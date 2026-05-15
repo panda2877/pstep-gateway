@@ -1,0 +1,79 @@
+# ============================================================================
+# Pstep Gateway 配置模板
+# 复制此文件为 config.yaml，填入实际密钥后使用
+# ⚠️ config.yaml 已在 .gitignore 中，不会提交到 GitHub！
+# ============================================================================
+
+# 网关监听端口
+port: 3001
+
+# ============================================================================
+# 上游提供商定义
+# api_key 支持两种方式：
+#   1. 直接写字符串（不推荐）
+#   2. ${ENV_VAR_NAME} — 从环境变量读取（推荐）
+# ============================================================================
+upstreams:
+  openai:
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+  # 如果不需要某个提供商，注释掉或删掉即可
+  # anthropic:
+  #   type: anthropic
+  #   base_url: https://api.anthropic.com/v1
+  #   api_key: ${ANTHROPIC_API_KEY}
+
+  # 示例：其他 OpenAI 兼容 API
+  # together:
+  #   type: openai
+  #   base_url: https://api.together.xyz/v1
+  #   api_key: ${TOGETHER_API_KEY}
+  #
+  # groq:
+  #   type: openai
+  #   base_url: https://api.groq.com/openai/v1
+  #   api_key: ${GROQ_API_KEY}
+
+# ============================================================================
+# 模型路由
+# 每个模型定义：
+#   upstream:    使用的上游提供商（必须在 upstreams 中定义）
+#   model:       实际发送给上游的模型名
+#   fallback:    可选的备用模型（主模型失败时自动切换）
+# ============================================================================
+models:
+  # --- OpenAI 模型 ---
+  gpt-4o:
+    upstream: openai
+    model: gpt-4o-2024-11-20
+    fallback: gpt-4o-mini
+
+  gpt-4o-mini:
+    upstream: openai
+    model: gpt-4o-mini
+
+  o3-mini:
+    upstream: openai
+    model: o3-mini-2025-01-31
+    fallback: gpt-4o
+
+  # --- Anthropic 模型 ---
+  # claude-sonnet-4:
+  #   upstream: anthropic
+  #   model: claude-sonnet-4-20250514
+  #   fallback: claude-3-5-sonnet-latest
+  #
+  # claude-3-5-sonnet:
+  #   upstream: anthropic
+  #   model: claude-3-5-sonnet-20241022
+
+# ============================================================================
+# 用量统计（可选）
+# 启用后会记录每次请求的 token 用量到内存
+# ============================================================================
+usage_tracking:
+  enabled: true
+  # 统计保留时间（小时），之后自动清理
+  retention_hours: 24
