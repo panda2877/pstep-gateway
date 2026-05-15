@@ -1,5 +1,5 @@
 {
-  "name": "plan-solve-gateway",
+  "name": "pstep-gateway",
   "version": "0.1.0",
   "private": false,
   "type": "module",
@@ -21,6 +21,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/panda2877/plan-solve-gateway.git"
+    "url": "git+https://github.com/panda2877/pstep-gateway.git"
   }
 }

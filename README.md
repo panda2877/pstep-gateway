@@ -1,4 +1,4 @@
-# plan-solve-gateway
+# pstep-gateway
 
 > 模型网关 — 零依赖 pi 的独立服务
 >
@@ -33,6 +33,6 @@ npm start
 或使用 Docker：
 
 ```bash
-docker build -t plan-solve-gateway .
-docker run -p 3001:3001 plan-solve-gateway
+docker build -t pstep-gateway .
+docker run -p 3001:3001 pstep-gateway
 ```
