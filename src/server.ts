@@ -37,7 +37,7 @@ async function main() {
       const result = await router.route(modelName, bodyStr);
 
       if (!stream) {
-        // 非流式：收集所有数据
+        // 非流式：从 SSE 流中提取 JSON 响应
         const reader = result.stream.getReader();
         let fullResponse = '';
         while (true) {
@@ -45,7 +45,12 @@ async function main() {
           if (done) break;
           fullResponse += value;
         }
-        return reply.type('application/json').send(fullResponse);
+        // 提取 JSON（去掉 SSE 包装）
+        const jsonMatch = fullResponse.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          return reply.type('application/json').send(jsonMatch[0]);
+        }
+        return reply.status(502).send({ error: '无效的响应格式' });
       }
 
       // 流式响应
