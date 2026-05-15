@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pstep Model Gateway — API key management, routing, failover, usage tracking",
+  "description": "Pstep Model Gateway \u2014 API key management, routing, failover, usage tracking",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
@@ -13,8 +13,8 @@
     "docker:run": "docker run -p 3001:3001 --env-file .env pstep-gateway"
   },
   "dependencies": {
-    "fastify": "^5.3.0",
-    "@fastify/cors": "^11.0.0",
+    "fastify": "^4.29.0",
+    "@fastify/cors": "^9.0.0",
     "yaml": "^2.7.0"
   },
   "devDependencies": {
