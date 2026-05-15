@@ -123,7 +123,7 @@ export interface AnthropicRequest {
   model: string;
   messages: Array<{
     role: 'user' | 'assistant';
-    content: string | Array<{ type: string; text?: string }>;
+content?: string | Array<Record<string, unknown>>;
   }>;
   system?: string;
   stream?: boolean;

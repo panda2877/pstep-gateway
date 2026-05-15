@@ -55,8 +55,8 @@ export class Router {
 
     // 尝试主模型
     const primaryResult = await this.tryUpstream(route.upstream, route.model, body, signal);
-    if (primaryResult.success) {
-      return this.makeResult(primaryResult, route.upstream, route.model, false);
+    if (primaryResult.success && primaryResult.response) {
+      return this.makeResult(primaryResult.response, primaryResult.latencyMs ?? 0, route.upstream, route.model, false);
     }
 
     // 主模型失败，尝试 fallback
@@ -70,8 +70,8 @@ export class Router {
           body,
           signal,
         );
-        if (fallbackResult.success) {
-          return this.makeResult(fallbackResult, fallbackRoute.upstream, fallbackRoute.model, true);
+        if (fallbackResult.success && fallbackResult.response) {
+          return this.makeResult(fallbackResult.response, fallbackResult.latencyMs ?? 0, fallbackRoute.upstream, fallbackRoute.model, true);
         }
       }
     }
@@ -127,13 +127,12 @@ export class Router {
   }
 
   private makeResult(
-    result: NonNullable<ReturnType<Router['tryUpstream']>['success'] extends true ? { response: Response; latencyMs: number } : never>,
+    response: Response,
+    latencyMs: number,
     upstreamName: string,
     modelName: string,
     didFailover: boolean,
   ): RouteResult {
-    const response = result.response!;
-
     // 构建 SSE 流
     const stream = new ReadableStream<string>({
       start: async (controller) => {
@@ -186,7 +185,7 @@ export class Router {
             total_tokens: promptTokens + completionTokens,
             timestamp: Date.now(),
             success: true,
-            latency_ms: result.latencyMs,
+            latency_ms: latencyMs,
           });
         } catch (err) {
           controller.error(err);

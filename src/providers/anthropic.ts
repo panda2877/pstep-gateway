@@ -37,7 +37,7 @@ function convertToAnthropic(openaiReq: OpenAIRequest, targetModel: string): Anth
         role: 'user',
         content: [
           {
-            type: 'tool_result',
+            type: 'tool_result' as const,
             tool_use_id: msg.tool_call_id!,
             content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
           },
