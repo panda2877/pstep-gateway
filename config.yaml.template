@@ -26,15 +26,21 @@ upstreams:
   #   api_key: ${ANTHROPIC_API_KEY}
 
   # 示例：其他 OpenAI 兼容 API
-  # together:
-  #   type: openai
-  #   base_url: https://api.together.xyz/v1
-  #   api_key: ${TOGETHER_API_KEY}
-  #
-  # groq:
-  #   type: openai
-  #   base_url: https://api.groq.com/openai/v1
-  #   api_key: ${GROQ_API_KEY}
+  together:
+    type: openai
+    base_url: https://api.together.xyz/v1
+    api_key: ${TOGETHER_API_KEY}
+
+  groq:
+    type: openai
+    base_url: https://api.groq.com/openai/v1
+    api_key: ${GROQ_API_KEY}
+
+  # 小米 MiMo
+  mimo:
+    type: openai
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
+    api_key: ${MIMO_API_KEY}
 
 # ============================================================================
 # 模型路由
@@ -59,7 +65,11 @@ models:
     model: o3-mini-2025-01-31
     fallback: gpt-4o
 
-  # --- Anthropic 模型 ---
+  # --- 小米 MiMo 模型 ---
+  mimo-v2.5:
+    upstream: mimo
+    model: mimo-v2.5
+    fallback: gpt-4o-mini
   # claude-sonnet-4:
   #   upstream: anthropic
   #   model: claude-sonnet-4-20250514
