@@ -38,12 +38,9 @@ async function main() {
 
       if (!stream) {
         // 非流式：从 SSE 流中提取 JSON 响应
-        const reader = result.stream.getReader();
         let fullResponse = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          fullResponse += value;
+        for await (const chunk of result.stream) {
+          fullResponse += typeof chunk === 'string' ? chunk : chunk.toString();
         }
         // 提取 JSON（去掉 SSE 包装）
         const jsonMatch = fullResponse.match(/\{[\s\S]*\}/);
@@ -66,14 +63,11 @@ async function main() {
         reply.raw.setHeader('X-Pstep-Failover', 'true');
       }
 
-      const reader = result.stream.getReader();
       const decoder = new TextDecoder();
 
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          reply.raw.write(typeof value === 'string' ? value : decoder.decode(value));
+        for await (const chunk of result.stream) {
+          reply.raw.write(typeof chunk === 'string' ? chunk : decoder.decode(chunk));
         }
       } finally {
         reply.raw.end();

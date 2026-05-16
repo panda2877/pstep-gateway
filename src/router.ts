@@ -3,13 +3,14 @@
 // ============================================================================
 
 import type { GatewayConfig, UpstreamConfig, UsageRecord } from './types.js';
+import { Readable } from 'node:stream';
 import { proxyToOpenAI } from './providers/openai.js';
 import { proxyToAnthropic } from './providers/anthropic.js';
 import { UsageTracker } from './usage.js';
 
 export interface RouteResult {
   /** 最终的 SSE 文本流（已转换为 OpenAI 格式） */
-  stream: ReadableStream<string>;
+  stream: Readable;
   /** 最终使用的上游 */
   usedUpstream: string;
   /** 最终使用的模型 */
@@ -133,72 +134,72 @@ export class Router {
     modelName: string,
     didFailover: boolean,
   ): RouteResult {
-    // 构建 SSE 流
-    const stream = new ReadableStream<string>({
-      start: async (controller) => {
-        try {
-          if (!response.body) {
-            controller.enqueue(`data: ${JSON.stringify({
-              error: '上游返回空响应',
-              status: response.status,
-            })}\n\n`);
-            controller.close();
-            return;
-          }
+    // 构建 SSE 流（Node.js stream.Readable 替代 ReadableStream）
+    const sseStream = new Readable({ read() {} });
 
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-          let promptTokens = 0;
-          let completionTokens = 0;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-
-            // 按行处理（SSE 格式）
-            const lines = buffer.split('\n');
-            buffer = lines.pop() ?? '';
-
-            for (const line of lines) {
-              if (line.trim() === '') continue;
-              controller.enqueue(line + '\n');
-            }
-          }
-
-          // 处理剩余的 buffer
-          if (buffer.trim()) {
-            controller.enqueue(buffer + '\n');
-          }
-
-          controller.enqueue('data: [DONE]\n\n');
-          controller.close();
-
-          // 记录用量
-          this.usageTracker.record({
-            model: modelName,
-            upstream: upstreamName,
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens,
-            timestamp: Date.now(),
-            success: true,
-            latency_ms: latencyMs,
-          });
-        } catch (err) {
-          controller.error(err);
+    (async () => {
+      try {
+        if (!response.body) {
+          sseStream.push("data: " + JSON.stringify({
+            error: '上游返回空响应',
+            status: response.status,
+          }) + "\n\n");
+          sseStream.push(null);
+          return;
         }
-      },
-    });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let promptTokens = 0;
+        let completionTokens = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // 按行处理（SSE 格式）
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (line.trim() === '') continue;
+            sseStream.push(line + '\n');
+          }
+        }
+
+        // 处理剩余的 buffer
+        if (buffer.trim()) {
+          sseStream.push(buffer + '\n');
+        }
+
+        sseStream.push('data: [DONE]\n\n');
+        sseStream.push(null);
+
+        // 记录用量
+        this.usageTracker.record({
+          model: modelName,
+          upstream: upstreamName,
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          timestamp: Date.now(),
+          success: true,
+          latency_ms: latencyMs,
+        });
+      } catch (err) {
+        sseStream.destroy(err);
+      }
+    })();
 
     return {
-      stream,
+      stream: sseStream,
       usedUpstream: upstreamName,
       usedModel: modelName,
       didFailover,
-      usage: null, // usage will be parsed from stream
+      usage: null,
     };
   }
 }
