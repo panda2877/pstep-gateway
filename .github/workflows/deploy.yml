@@ -41,7 +41,7 @@ jobs:
 
       - name: 📦 Install dependencies
         run: |
-          npm config set script-shell /bin/bash
+          npm cache clean --force
           npm ci --no-audit --no-fund
 
       - name: 🏗️ Build
