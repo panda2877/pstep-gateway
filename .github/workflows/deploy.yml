@@ -49,7 +49,7 @@ jobs:
       - name: 🚀 Deploy to server
         env:
           SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
         run: |
           set -e
 
