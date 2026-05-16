@@ -38,7 +38,7 @@ jobs:
       - name: ⚙️ Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 📦 Install dependencies
         run: npm install
@@ -60,24 +60,24 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
 
           echo '🛑 停止 gateway 服务...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key root@$SERVER_HOST 'systemctl stop pstep-gateway'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl stop pstep-gateway'
 
           echo '📦 备份...'
           TS=$(date +%Y%m%d_%H%M%S)
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key root@$SERVER_HOST "mkdir -p /opt/pstep/backups/$TS && cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/"
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "mkdir -p /opt/pstep/backups/$TS && cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/"
 
           echo '📤 部署 gateway...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key root@$SERVER_HOST 'rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
-          tar cz -C . dist node_modules |             ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key root@$SERVER_HOST 'tar xz -C /opt/pstep/gateway'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
+          tar cz -C . dist node_modules |             ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'tar xz -C /opt/pstep/gateway'
 
           echo '🚀 启动 gateway...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key root@$SERVER_HOST 'systemctl start pstep-gateway'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl start pstep-gateway'
 
           echo '🔍 健康检查...'
           sleep 3
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key root@$SERVER_HOST '
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST '
             echo "=== Gateway Status ==="
-            systemctl is-active pstep-gateway
+            sudo systemctl is-active pstep-gateway
             echo "=== Health Check ==="
             curl -s http://localhost:3001/health
             echo ""
