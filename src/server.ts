@@ -116,6 +116,29 @@ async function main() {
   });
 
   // ==================================================================
+  // GET /api/models — 返回 Agent 可用的完整模型元数据
+  // ==================================================================
+  app.get('/api/models', async () => {
+    const baseUrl = config.public_url || `http://localhost:${config.port}/v1`;
+    const models = Object.entries(config.models).map(([id, route]) => {
+      const meta = (route as any).metadata || {};
+      return {
+        id,
+        name: meta.name || id,
+        api: 'openai-completions',
+        provider: 'pstep-gateway',
+        baseUrl,
+        reasoning: meta.reasoning || false,
+        input: meta.input || ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: meta.context_window || 128000,
+        maxTokens: meta.max_tokens || 4096,
+      };
+    });
+    return { models, apiKey: 'pstep-gateway-key' };
+  });
+
+  // ==================================================================
   // GET /stats — 用量统计
   // ==================================================================
   app.get('/stats', async () => {
