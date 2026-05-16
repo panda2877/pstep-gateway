@@ -38,10 +38,11 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
-          npm-version: latest
 
       - name: 📦 Install dependencies
-        run: npm ci --ignore-scripts
+        run: |
+          npm config set script-shell /bin/bash
+          npm ci --no-audit --no-fund
 
       - name: 🏗️ Build
         run: npm run build
@@ -84,4 +85,3 @@ jobs:
           '
 
           echo '✅ Gateway 部署完成!'
-
