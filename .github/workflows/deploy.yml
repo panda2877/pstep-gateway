@@ -35,14 +35,12 @@ jobs:
         uses: actions/checkout@v6
 
       - name: ⚙️ Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '20'
 
       - name: 📦 Install dependencies
-        run: |
-          npm cache clean --force
-          npm ci --no-audit --no-fund
+        run: npm ci
 
       - name: 🏗️ Build
         run: npm run build
