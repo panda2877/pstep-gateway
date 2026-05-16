@@ -1,9 +1,9 @@
 {
   "name": "pstep-gateway",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
-  "description": "Pstep Model Gateway \u2014 API key management, routing, failover, usage tracking",
+  "description": "Pstep Model Gateway — API key management, routing, failover, usage tracking",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
