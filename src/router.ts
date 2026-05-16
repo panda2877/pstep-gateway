@@ -190,7 +190,7 @@ export class Router {
           latency_ms: latencyMs,
         });
       } catch (err) {
-        sseStream.destroy(err);
+        sseStream.destroy(err instanceof Error ? err : new Error(String(err)));
       }
     })();
 

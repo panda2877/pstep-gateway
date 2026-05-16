@@ -31,6 +31,7 @@ export interface GatewayConfig {
   upstreams: Record<string, UpstreamConfig>;
   models: Record<string, ModelRoute>;
   usage_tracking: UsageConfig;
+  public_url?: string;
 }
 
 /** Token 用量记录 */
