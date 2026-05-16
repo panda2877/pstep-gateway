@@ -38,9 +38,10 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
+          npm-version: latest
 
       - name: 📦 Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: 🏗️ Build
         run: npm run build
