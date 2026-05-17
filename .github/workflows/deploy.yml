@@ -66,8 +66,8 @@ jobs:
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/$TS && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/; else echo 'skip backup'; fi"
 
           echo '部署 gateway...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo mkdir -p /opt/pstep/gateway && rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
-          tar cz -C . dist node_modules package.json | ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'tar xz -C /opt/pstep/gateway'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "sudo rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules 2>/dev/null; sudo mkdir -p /opt/pstep/gateway"
+          tar cz -C . dist node_modules package.json | ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "sudo tar xz -C /opt/pstep/gateway"
 
           echo '重建原生模块...'
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'cd /opt/pstep/gateway && sudo npm rebuild'
