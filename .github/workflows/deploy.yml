@@ -40,7 +40,7 @@ jobs:
           node-version: '20'
 
       - name: 📦 Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: 🏗️ Build
         run: npm run build
@@ -58,21 +58,24 @@ jobs:
           echo "$SSH_KEY_B64" | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          echo '🛑 停止 gateway 服务...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl stop pstep-gateway'
+          echo '停止 gateway 服务...'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl stop pstep-gateway || true'
 
-          echo '📦 备份...'
+          echo '备份...'
           TS=$(date +%Y%m%d_%H%M%S)
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/$TS && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/; else echo '⚠️ /opt/pstep/gateway not found, skipping backup'; fi"
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/$TS && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/; else echo 'skip backup'; fi"
 
-          echo '📤 部署 gateway...'
+          echo '部署 gateway...'
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo mkdir -p /opt/pstep/gateway && rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
-          tar cz --dereference -C . dist node_modules |             ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'tar xz -C /opt/pstep/gateway'
+          tar cz -C . dist node_modules package.json | ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'tar xz -C /opt/pstep/gateway'
 
-          echo '🚀 启动 gateway...'
+          echo '重建原生模块...'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'cd /opt/pstep/gateway && sudo npm rebuild'
+
+          echo '启动 gateway...'
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl start pstep-gateway'
 
-          echo '🔍 健康检查...'
+          echo '健康检查...'
           sleep 3
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST '
             echo "=== Gateway Status ==="
@@ -82,4 +85,4 @@ jobs:
             echo ""
           '
 
-          echo '✅ Gateway 部署完成!'
+          echo 'Gateway 部署完成!'
