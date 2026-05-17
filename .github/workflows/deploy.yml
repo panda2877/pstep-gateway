@@ -66,7 +66,7 @@ jobs:
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/$TS && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/; else echo '⚠️ /opt/pstep/gateway not found, skipping backup'; fi"
 
           echo '📤 部署 gateway...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo mkdir -p /opt/pstep/gateway && rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
           tar cz -C . dist node_modules |             ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'tar xz -C /opt/pstep/gateway'
 
           echo '🚀 启动 gateway...'
