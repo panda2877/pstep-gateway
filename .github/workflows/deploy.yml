@@ -63,7 +63,7 @@ jobs:
 
           echo '📦 备份...'
           TS=$(date +%Y%m%d_%H%M%S)
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "mkdir -p /opt/pstep/backups/$TS && cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/"
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "sudo mkdir -p /opt/pstep/backups/$TS && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/"
 
           echo '📤 部署 gateway...'
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules'
