@@ -1,5 +1,5 @@
 # ============================================================================
-# Pstep Gateway — 独立部署工作流
+# Pstep Gateway — Rust 版自动部署工作流
 # 触发方式：
 #   1. 手动触发 (workflow_dispatch)
 #   2. push 到 main 分支时自动触发
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (如 0.1.1)'
+        description: '版本号 (如 0.1.0)'
         required: false
         type: string
   push:
@@ -19,11 +19,10 @@ on:
       - main
     paths:
       - 'src/**'
-      - 'package.json'
-      - 'tsconfig.json'
-      - 'package-lock.json'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
       - '.github/workflows/deploy.yml'
-
 
 jobs:
   deploy:
@@ -34,55 +33,59 @@ jobs:
       - name: 🔨 Checkout
         uses: actions/checkout@v6
 
-      - name: ⚙️ Setup Node.js
-        uses: actions/setup-node@v6
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-action@stable
         with:
-          node-version: '20'
+          toolchain: stable
 
-      - name: 📦 Install dependencies
-        run: npm install
+      - name: 📦 Build Release
+        run: cargo build --release
 
-      - name: 🏗️ Build
-        run: npm run build
+      - name: 📤 Copy Binary
+        run: cp target/release/pstep-gateway ./gateway-bin
 
       - name: 🚀 Deploy to server
         env:
           SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_USER: ${{ vars.SERVER_USER }}
         run: |
           set -e
 
           # 配置 SSH
           mkdir -p ~/.ssh
-          ssh-keyscan -H $SERVER_HOST >> ~/.ssh/known_hosts 2>/dev/null || echo '[WARN] ssh-keyscan failed'
+          ssh-keyscan -H $SERVER_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
           echo "$SSH_KEY_B64" | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
+          SSHD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key ${SERVER_USER}@${SERVER_HOST}"
+
           echo '停止 gateway 服务...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl stop pstep-gateway || true'
+          $SSHD 'sudo systemctl stop pstep-gateway || true'
 
           echo '备份...'
           TS=$(date +%Y%m%d_%H%M%S)
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/$TS && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/$TS/; else echo 'skip backup'; fi"
+          $SSHD "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/\${TS} && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/\${TS}/; fi"
 
           echo '部署 gateway...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "sudo rm -rf /opt/pstep/gateway/dist/* /opt/pstep/gateway/node_modules 2>/dev/null; sudo mkdir -p /opt/pstep/gateway"
-          tar cz -C . dist node_modules package.json | ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST "sudo tar xz -C /opt/pstep/gateway"
+          $SSHD 'sudo mkdir -p /opt/pstep/gateway'
+          cat ./gateway-bin | $SSHD 'sudo tee /opt/pstep/gateway/pstep-gateway > /dev/null'
+          $SSHD 'sudo chmod +x /opt/pstep/gateway/pstep-gateway'
 
-          echo '重建原生模块...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'cd /opt/pstep/gateway && sudo npm rebuild'
+          # 如果有配置文件需要更新
+          $SSHD 'if [ -f /opt/pstep/gateway/config.yaml ]; then sudo cp /opt/pstep/gateway/config.yaml /opt/pstep/gateway/config.yaml.new || true; fi'
 
           echo '启动 gateway...'
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST 'sudo systemctl start pstep-gateway'
+          $SSHD 'sudo systemctl start pstep-gateway'
 
           echo '健康检查...'
           sleep 3
-          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key agentuser@$SERVER_HOST '
+          $SSHD '
             echo "=== Gateway Status ==="
             sudo systemctl is-active pstep-gateway
             echo "=== Health Check ==="
-            curl -s http://localhost:3001/health
+            curl -s http://localhost:3001/health || echo "health endpoint not available"
             echo ""
           '
 
-          echo 'Gateway 部署完成!'
+          echo '✅ Gateway 部署完成!'
