@@ -49,7 +49,11 @@
       "Bash(curl -s -X POST http://127.0.0.1:3001/anthropic/v1/messages -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Use the calculate tool.\"}], \"max_tokens\": 1000, \"tools\": [{\"name\": \"calculate\", \"description\": \"A calculator\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"expr\": {\"type\": \"string\"}}}}]}')",
       "Bash(curl -s -X POST http://127.0.0.1:3001/anthropic/v1/messages -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"tell me a joke\"}], \"max_tokens\": 500}')",
       "Bash(curl -s -X POST http://127.0.0.1:3001/anthropic/v1/messages -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"你好\"}], \"max_tokens\": 300}')",
-      "Bash(curl -s -X POST http://127.0.0.1:3001/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"你好\"}], \"max_tokens\": 300}')"
+      "Bash(curl -s -X POST http://127.0.0.1:3001/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"你好\"}], \"max_tokens\": 300}')",
+      "Bash(rm -rf /tmp/pstep-test)"
+    ],
+    "additionalDirectories": [
+      "/tmp/pstep-test"
     ]
   }
 }
