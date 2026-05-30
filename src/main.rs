@@ -42,7 +42,7 @@ async fn main() {
 
     let app = Router::new()
         .nest("/v1", handlers::v1::v1_routes())
-        .nest("/anthropic/v1", handlers::v1::anthropic_routes())
+        .nest("/provider", handlers::v1::provider_routes())
         .route("/health", axum::routing::get(handlers::health))
         .route("/stats", axum::routing::get(handlers::stats))
         .route("/stats/recent", axum::routing::get(handlers::stats_recent))
