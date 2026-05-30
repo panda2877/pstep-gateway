@@ -40,6 +40,44 @@ pub async fn proxy(
             }
         }
 
+        // If there's a role:tool message but no tools field, reconstruct tools from history
+        // This is needed because MiniMax and some other providers validate tool_call_id
+        // against the original tool definitions in the session context
+        let has_tools = new_obj.get("tools").is_some();
+        let has_tool_role_message = new_obj.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|msgs| msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")))
+            .unwrap_or(false);
+
+        if !has_tools && has_tool_role_message {
+            if let Some(messages) = new_obj.get("messages").and_then(|m| m.as_array()) {
+                let mut tools_from_history: Vec<serde_json::Value> = Vec::new();
+                let mut seen_functions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                for msg in messages {
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    if seen_functions.insert(name.to_string()) {
+                                        let func_obj = func.as_object().cloned().unwrap_or_default();
+                                        tools_from_history.push(serde_json::json!({
+                                            "type": "function",
+                                            "function": func_obj
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !tools_from_history.is_empty() {
+                    new_obj.insert("tools".to_string(), serde_json::json!(tools_from_history));
+                }
+            }
+        }
+
         let result = serde_json::to_string(&new_obj).map_err(|e| e.to_string())?;
         result
     } else {
@@ -516,6 +554,44 @@ pub async fn proxy_non_stream(
                     if needs_fix {
                         tool_obj.insert("type".to_string(), serde_json::json!("function"));
                     }
+                }
+            }
+        }
+
+        // If there's a role:tool message but no tools field, reconstruct tools from history
+        // This is needed because MiniMax and some other providers validate tool_call_id
+        // against the original tool definitions in the session context
+        let has_tools = new_obj.get("tools").is_some();
+        let has_tool_role_message = new_obj.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|msgs| msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")))
+            .unwrap_or(false);
+
+        if !has_tools && has_tool_role_message {
+            if let Some(messages) = new_obj.get("messages").and_then(|m| m.as_array()) {
+                let mut tools_from_history: Vec<serde_json::Value> = Vec::new();
+                let mut seen_functions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                for msg in messages {
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    if seen_functions.insert(name.to_string()) {
+                                        let func_obj = func.as_object().cloned().unwrap_or_default();
+                                        tools_from_history.push(serde_json::json!({
+                                            "type": "function",
+                                            "function": func_obj
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !tools_from_history.is_empty() {
+                    new_obj.insert("tools".to_string(), serde_json::json!(tools_from_history));
                 }
             }
         }
