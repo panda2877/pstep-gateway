@@ -111,9 +111,11 @@ async fn provider_proxy(
 
     // Set auth header based on provider
     match provider.as_str() {
-        "anthropic" => {
+        "anthropic" | "minimax" => {
             request = request.header("x-api-key", api_key);
-            request = request.header("anthropic-version", "2023-06-01");
+            if provider == "anthropic" {
+                request = request.header("anthropic-version", "2023-06-01");
+            }
         }
         _ => {
             request = request.header("Authorization", format!("Bearer {}", api_key));
