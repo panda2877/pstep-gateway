@@ -177,10 +177,10 @@ pub fn provider_routes() -> axum::Router<AppState> {
 
     // Standard Base URLs - provider prefix routes
     axum::Router::new()
-        .route("/openai/*path", post(provider_proxy))
-        .route("/anthropic/*path", post(provider_proxy))
-        .route("/deepseek/*path", post(provider_proxy))
-        .route("/minimax/*path", post(provider_proxy))
+        .route("/openai/{*path}", post(provider_proxy))
+        .route("/anthropic/{*path}", post(provider_proxy))
+        .route("/deepseek/{*path}", post(provider_proxy))
+        .route("/minimax/{*path}", post(provider_proxy))
         // Also support direct /messages for backward compatibility
         .route("/anthropic/messages", post(provider_proxy))
 }
