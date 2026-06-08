@@ -38,13 +38,21 @@ fn get_provider_base_url(provider: &str) -> Option<&'static str> {
 
 async fn provider_proxy(
     State(state): State<AppState>,
-    axum::extract::Path((provider, path)): axum::extract::Path<(String, String)>,
+    axum::extract::Path(path): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Response {
     if let Some(resp) = require_auth(&headers) {
         return resp;
     }
+
+    // Extract provider from the URI path - first segment after the nest prefix
+    // Route is /provider/{provider}/{*path}, but {*path} captures "provider/v1/messages"
+    // so we split on the first "/" to separate provider from the rest
+    let (provider, actual_path) = match path.split_once('/') {
+        Some((p, rest)) => (p.to_string(), rest.to_string()),
+        None => (path.clone(), String::new()),
+    };
 
     let base_url = match get_provider_base_url(&provider) {
         Some(url) => url,
@@ -57,7 +65,7 @@ async fn provider_proxy(
     };
 
     // Build the target path - handle both /messages and /v1/messages formats
-    let target_path = if path.is_empty() {
+    let target_path = if actual_path.is_empty() {
         // Direct /provider route, look for default path
         if provider == "anthropic" {
             "messages".to_string()
@@ -65,7 +73,7 @@ async fn provider_proxy(
             String::new()
         }
     } else {
-        format!("/{}", path)
+        format!("/{}", actual_path)
     };
 
     // Get the appropriate API key from config
@@ -176,13 +184,10 @@ pub fn provider_routes() -> axum::Router<AppState> {
     use axum::routing::post;
 
     // Standard Base URLs - provider prefix routes
+    // The {*path} wildcard captures the rest of the path, e.g. "openai/v1/chat/completions"
+    // The handler splits this to extract the provider name and actual path
     axum::Router::new()
-        .route("/openai/{*path}", post(provider_proxy))
-        .route("/anthropic/{*path}", post(provider_proxy))
-        .route("/deepseek/{*path}", post(provider_proxy))
-        .route("/minimax/{*path}", post(provider_proxy))
-        // Also support direct /messages for backward compatibility
-        .route("/anthropic/messages", post(provider_proxy))
+        .route("/{*path}", post(provider_proxy))
 }
 
 async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
