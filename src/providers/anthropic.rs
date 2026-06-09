@@ -11,13 +11,14 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 // ============================================================================
-// openai -> anthropic  (existing, kept)
+// openai -> anthropic  (request translation, response based on downstream format)
 // ============================================================================
 
 pub async fn proxy_openai_to_anthropic(
     upstream: &UpstreamConfig,
     target_model: &str,
     body: &str,
+    downstream_format: OutputFormat,
 ) -> Result<String, String> {
     let client = build_client()?;
     let openai_req: ChatCompletionsRequest = serde_json::from_str(body)
@@ -41,16 +42,51 @@ pub async fn proxy_openai_to_anthropic(
     if !status.is_success() {
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
-    Ok(body_str.to_string())
+
+    // Response translation: if downstream is openai, translate anthropic -> openai
+    match downstream_format {
+        OutputFormat::Anthropic => Ok(body_str.to_string()),
+        OutputFormat::OpenAI => crate::providers::anthropic::anthropic_response_to_openai(&body_str),
+    }
 }
 
 pub async fn proxy_non_stream_openai_to_anthropic(
     upstream: &UpstreamConfig,
     target_model: &str,
     body: &str,
+    downstream_format: OutputFormat,
 ) -> Result<String, String> {
-    // Same as streaming — we just return the upstream body directly when downstream is anthropic
-    proxy_openai_to_anthropic(upstream, target_model, body).await
+    let client = build_client()?;
+    let openai_req: ChatCompletionsRequest = serde_json::from_str(body)
+        .map_err(|e| format!("请求体解析失败: {}", e))?;
+
+    let anthropic_req = openai_to_anthropic_request(&openai_req, target_model)?;
+    let resp = client
+        .post(format!("{}/messages", upstream.base_url))
+        .header("Content-Type", "application/json")
+        .header("x-api-key", &upstream.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .body(serde_json::to_string(&anthropic_req).map_err(|e| e.to_string())?)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    let status = resp.status();
+    let body_bytes = resp.bytes().await.map_err(|e| format!("读取响应失败: {}", e))?;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    if !status.is_success() {
+        return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
+    }
+
+    match downstream_format {
+        OutputFormat::Anthropic => Ok(body_str.to_string()),
+        OutputFormat::OpenAI => {
+            let json: Value = serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
+            let resp = convert_anthropic_json_to_openai(&json)?;
+            serde_json::to_string(&resp).map_err(|e| e.to_string())
+        }
+    }
 }
 
 // ============================================================================

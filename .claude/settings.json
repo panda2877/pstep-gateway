@@ -50,7 +50,18 @@
       "Bash(curl -s -X POST http://127.0.0.1:3001/anthropic/v1/messages -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"tell me a joke\"}], \"max_tokens\": 500}')",
       "Bash(curl -s -X POST http://127.0.0.1:3001/anthropic/v1/messages -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"你好\"}], \"max_tokens\": 300}')",
       "Bash(curl -s -X POST http://127.0.0.1:3001/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer pstep-gateway-key\" -d '{\"model\": \"minimax\", \"messages\": [{\"role\": \"user\", \"content\": \"你好\"}], \"max_tokens\": 300}')",
-      "Bash(rm -rf /tmp/pstep-test)"
+      "Bash(rm -rf /tmp/pstep-test)",
+      "Bash(ssh root@134.175.163.213 \"journalctl -u pstep-gateway --no-pager -n 100 2>&1 || tail -100 /var/log/syslog 2>&1\")",
+      "Bash(ssh root@134.175.163.213 \"journalctl -u pstep-gateway --no-pager -n 500 2>&1 | grep -i 'error\\\\|400\\\\|502\\\\|tool\\\\|fail' | tail -50\")",
+      "Bash(ssh root@134.175.163.213 \"journalctl -u pstep-gateway --no-pager -n 500 2>&1 | grep -i '2013\\\\|invalid.*tool\\\\|not found' | tail -20\")",
+      "Bash(ssh root@134.175.163.213 \"journalctl -u pstep-gateway --no-pager -n 500 2>&1 | grep -E '上游返回|502|400:' | tail -20\")",
+      "Bash(ssh root@134.175.163.213 \"ls -la /opt/pstep/gateway/ 2>/dev/null && stat /opt/pstep/gateway/pstep-gateway 2>/dev/null | head -10\")",
+      "Bash(ssh root@134.175.163.213 \"systemctl status pstep-gateway 2>&1 | head -20\")",
+      "Bash(ssh root@134.175.163.213 \"cd /opt/pstep/gateway && git log --oneline -5 2>/dev/null || echo 'not a git repo'\")",
+      "Bash(ssh root@134.175.163.213 \"strings /opt/pstep/gateway/pstep-gateway | grep -A5 'role:tool' | head -20\")",
+      "Bash(ssh root@134.175.163.213 \"strings /opt/pstep/gateway/pstep-gateway | grep 'tools_from_history' | head -5\")",
+      "Bash(ssh root@134.175.163.213 \"journalctl -u pstep-gateway --no-pager 2>&1 | grep -E 'tool_call_id|tool_calls|role.*tool' | tail -20\")",
+      "Bash(ssh root@134.175.163.213 \"journalctl -u pstep-gateway --no-pager 2>&1 | grep -o '\\\\\"role\\\\\":\\\\\"tool\\\\\"[^{}]*' | head -10\")"
     ],
     "additionalDirectories": [
       "/tmp/pstep-test"

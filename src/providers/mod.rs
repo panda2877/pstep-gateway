@@ -30,7 +30,7 @@ pub async fn proxy(
         }
         // Upstream = Anthropic
         (UpstreamType::Anthropic, OutputFormat::OpenAI) => {
-            anthropic::proxy_openai_to_anthropic(upstream, target_model, body).await
+            anthropic::proxy_openai_to_anthropic(upstream, target_model, body, downstream_format).await
         }
         (UpstreamType::Anthropic, OutputFormat::Anthropic) => {
             anthropic::proxy_anthropic_to_anthropic(upstream, target_model, body).await
@@ -52,7 +52,7 @@ pub async fn proxy_non_stream(
             openai::proxy_non_stream_anthropic_to_openai(upstream, target_model, body).await
         }
         (UpstreamType::Anthropic, OutputFormat::OpenAI) => {
-            anthropic::proxy_non_stream_openai_to_anthropic(upstream, target_model, body).await
+            anthropic::proxy_non_stream_openai_to_anthropic(upstream, target_model, body, downstream_format).await
         }
         (UpstreamType::Anthropic, OutputFormat::Anthropic) => {
             anthropic::proxy_non_stream_anthropic_to_anthropic(upstream, target_model, body).await

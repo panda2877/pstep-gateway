@@ -53,6 +53,15 @@ src/
 - `?format=anthropic` — Anthropic event stream format
 - Non-streaming responses pass through upstream JSON directly
 
+## Deployment
+
+```bash
+ssh root@134.175.163.213
+```
+
+- 服务部署通过 GitHub Actions 完成
+- 服务器已配置免密登录（root 用户）
+
 ## Configuration
 
 See `config.yaml.template`. Upstreams require `api_key`. Models reference upstreams and optionally a fallback model for failover.
