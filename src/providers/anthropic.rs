@@ -40,6 +40,15 @@ pub async fn proxy_openai_to_anthropic(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "anthropic",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "anthropic upstream returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
@@ -76,6 +85,15 @@ pub async fn proxy_non_stream_openai_to_anthropic(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "anthropic",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "anthropic upstream (non-stream) returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
@@ -122,6 +140,15 @@ pub async fn proxy_anthropic_to_anthropic(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "anthropic",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "anthropic upstream (passthrough) returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
     Ok(body_str.to_string())
@@ -138,6 +165,16 @@ pub async fn proxy_non_stream_anthropic_to_anthropic(
 // ============================================================================
 // Conversions
 // ============================================================================
+
+/// Truncate `s` to at most `max` characters, appending a marker if cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{}…(truncated, total {} chars)", head, s.chars().count())
+    }
+}
 
 fn build_client() -> Result<Client, String> {
     Client::builder()

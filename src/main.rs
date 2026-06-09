@@ -24,7 +24,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     println!("╔══════════════════════════════════════╗");
-    println!("║         Pstep Gateway v0.1.1          ║");
+    println!("║         Pstep Gateway v0.1.2          ║");
     println!("╚══════════════════════════════════════╝");
 
     let config = load_config();

@@ -12,6 +12,16 @@ use std::time::Duration;
 
 const VALID_API_KEY: &str = "pstep-gateway-key";
 
+/// Truncate `s` to at most `max` characters, appending a marker if cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{}…(truncated, total {} chars)", head, s.chars().count())
+    }
+}
+
 fn require_auth(headers: &axum::http::HeaderMap) -> Option<Response> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     if auth == format!("Bearer {}", VALID_API_KEY) {
@@ -165,6 +175,18 @@ async fn provider_proxy(
                 }
             };
 
+            if !status.is_success() {
+                tracing::error!(
+                    target: "upstream",
+                    upstream = "provider_proxy",
+                    provider = %provider,
+                    target_url = %target_url,
+                    status = status.as_u16(),
+                    body = %truncate(&body_str, 2048),
+                    "provider_proxy upstream returned non-success"
+                );
+            }
+
             let mut response = axum::response::Response::new(axum::body::Body::from(body_str.clone()));
             response.headers_mut().insert(
                 "Content-Type",
@@ -179,6 +201,14 @@ async fn provider_proxy(
             response
         }
         Err(e) => {
+            tracing::error!(
+                target: "upstream",
+                upstream = "provider_proxy",
+                provider = %provider,
+                target_url = %target_url,
+                error = %e,
+                "provider_proxy request failed"
+            );
             (axum::http::StatusCode::BAD_GATEWAY, Json(serde_json::json!({
                 "error": "bad_gateway",
                 "message": e.to_string()

@@ -68,6 +68,14 @@ impl Router {
                 Ok(response)
             }
             Err(e) => {
+                tracing::error!(
+                    target: "router",
+                    model = %model_name,
+                    primary_upstream = %route.upstream,
+                    primary_model = %route.model,
+                    error = %e,
+                    "primary upstream failed (non-stream)"
+                );
                 if let Some(fallback) = &route.fallback {
                     let fallback_route = self.config.models.get(fallback)
                         .ok_or_else(|| format!("fallback {} 不存在", fallback))?;
@@ -95,7 +103,18 @@ impl Router {
                             });
                             Ok(response)
                         }
-                        Err(e2) => Err(format!("所有上游都失败：{} → {}: {} → {}", route.model, fallback, e, e2))
+                        Err(e2) => {
+                            tracing::error!(
+                                target: "router",
+                                model = %model_name,
+                                fallback_upstream = %fallback_route.upstream,
+                                fallback_model = %fallback_route.model,
+                                primary_error = %e,
+                                fallback_error = %e2,
+                                "both primary and fallback upstreams failed (non-stream)"
+                            );
+                            Err(format!("所有上游都失败：{} → {}: {} → {}", route.model, fallback, e, e2))
+                        }
                     }
                 } else {
                     Err(e)
@@ -141,6 +160,14 @@ impl Router {
                 Ok(response)
             }
             Err(e) => {
+                tracing::error!(
+                    target: "router",
+                    model = %model_name,
+                    primary_upstream = %route.upstream,
+                    primary_model = %route.model,
+                    error = %e,
+                    "primary upstream failed (stream)"
+                );
                 if let Some(fallback) = &route.fallback {
                     let fallback_route = self.config.models.get(fallback)
                         .ok_or_else(|| format!("fallback {} 不存在", fallback))?;
@@ -168,7 +195,18 @@ impl Router {
                             });
                             Ok(response)
                         }
-                        Err(e2) => Err(format!("所有上游都失败：{} → {}: {} {}", route.model, fallback, e, e2))
+                        Err(e2) => {
+                            tracing::error!(
+                                target: "router",
+                                model = %model_name,
+                                fallback_upstream = %fallback_route.upstream,
+                                fallback_model = %fallback_route.model,
+                                primary_error = %e,
+                                fallback_error = %e2,
+                                "both primary and fallback upstreams failed (stream)"
+                            );
+                            Err(format!("所有上游都失败：{} → {}: {} {}", route.model, fallback, e, e2))
+                        }
                     }
                 } else {
                     Err(e)

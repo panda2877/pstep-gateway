@@ -37,6 +37,15 @@ pub async fn proxy_openai_to_openai(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "openai",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "openai upstream returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
@@ -79,6 +88,15 @@ pub async fn proxy_non_stream_openai_to_openai(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "openai",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "openai upstream (non-stream) returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
@@ -120,6 +138,16 @@ pub async fn proxy_anthropic_to_openai(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "openai",
+            target_model,
+            base_url = %upstream.base_url,
+            downstream = "anthropic",
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "openai upstream (anthropic->openai) returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
@@ -155,6 +183,16 @@ pub async fn proxy_non_stream_anthropic_to_openai(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if !status.is_success() {
+        tracing::error!(
+            target: "upstream",
+            upstream = "openai",
+            target_model,
+            base_url = %upstream.base_url,
+            downstream = "anthropic",
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "openai upstream (anthropic->openai, non-stream) returned non-success"
+        );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
@@ -166,6 +204,16 @@ pub async fn proxy_non_stream_anthropic_to_openai(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Truncate `s` to at most `max` characters, appending a marker if cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{}…(truncated, total {} chars)", head, s.chars().count())
+    }
+}
 
 fn build_client() -> Result<Client, String> {
     Client::builder()
