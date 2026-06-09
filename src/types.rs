@@ -119,6 +119,8 @@ pub struct Message {
     pub name: Option<String>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

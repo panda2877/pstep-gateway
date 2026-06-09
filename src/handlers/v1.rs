@@ -348,6 +348,7 @@ fn convert_anthropic_system_to_openai(system: &Option<AnthropicSystem>) -> Vec<M
                 content: ContentValue::String(sys_text),
                 name: None,
                 tool_call_id: None,
+                tool_calls: None,
             });
         }
     }
@@ -378,6 +379,7 @@ fn convert_anthropic_messages_to_openai(messages: &[AnthropicMessagesMessage]) -
             content,
             name: None,
             tool_call_id: None,
+            tool_calls: None,
         }
     }).collect()
 }
