@@ -192,6 +192,7 @@ pub fn v1_routes() -> axum::Router<AppState> {
 
     axum::Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/messages", post(chat_completions_anthropic))
         .route("/models", get(list_models))
 }
 
@@ -280,42 +281,21 @@ async fn chat_completions_anthropic(
         return resp;
     }
 
-    let format = OutputFormat::Anthropic;
     let model_name = body.model.clone();
     let is_stream = body.stream == Some(true);
 
-    // Convert Anthropic request to OpenAI format for internal processing
-    let openai_messages = convert_anthropic_messages_to_openai(&body.messages);
-    let openai_system = convert_anthropic_system_to_openai(&body.system);
-    let openai_tools = body.tools.as_ref().and_then(|t| convert_anthropic_tools_to_openai(t));
-
-    let mut messages = openai_system;
-    messages.extend(openai_messages);
-
-    let chat_request = ChatCompletionsRequest {
-        model: model_name.clone(),
-        messages,
-        stream: false, // Always non-streaming internally
-        max_tokens: body.max_tokens,
-        temperature: None,
-        top_p: None,
-        tools: openai_tools,
-        tool_choice: None,
-        stop: None,
-    };
-
-    let body_str = serde_json::to_string(&chat_request).unwrap();
+    // Forward the original anthropic-format body to the router; the router
+    // (and providers layer) handles translation to the upstream protocol and
+    // back to anthropic format.
+    let body_str = serde_json::to_string(&body).unwrap();
 
     if is_stream {
-        let result = state.router.route(&model_name, &body_str, format).await;
+        let result = state.router.route(&model_name, &body_str, OutputFormat::Anthropic).await;
 
         match result {
             Ok(stream) => {
                 let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
-                resp.headers_mut().insert(
-                    "Content-Type",
-                    "text/event-stream".parse().unwrap(),
-                );
+                resp.headers_mut().insert("Content-Type", "text/event-stream".parse().unwrap());
                 resp.headers_mut().insert("Cache-Control", "no-cache".parse().unwrap());
                 resp.headers_mut().insert("X-Accel-Buffering", "no".parse().unwrap());
                 if state.router.did_failover().await {
@@ -331,15 +311,12 @@ async fn chat_completions_anthropic(
             }
         }
     } else {
-        let result = state.router.route_non_stream(&model_name, &body_str, format).await;
+        let result = state.router.route_non_stream(&model_name, &body_str, OutputFormat::Anthropic).await;
 
         match result {
             Ok(response) => {
                 let mut resp = axum::response::Response::new(axum::body::Body::from(response));
-                resp.headers_mut().insert(
-                    "Content-Type",
-                    "application/json".parse().unwrap(),
-                );
+                resp.headers_mut().insert("Content-Type", "application/json".parse().unwrap());
                 if state.router.did_failover().await {
                     resp.headers_mut().insert("X-Pstep-Failover", "true".parse().unwrap());
                 }

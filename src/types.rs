@@ -19,7 +19,7 @@ pub struct UpstreamConfig {
     pub api_key: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamType {
     Openai,
