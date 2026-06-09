@@ -25,15 +25,20 @@ fn require_auth(headers: &axum::http::HeaderMap) -> Option<Response> {
 }
 
 // Provider base URL mapping
-const PROVIDER_BASE_URLS: &[(&str, &str)] = &[
-    ("minimax", "https://api.minimax.io/anthropic"),
-    ("openai", "https://api.openai.com/v1"),
-    ("anthropic", "https://api.anthropic.com/v1"),
-    ("deepseek", "https://api.deepseek.com/v1"),
+// Use config-driven upstreams; PROVIDER_BASE_URLS is a fallback for built-in providers
+// not present in config (e.g. openai, deepseek, anthropic).
+const PROVIDER_BASE_URLS: &[(&str, &str, &str)] = &[
+    // (provider, base_url, auth_type)  auth_type: "bearer" | "x-api-key"
+    ("openai", "https://api.openai.com/v1", "bearer"),
+    ("anthropic", "https://api.anthropic.com/v1", "x-api-key"),
+    ("deepseek", "https://api.deepseek.com/v1", "bearer"),
 ];
 
-fn get_provider_base_url(provider: &str) -> Option<&'static str> {
-    PROVIDER_BASE_URLS.iter().find(|(p, _)| *p == provider).map(|(_, url)| *url)
+fn get_provider_default(provider: &str) -> Option<(&'static str, &'static str)> {
+    PROVIDER_BASE_URLS
+        .iter()
+        .find(|(p, _, _)| *p == provider)
+        .map(|(_, url, auth)| (*url, *auth))
 }
 
 async fn provider_proxy(
@@ -54,36 +59,46 @@ async fn provider_proxy(
         None => (path.clone(), String::new()),
     };
 
-    let base_url = match get_provider_base_url(&provider) {
-        Some(url) => url,
-        None => {
-            return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "bad_request",
-                "message": format!("Unknown provider: {}", provider)
-            }))).into_response()
-        }
+    // Resolve upstream from config first, fall back to built-in defaults
+    let (base_url, api_key, auth) = if let Some(upstream) = state.config.upstreams.get(&provider) {
+        let auth = match upstream.upstream_type {
+            crate::types::UpstreamType::Anthropic => "x-api-key",
+            crate::types::UpstreamType::Openai => "bearer",
+        };
+        (upstream.base_url.clone(), upstream.api_key.clone(), auth)
+    } else if let Some((url, a)) = get_provider_default(&provider) {
+        (url.to_string(), String::new(), a)
+    } else {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "bad_request",
+            "message": format!("Unknown provider: {}", provider)
+        }))).into_response();
     };
 
-    // Build the target path - handle both /messages and /v1/messages formats
-    let target_path = if actual_path.is_empty() {
-        // Direct /provider route, look for default path
+    // Build the target URL. base_url is taken as-is from config; actual_path is the
+    // path captured after the provider prefix. We strip a leading "/v1" from the path
+    // if the base_url already ends with "/v1" to avoid double-prefixing.
+    let target_url = if actual_path.is_empty() {
+        // Default path: anthropic uses /v1/messages, others use root
         if provider == "anthropic" {
-            "messages".to_string()
+            format!("{}/v1/messages", base_url.trim_end_matches('/'))
         } else {
-            String::new()
+            base_url.clone()
         }
     } else {
-        format!("/{}", actual_path)
+        let path = actual_path.trim_start_matches('/');
+        if base_url.ends_with("/v1") && (path == "v1" || path.starts_with("v1/")) {
+            // Avoid double /v1
+            let stripped = path.strip_prefix("v1").unwrap_or(path).trim_start_matches('/');
+            if stripped.is_empty() {
+                base_url.clone()
+            } else {
+                format!("{}/{}", base_url.trim_end_matches('/'), stripped)
+            }
+        } else {
+            format!("{}/{}", base_url.trim_end_matches('/'), path)
+        }
     };
-
-    // Get the appropriate API key from config
-    let api_key = match provider.as_str() {
-        "openai" => state.config.upstreams.get("openai").map(|u| u.api_key.as_str()),
-        "anthropic" => state.config.upstreams.get("anthropic").map(|u| u.api_key.as_str()),
-        "deepseek" => state.config.upstreams.get("deepseek").map(|u| u.api_key.as_str()),
-        "minimax" => state.config.upstreams.get("minimax").map(|u| u.api_key.as_str()),
-        _ => None,
-    }.unwrap_or("");
 
     // Get the body bytes
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
@@ -96,9 +111,7 @@ async fn provider_proxy(
         }
     };
 
-    let target_url = format!("{}{}", base_url, target_path);
-
-    println!("🔄 [{}] {} -> {}", provider, target_path.trim_start_matches("/"), target_url);
+    println!("🔄 [{}] -> {}", provider, target_url);
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -117,16 +130,18 @@ async fn provider_proxy(
     let mut request = client.post(&target_url);
     request = request.header("Content-Type", "application/json");
 
-    // Set auth header based on provider
-    match provider.as_str() {
-        "anthropic" | "minimax" => {
+    // Set auth header based on upstream type
+    match auth {
+        "x-api-key" => {
             request = request.header("x-api-key", api_key);
             if provider == "anthropic" {
                 request = request.header("anthropic-version", "2023-06-01");
             }
         }
         _ => {
-            request = request.header("Authorization", format!("Bearer {}", api_key));
+            if !api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
         }
     }
 
