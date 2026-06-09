@@ -68,6 +68,51 @@ pub struct UsageRecord {
     pub latency_ms: u64,
 }
 
+/// Token usage extracted from upstream response body.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+impl TokenUsage {
+    /// Extract token usage from an OpenAI-format response body (non-streaming JSON).
+    pub fn from_openai_response(body: &str) -> Self {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+            return Self::default();
+        };
+        let usage = json.get("usage");
+        Self {
+            prompt_tokens: usage
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            completion_tokens: usage
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+        }
+    }
+
+    /// Extract token usage from an Anthropic-format response body (non-streaming JSON).
+    pub fn from_anthropic_response(body: &str) -> Self {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+            return Self::default();
+        };
+        let usage = json.get("usage");
+        Self {
+            prompt_tokens: usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            completion_tokens: usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageStats {
     pub total_requests: u32,

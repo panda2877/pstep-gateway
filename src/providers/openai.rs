@@ -1,5 +1,5 @@
 use crate::providers::OutputFormat;
-use crate::types::UpstreamConfig;
+use crate::types::{TokenUsage, UpstreamConfig};
 use reqwest::Client;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -17,7 +17,7 @@ pub async fn proxy_openai_to_openai(
     target_model: &str,
     body: &str,
     downstream_format: OutputFormat,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let client = build_client()?;
     let body_json: Value = serde_json::from_str(body)
         .map_err(|e| format!("请求体解析失败: {}", e))?;
@@ -50,15 +50,18 @@ pub async fn proxy_openai_to_openai(
     }
 
     if downstream_format == OutputFormat::OpenAI {
-        Ok(body_str.to_string())
+        Ok((body_str.to_string(), TokenUsage::from_openai_response(&body_str)))
     } else {
         // Client asked for anthropic format on the openai endpoint
         if body_str.contains("event:") || body_str.contains("data:") {
+            let usage = TokenUsage::default(); // streaming: usage in SSE, hard to extract
             crate::providers::openai::convert_sse_to_anthropic_stream(&body_str)
+                .map(|s| (s, usage))
         } else {
+            let usage = TokenUsage::from_openai_response(&body_str);
             let json: Value = serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
             let resp = convert_to_anthropic_response(&json)?;
-            serde_json::to_string(&resp).map_err(|e| e.to_string())
+            serde_json::to_string(&resp).map(|s| (s, usage)).map_err(|e| e.to_string())
         }
     }
 }
@@ -68,7 +71,7 @@ pub async fn proxy_non_stream_openai_to_openai(
     target_model: &str,
     body: &str,
     downstream_format: OutputFormat,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let client = build_client()?;
     let body_json: Value = serde_json::from_str(body)
         .map_err(|e| format!("请求体解析失败: {}", e))?;
@@ -101,11 +104,12 @@ pub async fn proxy_non_stream_openai_to_openai(
     }
 
     if downstream_format == OutputFormat::OpenAI {
-        Ok(body_str.to_string())
+        Ok((body_str.to_string(), TokenUsage::from_openai_response(&body_str)))
     } else {
+        let usage = TokenUsage::from_openai_response(&body_str);
         let json: Value = serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
         let resp = convert_to_anthropic_response(&json)?;
-        serde_json::to_string(&resp).map_err(|e| e.to_string())
+        serde_json::to_string(&resp).map(|s| (s, usage)).map_err(|e| e.to_string())
     }
 }
 
@@ -120,7 +124,7 @@ pub async fn proxy_anthropic_to_openai(
     upstream: &UpstreamConfig,
     target_model: &str,
     body: &str,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let openai_body = crate::providers::anthropic::anthropic_request_to_openai_json(body, target_model)?;
     let client = build_client()?;
 
@@ -153,11 +157,14 @@ pub async fn proxy_anthropic_to_openai(
 
     // Translate openai response back to anthropic format
     if body_str.contains("event:") || body_str.contains("data:") {
+        let usage = TokenUsage::default(); // streaming: usage in SSE
         crate::providers::openai::convert_sse_to_anthropic_stream(&body_str)
+            .map(|s| (s, usage))
     } else {
+        let usage = TokenUsage::from_openai_response(&body_str);
         let json: Value = serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
         let resp = convert_to_anthropic_response(&json)?;
-        serde_json::to_string(&resp).map_err(|e| e.to_string())
+        serde_json::to_string(&resp).map(|s| (s, usage)).map_err(|e| e.to_string())
     }
 }
 
@@ -165,7 +172,7 @@ pub async fn proxy_non_stream_anthropic_to_openai(
     upstream: &UpstreamConfig,
     target_model: &str,
     body: &str,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let openai_body = crate::providers::anthropic::anthropic_request_to_openai_json(body, target_model)?;
     let client = build_client()?;
 
@@ -196,9 +203,10 @@ pub async fn proxy_non_stream_anthropic_to_openai(
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
 
+    let usage = TokenUsage::from_openai_response(&body_str);
     let json: Value = serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
     let resp = convert_to_anthropic_response(&json)?;
-    serde_json::to_string(&resp).map_err(|e| e.to_string())
+    serde_json::to_string(&resp).map(|s| (s, usage)).map_err(|e| e.to_string())
 }
 
 // ============================================================================

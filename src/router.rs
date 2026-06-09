@@ -48,15 +48,15 @@ impl Router {
         let start = std::time::Instant::now();
 
         match providers::proxy_non_stream(upstream, &route.model, body, format).await {
-            Ok(response) => {
+            Ok((response, usage)) => {
                 *self.last_failover.write().await = false;
 
                 self.usage_tracker.record(crate::types::UsageRecord {
                     model: model_name.to_string(),
                     upstream: route.upstream.clone(),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.prompt_tokens + usage.completion_tokens,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -87,13 +87,13 @@ impl Router {
                     *self.last_failover.write().await = true;
 
                     match providers::proxy_non_stream(fallback_upstream, &fallback_route.model, body, format).await {
-                        Ok(response) => {
+                        Ok((response, usage)) => {
                             self.usage_tracker.record(crate::types::UsageRecord {
                                 model: model_name.to_string(),
                                 upstream: fallback_route.upstream.clone(),
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                total_tokens: 0,
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                total_tokens: usage.prompt_tokens + usage.completion_tokens,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
@@ -140,15 +140,15 @@ impl Router {
         let start = std::time::Instant::now();
 
         match providers::proxy(upstream, &route.model, body, format).await {
-            Ok(response) => {
+            Ok((response, usage)) => {
                 *self.last_failover.write().await = false;
 
                 self.usage_tracker.record(crate::types::UsageRecord {
                     model: model_name.to_string(),
                     upstream: route.upstream.clone(),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.prompt_tokens + usage.completion_tokens,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -179,13 +179,13 @@ impl Router {
                     *self.last_failover.write().await = true;
 
                     match providers::proxy(fallback_upstream, &fallback_route.model, body, format).await {
-                        Ok(response) => {
+                        Ok((response, usage)) => {
                             self.usage_tracker.record(crate::types::UsageRecord {
                                 model: model_name.to_string(),
                                 upstream: fallback_route.upstream.clone(),
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                total_tokens: 0,
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                total_tokens: usage.prompt_tokens + usage.completion_tokens,
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)

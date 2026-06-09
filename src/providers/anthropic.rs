@@ -1,7 +1,7 @@
 use crate::providers::OutputFormat;
 use crate::types::{
     AnthropicRequest, AnthropicContent, AnthropicMessage, AnthropicContentBlock,
-    AnthropicTool, AnthropicToolChoice,
+    AnthropicTool, AnthropicToolChoice, TokenUsage,
     UpstreamConfig, ChatCompletionsRequest, ContentValue, Message as OaiMessage,
     AnthropicMessagesRequest, AnthropicSystem,
     Tool as OaiTool, ToolChoice, ContentPart, FunctionDef,
@@ -19,7 +19,7 @@ pub async fn proxy_openai_to_anthropic(
     target_model: &str,
     body: &str,
     downstream_format: OutputFormat,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let client = build_client()?;
     let openai_req: ChatCompletionsRequest = serde_json::from_str(body)
         .map_err(|e| format!("请求体解析失败: {}", e))?;
@@ -54,8 +54,15 @@ pub async fn proxy_openai_to_anthropic(
 
     // Response translation: if downstream is openai, translate anthropic -> openai
     match downstream_format {
-        OutputFormat::Anthropic => Ok(body_str.to_string()),
-        OutputFormat::OpenAI => crate::providers::anthropic::anthropic_response_to_openai(&body_str),
+        OutputFormat::Anthropic => {
+            let usage = TokenUsage::from_anthropic_response(&body_str);
+            Ok((body_str.to_string(), usage))
+        }
+        OutputFormat::OpenAI => {
+            let usage = TokenUsage::from_anthropic_response(&body_str);
+            let converted = crate::providers::anthropic::anthropic_response_to_openai(&body_str)?;
+            Ok((converted, usage))
+        }
     }
 }
 
@@ -64,7 +71,7 @@ pub async fn proxy_non_stream_openai_to_anthropic(
     target_model: &str,
     body: &str,
     downstream_format: OutputFormat,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let client = build_client()?;
     let openai_req: ChatCompletionsRequest = serde_json::from_str(body)
         .map_err(|e| format!("请求体解析失败: {}", e))?;
@@ -98,11 +105,15 @@ pub async fn proxy_non_stream_openai_to_anthropic(
     }
 
     match downstream_format {
-        OutputFormat::Anthropic => Ok(body_str.to_string()),
+        OutputFormat::Anthropic => {
+            let usage = TokenUsage::from_anthropic_response(&body_str);
+            Ok((body_str.to_string(), usage))
+        }
         OutputFormat::OpenAI => {
+            let usage = TokenUsage::from_anthropic_response(&body_str);
             let json: Value = serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
             let resp = convert_anthropic_json_to_openai(&json)?;
-            serde_json::to_string(&resp).map_err(|e| e.to_string())
+            serde_json::to_string(&resp).map(|s| (s, usage)).map_err(|e| e.to_string())
         }
     }
 }
@@ -115,7 +126,7 @@ pub async fn proxy_anthropic_to_anthropic(
     upstream: &UpstreamConfig,
     target_model: &str,
     body: &str,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let client = build_client()?;
     let mut req_json: Value = serde_json::from_str(body)
         .map_err(|e| format!("请求体解析失败: {}", e))?;
@@ -151,14 +162,15 @@ pub async fn proxy_anthropic_to_anthropic(
         );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
-    Ok(body_str.to_string())
+    let usage = TokenUsage::from_anthropic_response(&body_str);
+    Ok((body_str.to_string(), usage))
 }
 
 pub async fn proxy_non_stream_anthropic_to_anthropic(
     upstream: &UpstreamConfig,
     target_model: &str,
     body: &str,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     proxy_anthropic_to_anthropic(upstream, target_model, body).await
 }
 
