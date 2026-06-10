@@ -17,7 +17,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "ok",
-        "version": "0.1.1",
+        "version": env!("CARGO_PKG_VERSION"),
         "models": state.config.models.keys().collect::<Vec<_>>(),
         "uptime": uptime
     }))
