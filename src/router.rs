@@ -120,7 +120,7 @@ impl Router {
                     }
 
                     self.usage_tracker.record(crate::types::UsageRecord {
-                        model: model_name.to_string(),
+                        model: target_model_name.to_string(),
                         upstream: current_upstream.clone(),
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
@@ -220,7 +220,7 @@ impl Router {
                     }
 
                     self.usage_tracker.record(crate::types::UsageRecord {
-                        model: model_name.to_string(),
+                        model: target_model_name.to_string(),
                         upstream: current_upstream.clone(),
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
