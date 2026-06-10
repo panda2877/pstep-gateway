@@ -82,7 +82,7 @@ jobs:
             echo "=== Gateway Status ==="
             sudo systemctl is-active pstep-gateway
             echo "=== Health Check ==="
-            curl -s http://localhost:3001/health || echo "health endpoint not available"
+            curl -s http://localhost:3002/health || echo "health endpoint not available"
             echo ""
           '
 

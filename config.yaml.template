@@ -1,5 +1,5 @@
-port: 3001
-public_url: "http://localhost:3001"
+port: 3002
+public_url: "http://localhost:3002"
 
 upstreams:
   openai:
@@ -30,7 +30,9 @@ models:
   claude-sonnet:
     upstream: anthropic
     model: "claude-3-5-sonnet-20241022"
-    fallback: gpt-4o
+    fallback_chain:
+      - gpt-4o        # First fallback
+      - deepseek-chat # Second fallback
     metadata:
       name: "Claude Sonnet"
       reasoning: false
@@ -56,3 +58,10 @@ models:
 usage_tracking:
   enabled: true
   retention_hours: 24
+
+# Thaw (freeze/unfreeze) configuration for automatic model recovery
+# thaw:
+#   freeze_duration_minutes: 15    # How long to keep a model frozen after failure
+#   recovery_threshold: 0.8        # Success rate threshold (>= 80%) to consider healthy
+#   min_requests_to_freeze: 5      # Minimum requests before triggering freeze
+#   recovering_attempts: 3         # Consecutive successes needed to recover

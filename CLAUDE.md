@@ -41,7 +41,7 @@ src/
 5. Response returned (format controlled by `?format=openai|anthropic` query param)
 
 **Key behaviors**:
-- Only listens on `127.0.0.1:3001` — expects reverse proxy in front
+- Only listens on `127.0.0.1:3002` — expects reverse proxy in front
 - `GET /api/models` returns model metadata + API key for agent integration (no auth)
 - `GET /v1/models` returns OpenAI-compatible model list (no auth)
 - `X-Pstep-Failover` response header set if fallback was used

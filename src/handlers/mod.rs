@@ -60,3 +60,18 @@ pub async fn api_models(State(state): State<AppState>) -> impl IntoResponse {
         "apiKey": "pstep-gateway-key"
     }))
 }
+
+pub async fn health_status(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(ref tracker) = state.thaw_tracker {
+        let health = tracker.get_all_health().await;
+        Json(serde_json::json!({
+            "thaw_enabled": true,
+            "models": health
+        }))
+    } else {
+        Json(serde_json::json!({
+            "thaw_enabled": false,
+            "models": {}
+        }))
+    }
+}

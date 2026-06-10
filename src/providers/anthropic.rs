@@ -818,37 +818,3 @@ fn convert_anthropic_sse_to_openai(sse: &str) -> Result<String, String> {
     }
     Ok(out)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn debug_anthropic_to_openai() {
-        let body = r#"{
-          "model": "minimax",
-          "max_tokens": 50,
-          "tools": [{"name": "search", "input_schema": {"type":"object"}}],
-          "messages": [
-            {"role": "user", "content": "query"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_D", "name": "search", "input": {"q":"x"}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}]}
-          ]
-        }"#;
-        let result = anthropic_request_to_openai_json(body, "MiniMax-M2.7").unwrap();
-        eprintln!("=== Case A: tool_result-only user ===\n{}\n=== end ===", result);
-
-        // Case B: user message with mixed text + tool_result blocks (text should be preserved)
-        let body2 = r#"{
-          "model": "minimax",
-          "messages": [
-            {"role": "user", "content": [
-              {"type": "text", "text": "Please call"},
-              {"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}
-            ]}
-          ]
-        }"#;
-        let result2 = anthropic_request_to_openai_json(body2, "MiniMax-M2.7").unwrap();
-        eprintln!("=== Case B: text + tool_result ===\n{}\n=== end ===", result2);
-        panic!("intentional");
-    }
-}

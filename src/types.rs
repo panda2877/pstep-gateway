@@ -9,6 +9,8 @@ pub struct GatewayConfig {
     pub usage_tracking: UsageConfig,
     #[serde(default)]
     pub public_url: Option<String>,
+    #[serde(default)]
+    pub thaw: Option<ThawConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -31,7 +33,9 @@ pub struct ModelRoute {
     pub upstream: String,
     pub model: String,
     #[serde(default)]
-    pub fallback: Option<String>,
+    pub fallback: Option<String>,  // 兼容旧配置
+    #[serde(default)]
+    pub fallback_chain: Vec<String>,  // 新增：链式 fallback
     #[serde(default)]
     pub metadata: Option<ModelMetadata>,
 }
@@ -54,6 +58,32 @@ pub struct ModelMetadata {
 pub struct UsageConfig {
     pub enabled: bool,
     pub retention_hours: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThawConfig {
+    #[serde(default = "default_freeze_duration")]
+    pub freeze_duration_minutes: u32,
+    #[serde(default = "default_recovery_threshold")]
+    pub recovery_threshold: f32,
+    #[serde(default)]
+    pub min_requests_to_freeze: u64,
+    #[serde(default = "default_recovering_attempts")]
+    pub recovering_attempts: u8,
+}
+
+fn default_freeze_duration() -> u32 { 15 }
+fn default_recovery_threshold() -> f32 { 0.8 }
+fn default_recovering_attempts() -> u8 { 3 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelHealthStatus {
+    pub state: String,
+    pub success_rate: f32,
+    pub total_requests: u64,
+    pub failed_requests: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_until: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

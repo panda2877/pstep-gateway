@@ -2,6 +2,7 @@ mod config;
 mod handlers;
 mod providers;
 mod router;
+mod thaw;
 mod types;
 mod usage;
 
@@ -17,6 +18,7 @@ use crate::router::Router as GatewayRouter;
 pub struct AppState {
     pub config: Arc<types::GatewayConfig>,
     pub router: Arc<GatewayRouter>,
+    pub thaw_tracker: Option<Arc<thaw::ThawTracker>>,
 }
 
 #[tokio::main]
@@ -28,11 +30,20 @@ async fn main() {
     println!("╚══════════════════════════════════════╝");
 
     let config = load_config();
-    let gateway_router = GatewayRouter::new(config.clone());
+
+    // Initialize thaw tracker if configured
+    let thaw_tracker = if let Some(thaw_config) = &config.thaw {
+        Some(Arc::new(thaw::ThawTracker::new(thaw_config.clone())))
+    } else {
+        None
+    };
+
+    let gateway_router = GatewayRouter::new(config.clone(), thaw_tracker.clone());
 
     let state = AppState {
         config: Arc::new(config.clone()),
         router: Arc::new(gateway_router),
+        thaw_tracker,
     };
 
     let cors = CorsLayer::new()
@@ -47,6 +58,7 @@ async fn main() {
         .route("/stats", axum::routing::get(handlers::stats))
         .route("/stats/recent", axum::routing::get(handlers::stats_recent))
         .route("/api/models", axum::routing::get(handlers::api_models))
+        .route("/api/health", axum::routing::get(handlers::health_status))
         .layer(cors)
         .with_state(state);
 
