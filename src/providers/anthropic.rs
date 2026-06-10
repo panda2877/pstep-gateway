@@ -11,6 +11,40 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 // ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn debug_anthropic_to_openai() {
+        let body = r#"{
+          "model": "minimax",
+          "max_tokens": 50,
+          "tools": [{"name": "search", "input_schema": {"type":"object"}}],
+          "messages": [
+            {"role": "user", "content": "query"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_D", "name": "search", "input": {"q":"x"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}]}
+          ]
+        }"#;
+        let result = anthropic_request_to_openai_json(body, "MiniMax-M2.7").unwrap();
+        eprintln!("=== Case A: tool_result-only user ===\n{}\n=== end ===", result);
+
+        let body2 = r#"{
+          "model": "minimax",
+          "messages": [
+            {"role": "user", "content": [
+              {"type": "text", "text": "Please call"},
+              {"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}
+            ]}
+          ]
+        }"#;
+        let result2 = anthropic_request_to_openai_json(body2, "MiniMax-M2.7").unwrap();
+        eprintln!("=== Case B: text + tool_result ===\n{}\n=== end ===", result2);
+        panic!("intentional");
+    }
+}
+
+// ============================================================================
 // openai -> anthropic  (request translation, response based on downstream format)
 // ============================================================================
 
@@ -406,14 +440,24 @@ pub fn anthropic_request_to_openai_json(
         let mut tool_calls: Vec<serde_json::Value> = Vec::new();
         let mut tool_result_messages: Vec<OaiMessage> = Vec::new();
         let mut text_parts: Vec<ContentPart> = Vec::new();
+        // Track whether the source message contained anything other than
+        // tool_result blocks. If only tool_result blocks are present, the
+        // source message itself was a synthetic carrier — we must not emit a
+        // duplicate empty user message that confuses upstream tool-call
+        // validators ("tool call result does not follow tool call").
+        let mut has_non_tool_result = false;
 
         let content = match &m.content {
-            Value::String(s) => ContentValue::String(s.clone()),
+            Value::String(s) => {
+                has_non_tool_result = true;
+                ContentValue::String(s.clone())
+            }
             Value::Array(arr) => {
                 for v in arr {
                     let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match part_type {
                         "text" => {
+                            has_non_tool_result = true;
                             if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                                 text_parts.push(ContentPart {
                                     part_type: "text".to_string(),
@@ -423,6 +467,7 @@ pub fn anthropic_request_to_openai_json(
                             }
                         }
                         "tool_use" => {
+                            has_non_tool_result = true;
                             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let input = v.get("input").cloned().unwrap_or(json!({}));
@@ -436,6 +481,9 @@ pub fn anthropic_request_to_openai_json(
                             }));
                         }
                         "tool_result" => {
+                            // tool_result blocks are extracted into role="tool"
+                            // messages; they do NOT contribute to the source
+                            // message's content.
                             let tool_use_id = v.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let result_text = v.get("content").map(|c| c.to_string()).unwrap_or_default();
                             tool_result_messages.push(OaiMessage {
@@ -458,16 +506,25 @@ pub fn anthropic_request_to_openai_json(
                     ContentValue::Array(text_parts)
                 }
             }
-            _ => ContentValue::String(m.content.to_string()),
+            _ => {
+                has_non_tool_result = true;
+                ContentValue::String(m.content.to_string())
+            }
         };
-        let role = if m.role == "assistant" { "assistant" } else { "user" };
-        messages.push(OaiMessage {
-            role: role.to_string(),
-            content,
-            name: None,
-            tool_call_id: None,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
-        });
+
+        // Only emit the source message if it carried something other than
+        // tool_result blocks. Otherwise the tool_result extraction below is
+        // the only meaningful translation of this source message.
+        if has_non_tool_result {
+            let role = if m.role == "assistant" { "assistant" } else { "user" };
+            messages.push(OaiMessage {
+                role: role.to_string(),
+                content,
+                name: None,
+                tool_call_id: None,
+                tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            });
+        }
         // tool_result blocks become role="tool" messages
         for tr in tool_result_messages {
             messages.push(tr);
@@ -760,4 +817,38 @@ fn convert_anthropic_sse_to_openai(sse: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn debug_anthropic_to_openai() {
+        let body = r#"{
+          "model": "minimax",
+          "max_tokens": 50,
+          "tools": [{"name": "search", "input_schema": {"type":"object"}}],
+          "messages": [
+            {"role": "user", "content": "query"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_D", "name": "search", "input": {"q":"x"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}]}
+          ]
+        }"#;
+        let result = anthropic_request_to_openai_json(body, "MiniMax-M2.7").unwrap();
+        eprintln!("=== Case A: tool_result-only user ===\n{}\n=== end ===", result);
+
+        // Case B: user message with mixed text + tool_result blocks (text should be preserved)
+        let body2 = r#"{
+          "model": "minimax",
+          "messages": [
+            {"role": "user", "content": [
+              {"type": "text", "text": "Please call"},
+              {"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}
+            ]}
+          ]
+        }"#;
+        let result2 = anthropic_request_to_openai_json(body2, "MiniMax-M2.7").unwrap();
+        eprintln!("=== Case B: text + tool_result ===\n{}\n=== end ===", result2);
+        panic!("intentional");
+    }
 }

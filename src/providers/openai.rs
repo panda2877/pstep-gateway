@@ -127,7 +127,8 @@ pub async fn proxy_anthropic_to_openai(
     target_model: &str,
     body: &str,
 ) -> Result<(String, TokenUsage), String> {
-    let openai_body = crate::providers::anthropic::anthropic_request_to_openai_json(body, target_model)?;
+    let openai_body_raw = crate::providers::anthropic::anthropic_request_to_openai_json(body, target_model)?;
+    let openai_body = prepare_openai_body(serde_json::from_str(&openai_body_raw).unwrap_or(json!({})), target_model);
     let client = build_client()?;
 
     let resp = client
