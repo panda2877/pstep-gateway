@@ -240,6 +240,14 @@ fn prepare_openai_body(body_json: Value, target_model: &str) -> String {
     let mut new_obj = obj.clone();
     new_obj.insert("model".to_string(), json!(target_model));
 
+    // For streaming requests, set stream_options.include_usage so the upstream
+    // sends usage data in the final SSE chunk. This enables token tracking for
+    // all streaming calls (minimax, mimo, etc.).
+    let is_streaming = new_obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if is_streaming {
+        new_obj.insert("stream_options".to_string(), json!({"include_usage": true}));
+    }
+
     // Ensure each tool has a "type" field
     if let Some(tools) = new_obj.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
