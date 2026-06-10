@@ -55,11 +55,19 @@ pub async fn proxy_openai_to_anthropic(
     // Response translation: if downstream is openai, translate anthropic -> openai
     match downstream_format {
         OutputFormat::Anthropic => {
-            let usage = TokenUsage::from_anthropic_response(&body_str);
+            let usage = if body_str.contains("event:") || body_str.contains("data:") {
+                TokenUsage::from_anthropic_sse(&body_str)
+            } else {
+                TokenUsage::from_anthropic_response(&body_str)
+            };
             Ok((body_str.to_string(), usage))
         }
         OutputFormat::OpenAI => {
-            let usage = TokenUsage::from_anthropic_response(&body_str);
+            let usage = if body_str.contains("event:") || body_str.contains("data:") {
+                TokenUsage::from_anthropic_sse(&body_str)
+            } else {
+                TokenUsage::from_anthropic_response(&body_str)
+            };
             let converted = crate::providers::anthropic::anthropic_response_to_openai(&body_str)?;
             Ok((converted, usage))
         }
@@ -162,7 +170,11 @@ pub async fn proxy_anthropic_to_anthropic(
         );
         return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
     }
-    let usage = TokenUsage::from_anthropic_response(&body_str);
+    let usage = if body_str.contains("event:") || body_str.contains("data:") {
+        TokenUsage::from_anthropic_sse(&body_str)
+    } else {
+        TokenUsage::from_anthropic_response(&body_str)
+    };
     Ok((body_str.to_string(), usage))
 }
 

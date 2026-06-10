@@ -111,6 +111,84 @@ impl TokenUsage {
                 .unwrap_or(0) as u32,
         }
     }
+
+    /// Extract token usage from an OpenAI-format SSE stream.
+    /// OpenAI sends `usage` in the final chunk when `stream_options.include_usage`
+    /// is set; some providers send it unconditionally. We take the last seen
+    /// non-zero usage, since later chunks supersede earlier ones.
+    pub fn from_openai_sse(body: &str) -> Self {
+        let mut usage = Self::default();
+        let mut found = false;
+        for line in body.lines() {
+            let line = line.trim();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line[6..];
+            if data == "[DONE]" {
+                continue;
+            }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if let Some(u) = json.get("usage") {
+                let p = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let c = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if p > 0 || c > 0 || found {
+                    usage.prompt_tokens = p;
+                    usage.completion_tokens = c;
+                    found = true;
+                }
+            }
+        }
+        usage
+    }
+
+    /// Extract token usage from an Anthropic-format SSE stream.
+    /// - `message_start.message.usage.input_tokens` carries the input count
+    /// - `message_delta.usage.output_tokens` carries the cumulative output count
+    pub fn from_anthropic_sse(body: &str) -> Self {
+        let mut prompt_tokens: u32 = 0;
+        let mut completion_tokens: u32 = 0;
+        let mut current_prefix = "";
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with("event: ") {
+                current_prefix = &line[7..];
+                continue;
+            }
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line[6..];
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            // message_start carries input_tokens
+            if current_prefix == "message_start" {
+                if let Some(u) = json.get("message").and_then(|m| m.get("usage")) {
+                    prompt_tokens = u.get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                }
+            }
+            // message_delta carries cumulative output_tokens
+            if current_prefix == "message_delta" {
+                if let Some(u) = json.get("usage") {
+                    let out = u.get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    if out > completion_tokens {
+                        completion_tokens = out;
+                    }
+                }
+            }
+        }
+        Self { prompt_tokens, completion_tokens }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

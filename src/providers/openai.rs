@@ -50,11 +50,13 @@ pub async fn proxy_openai_to_openai(
     }
 
     if downstream_format == OutputFormat::OpenAI {
-        Ok((body_str.to_string(), TokenUsage::from_openai_response(&body_str)))
+        // Streaming upstream -> downstream: SSE passthrough
+        let usage = TokenUsage::from_openai_sse(&body_str);
+        Ok((body_str.to_string(), usage))
     } else {
         // Client asked for anthropic format on the openai endpoint
         if body_str.contains("event:") || body_str.contains("data:") {
-            let usage = TokenUsage::default(); // streaming: usage in SSE, hard to extract
+            let usage = TokenUsage::from_openai_sse(&body_str);
             crate::providers::openai::convert_sse_to_anthropic_stream(&body_str)
                 .map(|s| (s, usage))
         } else {
@@ -157,7 +159,7 @@ pub async fn proxy_anthropic_to_openai(
 
     // Translate openai response back to anthropic format
     if body_str.contains("event:") || body_str.contains("data:") {
-        let usage = TokenUsage::default(); // streaming: usage in SSE
+        let usage = TokenUsage::from_openai_sse(&body_str);
         crate::providers::openai::convert_sse_to_anthropic_stream(&body_str)
             .map(|s| (s, usage))
     } else {
@@ -304,6 +306,9 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
     let mut sent_content_block_start = false;
     let mut thinking_started = false;
     let mut current_prefix = "data:";
+    // Track which tool_use block indices we've emitted content_block_start for.
+    let mut started_tool_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut tool_block_counter: usize = 0;
 
     for line in sse_data.lines() {
         let line = line.trim();
@@ -327,6 +332,8 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
                 &mut sent_message_start,
                 &mut sent_content_block_start,
                 &mut thinking_started,
+                &mut started_tool_blocks,
+                &mut tool_block_counter,
                 &mut output,
             );
         }
@@ -340,6 +347,8 @@ fn convert_openai_chunk_to_anthropic(
     sent_message_start: &mut bool,
     sent_content_block_start: &mut bool,
     thinking_started: &mut bool,
+    started_tool_blocks: &mut std::collections::HashSet<usize>,
+    tool_block_counter: &mut usize,
     output: &mut String,
 ) -> Option<()> {
     let id = chunk.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -363,6 +372,75 @@ fn convert_openai_chunk_to_anthropic(
             }
         });
         output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
+        return Some(());
+    }
+
+    // Handle tool_calls streaming: emit content_block_start (tool_use) and
+    // input_json_delta events so that downstream Anthropic clients see proper
+    // tool_use blocks. Without this, the next request's tool_result blocks
+    // would fail with "tool call result does not follow tool call".
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+        for tc in tool_calls {
+            let oa_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            // Close any open thinking/text block before opening tool_use.
+            if *sent_content_block_start && (*thinking_started || oa_index == 0) {
+                let stop_event = json!({"type": "content_block_stop", "index": oa_index});
+                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                *thinking_started = false;
+            }
+
+            // Emit content_block_start once per tool_use index.
+            if !started_tool_blocks.contains(&oa_index) {
+                started_tool_blocks.insert(oa_index);
+                let tool_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tool_name = tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let block_index = *tool_block_counter;
+                *tool_block_counter += 1;
+                let start_event = json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {}
+                    }
+                });
+                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                *sent_content_block_start = true;
+
+                // Emit any initial arguments if present.
+                if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                    if !args.is_empty() {
+                        let delta_event = json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "input_json_delta", "partial_json": args}
+                        });
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                    }
+                }
+            } else {
+                // Subsequent chunk for an existing tool block: emit argument delta.
+                if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                    if !args.is_empty() {
+                        // Map openai index back to our sequential block index.
+                        let block_index = started_tool_blocks.iter().position(|&i| i == oa_index).unwrap_or(oa_index);
+                        let delta_event = json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "input_json_delta", "partial_json": args}
+                        });
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                    }
+                }
+            }
+        }
         return Some(());
     }
 
