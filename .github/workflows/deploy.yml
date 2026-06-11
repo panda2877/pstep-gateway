@@ -99,13 +99,13 @@ jobs:
           # ============ 部署前端 ============
           echo '部署前端 admin (端口 3003)...'
           $SSHD 'sudo mkdir -p /opt/pstep/admin'
-          $SSHD 'sudo rm -rf /opt/pstep/admin/*'
+          $SSHD 'sudo rm -rf /opt/pstep/admin/dist'
           tar -czf frontend-dist.tar.gz -C ./frontend dist
           cat ./frontend-dist.tar.gz | $SSHD 'sudo tar -xzf - -C /opt/pstep/admin'
           $SSHD 'sudo chown -R root:root /opt/pstep/admin'
 
           # 创建前端服务文件
-          SVC_B64=$(printf '[Unit]\nDescription=Pstep Admin Frontend\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=/opt/pstep/admin\nExecStart=/usr/bin/npx --yes serve -s . -l 3003\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n' | base64 -w0)
+          SVC_B64=$(printf '[Unit]\nDescription=Pstep Admin Frontend\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=/opt/pstep/admin/dist\nExecStart=/usr/bin/npx --yes serve -s . -l 3003\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n' | base64 -w0)
           $SSHD "echo $SVC_B64 | base64 -d | sudo tee /etc/systemd/system/pstep-admin.service > /dev/null"
 
           $SSHD 'sudo systemctl daemon-reload'
