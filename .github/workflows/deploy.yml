@@ -102,23 +102,8 @@ jobs:
           $SSHD 'sudo chown -R root:root /opt/pstep/admin'
 
           # 创建前端服务文件
-          cat > pstep-admin.service << 'EOF'
-[Unit]
-Description=Pstep Admin Frontend
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/pstep/admin
-ExecStart=/usr/bin/npx --yes serve -s . -l 3003
-Restart=always
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-          cat ./pstep-admin.service | $SSHD 'sudo tee /etc/systemd/system/pstep-admin.service > /dev/null'
+          SERVICE_CONTENT="[Unit]\nDescription=Pstep Admin Frontend\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory=/opt/pstep/admin\nExecStart=/usr/bin/npx --yes serve -s . -l 3003\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target"
+          $SSHD "printf '%s' '$SERVICE_CONTENT' | sudo tee /etc/systemd/system/pstep-admin.service > /dev/null"
 
           $SSHD 'sudo systemctl daemon-reload'
           $SSHD 'sudo systemctl start pstep-admin'
@@ -138,6 +123,6 @@ EOF
             echo ""
           '
 
-          echo '✅ 前后端部署完成!'
-          echo '   - 后端 Gateway: http://134.175.163.213:3002'
-          echo '   - 前端 Admin:  http://134.175.163.213:3003'
+          echo "=== Deploy Complete ==="
+          echo "Backend Gateway: http://SERVER_HOST:3002"
+          echo "Frontend Admin: http://SERVER_HOST:3003"
