@@ -30,6 +30,9 @@ jobs:
   deploy:
     name: Build & Deploy Gateway
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
 
     steps:
       - name: 🔨 Checkout
