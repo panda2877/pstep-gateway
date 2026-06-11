@@ -1,5 +1,5 @@
 # ============================================================================
-# Pstep Gateway — Rust 版自动部署工作流
+# Pstep Gateway — 自动部署工作流（前后端）
 # 触发方式：
 #   1. 手动触发 (workflow_dispatch)
 #   2. push 到 main 分支时自动触发
@@ -19,9 +19,11 @@ on:
       - main
     paths:
       - 'src/**'
+      - 'frontend/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - 'package.json'
       - '.github/workflows/deploy.yml'
 
 jobs:
@@ -33,15 +35,33 @@ jobs:
       - name: 🔨 Checkout
         uses: actions/checkout@v6
 
+      # ============ 后端构建 ============
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 📦 Build Release
+      - name: 📦 Build Backend Release
         run: cargo build --release
 
-      - name: 📤 Copy Binary
+      - name: 📤 Copy Backend Binary
         run: cp target/release/pstep-gateway ./gateway-bin
 
+      # ============ 前端构建 ============
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-depends-paths: 'frontend/package-lock.json'
+
+      - name: 📦 Install Frontend Dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: 🎨 Build Frontend
+        working-directory: ./frontend
+        run: npm run build
+
+      # ============ 部署到服务器 ============
       - name: 🚀 Deploy to server
         env:
           SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
@@ -58,32 +78,66 @@ jobs:
 
           SSHD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key ${SERVER_USER}@${SERVER_HOST}"
 
-          echo '停止 gateway 服务...'
+          echo '停止旧服务...'
           $SSHD 'sudo systemctl stop pstep-gateway || true'
+          $SSHD 'sudo systemctl stop pstep-admin || true'
 
           echo '备份...'
           TS=$(date +%Y%m%d_%H%M%S)
-          $SSHD "if [ -d /opt/pstep/gateway ]; then sudo mkdir -p /opt/pstep/backups/\${TS} && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/\${TS}/; fi"
+          $SSHD "if [ -d /opt/pstep ]; then sudo mkdir -p /opt/pstep/backups/\${TS} && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/\${TS}/ 2>/dev/null || true; fi"
 
-          echo '部署 gateway...'
+          # ============ 部署后端 ============
+          echo '部署后端 gateway (端口 3002)...'
           $SSHD 'sudo mkdir -p /opt/pstep/gateway'
           cat ./gateway-bin | $SSHD 'sudo tee /opt/pstep/gateway/pstep-gateway > /dev/null'
           $SSHD 'sudo chmod +x /opt/pstep/gateway/pstep-gateway'
-
-          # 如果有配置文件需要更新
-          $SSHD 'if [ -f /opt/pstep/gateway/config.yaml ]; then sudo cp /opt/pstep/gateway/config.yaml /opt/pstep/gateway/config.yaml.new || true; fi'
-
-          echo '启动 gateway...'
           $SSHD 'sudo systemctl start pstep-gateway'
 
+          # ============ 部署前端 ============
+          echo '部署前端 admin (端口 3003)...'
+          $SSHD 'sudo mkdir -p /opt/pstep/admin'
+          $SSHD 'sudo rm -rf /opt/pstep/admin/*'
+          tar -czf frontend-dist.tar.gz -C ./frontend dist
+          cat ./frontend-dist.tar.gz | $SSHD 'sudo tar -xzf - -C /opt/pstep/admin'
+          $SSHD 'sudo chown -R root:root /opt/pstep/admin'
+
+          # 创建前端服务文件
+          cat > pstep-admin.service << 'EOF'
+[Unit]
+Description=Pstep Admin Frontend
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pstep/admin
+ExecStart=/usr/bin/npx --yes serve -s . -l 3003
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+          cat ./pstep-admin.service | $SSHD 'sudo tee /etc/systemd/system/pstep-admin.service > /dev/null'
+
+          $SSHD 'sudo systemctl daemon-reload'
+          $SSHD 'sudo systemctl start pstep-admin'
+
           echo '健康检查...'
-          sleep 3
+          sleep 5
           $SSHD '
             echo "=== Gateway Status ==="
             sudo systemctl is-active pstep-gateway
-            echo "=== Health Check ==="
+            echo "=== Admin Status ==="
+            sudo systemctl is-active pstep-admin
+            echo "=== Health Check (Gateway) ==="
             curl -s http://localhost:3002/health || echo "health endpoint not available"
+            echo ""
+            echo "=== Health Check (Admin) ==="
+            curl -s -o /dev/null -w "%{http_code}" http://localhost:3003 || echo "admin not available"
             echo ""
           '
 
-          echo '✅ Gateway 部署完成!'
+          echo '✅ 前后端部署完成!'
+          echo '   - 后端 Gateway: http://134.175.163.213:3002'
+          echo '   - 前端 Admin:  http://134.175.163.213:3003'
