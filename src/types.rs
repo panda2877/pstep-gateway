@@ -434,3 +434,112 @@ pub struct AnthropicMessagesMessage {
     pub role: String,
     pub content: serde_json::Value,
 }
+
+// ============= Admin API Types =============
+
+/// Usage statistics for admin dashboard
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminUsageStats {
+    pub token_total: u64,
+    pub token_input: u64,
+    pub token_output: u64,
+    pub cost: f64,
+    pub change_percent: f32,
+    pub period: String,
+}
+
+/// Model distribution for admin dashboard
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelDistribution {
+    pub name: String,
+    pub color: String,
+    pub percent: f32,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminDistributionResponse {
+    pub models: Vec<ModelDistribution>,
+    pub period: String,
+}
+
+/// Model configuration for admin
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub version: String,
+    pub status: String,
+    pub timeout_secs: u32,
+    pub max_tokens: u32,
+    pub upstream: String,
+    pub fallback_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateModelConfigRequest {
+    pub timeout_secs: Option<u32>,
+    pub max_tokens: Option<u32>,
+    pub status: Option<String>,
+}
+
+/// API Key for admin
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub key_prefix: String,
+    pub key_masked: String,
+    pub model_permissions: Vec<String>,
+    pub quota_limit: u64,
+    pub quota_used: u64,
+    pub quota_percent: f32,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub name: String,
+    pub model_permissions: Vec<String>,
+    pub quota_limit: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateApiKeyResponse {
+    pub key: ApiKey,
+    pub raw_key: String,
+}
+
+/// Fallback policy for admin
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackPolicy {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub chain: Vec<ChainNode>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainNode {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateFallbackPolicyRequest {
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub chain: Vec<ChainNode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateFallbackPolicyRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub enabled: Option<bool>,
+    pub chain: Option<Vec<ChainNode>>,
+}

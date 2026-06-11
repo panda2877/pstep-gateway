@@ -1,3 +1,4 @@
+mod admin;
 mod config;
 mod handlers;
 mod providers;
@@ -6,6 +7,9 @@ mod thaw;
 mod types;
 mod usage;
 
+use admin::apikeys::ApiKeyStore;
+use admin::fallback::FallbackPolicyStore;
+use admin::usage as admin_usage;
 use axum::Router;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -19,6 +23,8 @@ pub struct AppState {
     pub config: Arc<types::GatewayConfig>,
     pub router: Arc<GatewayRouter>,
     pub thaw_tracker: Option<Arc<thaw::ThawTracker>>,
+    pub api_key_store: Arc<ApiKeyStore>,
+    pub fallback_policy_store: Arc<FallbackPolicyStore>,
 }
 
 #[tokio::main]
@@ -44,6 +50,8 @@ async fn main() {
         config: Arc::new(config.clone()),
         router: Arc::new(gateway_router),
         thaw_tracker,
+        api_key_store: Arc::new(ApiKeyStore::new()),
+        fallback_policy_store: Arc::new(FallbackPolicyStore::new()),
     };
 
     let cors = CorsLayer::new()
@@ -59,6 +67,20 @@ async fn main() {
         .route("/stats/recent", axum::routing::get(handlers::stats_recent))
         .route("/api/models", axum::routing::get(handlers::api_models))
         .route("/api/health", axum::routing::get(handlers::health_status))
+        // Admin API routes
+        .route("/api/admin/usage/stats", axum::routing::get(admin_usage::usage_stats))
+        .route("/api/admin/usage/distribution", axum::routing::get(admin_usage::usage_distribution))
+        .route("/api/admin/models", axum::routing::get(admin::models::list_models))
+        .route("/api/admin/models/{id}", axum::routing::get(admin::models::get_model))
+        .route("/api/admin/models/{id}", axum::routing::put(admin::models::update_model))
+        .route("/api/admin/keys", axum::routing::get(admin::apikeys::list_keys))
+        .route("/api/admin/keys", axum::routing::post(admin::apikeys::create_key))
+        .route("/api/admin/keys/{id}", axum::routing::delete(admin::apikeys::delete_key))
+        .route("/api/admin/fallback/policies", axum::routing::get(admin::fallback::list_policies))
+        .route("/api/admin/fallback/policies", axum::routing::post(admin::fallback::create_policy))
+        .route("/api/admin/fallback/policies/{id}", axum::routing::get(admin::fallback::get_policy))
+        .route("/api/admin/fallback/policies/{id}", axum::routing::put(admin::fallback::update_policy))
+        .route("/api/admin/fallback/policies/{id}", axum::routing::delete(admin::fallback::delete_policy))
         .layer(cors)
         .with_state(state);
 
