@@ -19,7 +19,7 @@ export const TopNav: React.FC = () => {
           }
         });
       },
-      { threshold: 0.3, rootMargin: '-60px 0px -40% 0px' }
+      { threshold: 0, rootMargin: '-70px 0px -70% 0px' }
     );
 
     SECTIONS.forEach(({ id }) => {

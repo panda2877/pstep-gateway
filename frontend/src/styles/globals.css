@@ -40,7 +40,7 @@ p { text-wrap: pretty; }
 h1, h2, h3, h4 { text-wrap: balance; }
 
 .container { max-width: var(--container); margin-inline: auto; padding-inline: var(--gutter); }
-.section { padding-block: var(--gap-xl); }
+.section { padding-block: var(--gap-xl); scroll-margin-top: 70px; }
 .section + .section { border-top: 1px solid var(--border); }
 .stack { display: flex; flex-direction: column; }
 .stack > * + * { margin-top: var(--gap-md); }
