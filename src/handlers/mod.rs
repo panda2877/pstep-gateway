@@ -48,9 +48,13 @@ pub async fn api_models(State(state): State<AppState>) -> impl IntoResponse {
                 "baseUrl": base_url,
                 "reasoning": meta.map(|m| m.reasoning).unwrap_or(false),
                 "input": meta.map(|m| m.input.clone()).unwrap_or_else(|| vec!["text".to_string()]),
-                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                "cost": {
+                    "input": meta.and_then(|m| m.price_per_input).unwrap_or(0.0),
+                    "output": meta.and_then(|m| m.price_per_output).unwrap_or(0.0),
+                    "cacheRead": 0,
+                    "cacheWrite": 0
+                },
                 "contextWindow": meta.and_then(|m| m.context_window).unwrap_or(128000),
-                "maxTokens": meta.and_then(|m| m.max_tokens).unwrap_or(4096),
             })
         })
         .collect();

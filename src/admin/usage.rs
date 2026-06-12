@@ -63,8 +63,33 @@ pub async fn usage_stats(
     let token_output: u64 = filtered.iter().map(|r| r.completion_tokens as u64).sum();
     let token_total = token_input + token_output;
 
-    // Estimate cost (simplified pricing: $0.001/1K input, $0.003/1K output)
-    let cost = (token_input as f64 * 0.000001) + (token_output as f64 * 0.000003);
+    // Calculate cost using model-specific pricing from config
+    let mut total_cost = 0.0;
+    for r in &filtered {
+        let mut price_input = 0.0;
+        let mut price_output = 0.0;
+        let record_model_lower = r.model.to_lowercase();
+
+        // Match by config.model field (e.g., "MiniMax-M2.7") or config key (e.g., "minimax")
+        for (_, model_config) in &state.config.models {
+            let config_model_lower = model_config.model.to_lowercase();
+            // Exact match on model field, or match on config key
+            if config_model_lower == record_model_lower ||
+               model_config.model.to_lowercase() == record_model_lower ||
+               record_model_lower.contains(&config_model_lower) ||
+               config_model_lower.contains(&record_model_lower) {
+                if let Some(meta) = &model_config.metadata {
+                    price_input = meta.price_per_input.unwrap_or(0.0);
+                    price_output = meta.price_per_output.unwrap_or(0.0);
+                    break;
+                }
+            }
+        }
+
+        // price is per 1M tokens
+        total_cost += (r.prompt_tokens as f64 * price_input / 1_000_000.0)
+                    + (r.completion_tokens as f64 * price_output / 1_000_000.0);
+    }
 
     // Calculate change percent (compare with previous period)
     let prev_total: u64 = all_recent
@@ -83,7 +108,7 @@ pub async fn usage_stats(
         token_total,
         token_input,
         token_output,
-        cost,
+        cost: total_cost,
         change_percent,
         period,
     })

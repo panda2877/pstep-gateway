@@ -51,7 +51,9 @@ pub struct ModelMetadata {
     #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(default)]
-    pub max_tokens: Option<u32>,
+    pub price_per_input: Option<f64>,   // 价格: 每 1M input tokens 的美元价格
+    #[serde(default)]
+    pub price_per_output: Option<f64>,  // 价格: 每 1M output tokens 的美元价格
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -472,7 +474,8 @@ pub struct ModelConfig {
     pub version: String,
     pub status: String,
     pub timeout_secs: u32,
-    pub max_tokens: u32,
+    pub price_per_input: Option<f64>,
+    pub price_per_output: Option<f64>,
     pub upstream: String,
     pub fallback_chain: Vec<String>,
 }
@@ -480,7 +483,8 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateModelConfigRequest {
     pub timeout_secs: Option<u32>,
-    pub max_tokens: Option<u32>,
+    pub price_per_input: Option<f64>,
+    pub price_per_output: Option<f64>,
     pub status: Option<String>,
 }
 

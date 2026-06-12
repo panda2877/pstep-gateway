@@ -25,7 +25,8 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
                 version: "2024-01-01".to_string(),
                 status: "active".to_string(),
                 timeout_secs: 30,
-                max_tokens: metadata.and_then(|m| m.max_tokens).unwrap_or(4096),
+                price_per_input: metadata.and_then(|m| m.price_per_input),
+                price_per_output: metadata.and_then(|m| m.price_per_output),
                 upstream: route.upstream.clone(),
                 fallback_chain: route.fallback_chain.clone(),
             }
@@ -54,7 +55,8 @@ pub async fn get_model(
                 version: "2024-01-01".to_string(),
                 status: "active".to_string(),
                 timeout_secs: 30,
-                max_tokens: metadata.and_then(|m| m.max_tokens).unwrap_or(4096),
+                price_per_input: metadata.and_then(|m| m.price_per_input),
+                price_per_output: metadata.and_then(|m| m.price_per_output),
                 upstream: route.upstream.clone(),
                 fallback_chain: route.fallback_chain.clone(),
             }).into_response()
@@ -91,7 +93,8 @@ pub async fn update_model(
         "model_id": id,
         "changes": {
             "timeout_secs": req.timeout_secs,
-            "max_tokens": req.max_tokens,
+            "price_per_input": req.price_per_input,
+            "price_per_output": req.price_per_output,
             "status": req.status
         }
     })).into_response()

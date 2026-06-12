@@ -33,7 +33,7 @@ export const ModelsPage: React.FC = () => {
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [loading, setLoading] = useState(true);
   const [editModal, setEditModal] = useState<ModelConfig | null>(null);
-  const [formData, setFormData] = useState({ timeout_secs: 30, max_tokens: 128000 });
+  const [formData, setFormData] = useState({ timeout_secs: 30, price_per_input: 0, price_per_output: 0 });
   const [saving, setSaving] = useState(false);
 
   const fetchModels = async () => {
@@ -54,7 +54,11 @@ export const ModelsPage: React.FC = () => {
 
   const openEditModal = (model: ModelConfig) => {
     setEditModal(model);
-    setFormData({ timeout_secs: model.timeout_secs, max_tokens: model.max_tokens });
+    setFormData({
+      timeout_secs: model.timeout_secs,
+      price_per_input: model.price_per_input || 0,
+      price_per_output: model.price_per_output || 0,
+    });
   };
 
   const handleSave = async () => {
@@ -63,7 +67,8 @@ export const ModelsPage: React.FC = () => {
     try {
       await updateModel(editModal.id, {
         timeout_secs: formData.timeout_secs,
-        max_tokens: formData.max_tokens,
+        price_per_input: formData.price_per_input,
+        price_per_output: formData.price_per_output,
       });
       setEditModal(null);
       fetchModels();
@@ -73,6 +78,8 @@ export const ModelsPage: React.FC = () => {
       setSaving(false);
     }
   };
+
+  const formatPrice = (price?: number) => price ? `$${price.toFixed(3)}` : '-';
 
   return (
     <div className="section" id="section-models">
@@ -90,10 +97,10 @@ export const ModelsPage: React.FC = () => {
               <tr>
                 <th>模型</th>
                 <th>供应商</th>
-                <th>版本</th>
                 <th>状态</th>
                 <th>超时</th>
-                <th>最大 Token</th>
+                <th>输入单价</th>
+                <th>输出单价</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -115,16 +122,14 @@ export const ModelsPage: React.FC = () => {
                   <tr key={model.id}>
                     <td style={{ fontWeight: 500 }}>{model.name}</td>
                     <td className="meta">{model.provider}</td>
-                    <td className="meta">{model.version}</td>
                     <td>
                       <Badge variant={getStatusVariant(model.status)}>
                         {getStatusLabel(model.status)}
                       </Badge>
                     </td>
                     <td className="num-col" style={{ textAlign: 'left' }}>{model.timeout_secs}s</td>
-                    <td className="num-col" style={{ textAlign: 'left' }}>
-                      {model.max_tokens >= 1000 ? `${(model.max_tokens / 1000).toFixed(0)}k` : model.max_tokens}
-                    </td>
+                    <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_input)}</td>
+                    <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_output)}</td>
                     <td className="actions">
                       <Button variant="secondary" size="sm" onClick={() => openEditModal(model)}>
                         编辑
@@ -157,7 +162,6 @@ export const ModelsPage: React.FC = () => {
               <Input label="模型名称" value={editModal.name} readOnly />
               <Input label="供应商" value={editModal.provider} readOnly />
             </div>
-            <Input label="版本" value={editModal.version} readOnly />
             <div className="field-row">
               <Input
                 label="超时 (秒)"
@@ -166,10 +170,25 @@ export const ModelsPage: React.FC = () => {
                 onChange={(e) => setFormData({ ...formData, timeout_secs: Number(e.target.value) })}
               />
               <Input
-                label="最大 Token"
+                label="状态"
+                value={editModal.status}
+                readOnly
+              />
+            </div>
+            <div className="field-row">
+              <Input
+                label="输入单价 ($/1M tokens)"
                 type="number"
-                value={formData.max_tokens}
-                onChange={(e) => setFormData({ ...formData, max_tokens: Number(e.target.value) })}
+                step="0.001"
+                value={formData.price_per_input}
+                onChange={(e) => setFormData({ ...formData, price_per_input: Number(e.target.value) })}
+              />
+              <Input
+                label="输出单价 ($/1M tokens)"
+                type="number"
+                step="0.001"
+                value={formData.price_per_output}
+                onChange={(e) => setFormData({ ...formData, price_per_output: Number(e.target.value) })}
               />
             </div>
           </>

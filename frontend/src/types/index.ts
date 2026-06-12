@@ -28,14 +28,16 @@ export interface ModelConfig {
   version: string;
   status: string;
   timeout_secs: number;
-  max_tokens: number;
+  price_per_input?: number;
+  price_per_output?: number;
   upstream: string;
   fallback_chain: string[];
 }
 
 export interface ModelConfigUpdate {
   timeout_secs?: number;
-  max_tokens?: number;
+  price_per_input?: number;
+  price_per_output?: number;
   status?: string;
 }
 
