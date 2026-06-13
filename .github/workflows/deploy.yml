@@ -71,7 +71,10 @@ jobs:
           SERVER_HOST: ${{ vars.SERVER_HOST }}
           SERVER_USER: ${{ vars.SERVER_USER }}
         run: |
-          set -e
+          set -x
+          echo "SERVER_HOST: $SERVER_HOST"
+          echo "SERVER_USER: $SERVER_USER"
+          echo "SSH_KEY length: ${#SSH_KEY_B64}"
 
           # 配置 SSH
           mkdir -p ~/.ssh
@@ -80,6 +83,8 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
 
           SSHD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key ${SERVER_USER}@${SERVER_HOST}"
+          echo "Testing SSH connection..."
+          $SSHD 'echo "SSH OK"' || { echo "SSH connection failed"; exit 1; }
 
           echo '停止旧服务...'
           $SSHD 'sudo systemctl stop pstep-gateway || true'
