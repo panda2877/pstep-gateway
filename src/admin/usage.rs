@@ -71,7 +71,7 @@ pub async fn usage_stats(
         let record_model_lower = r.model.to_lowercase();
 
         // Match by config.model field (e.g., "MiniMax-M2.7") or config key (e.g., "minimax")
-        for (_, model_config) in &state.config.models {
+        for (_, model_config) in state.config.lock().unwrap().models.iter() {
             let config_model_lower = model_config.model.to_lowercase();
             // Exact match on model field, or match on config key
             if config_model_lower == record_model_lower ||

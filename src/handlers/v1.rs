@@ -70,20 +70,23 @@ async fn provider_proxy(
     };
 
     // Resolve upstream from config first, fall back to built-in defaults
-    let (base_url, api_key, auth) = if let Some(upstream) = state.config.upstreams.get(&provider) {
-        let auth = match upstream.upstream_type {
-            crate::types::UpstreamType::Anthropic => "x-api-key",
-            crate::types::UpstreamType::Openai => "bearer",
-        };
-        (upstream.base_url.clone(), upstream.api_key.clone(), auth)
-    } else if let Some((url, a)) = get_provider_default(&provider) {
-        (url.to_string(), String::new(), a)
-    } else {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "bad_request",
-            "message": format!("Unknown provider: {}", provider)
-        }))).into_response();
-    };
+    let (base_url, api_key, auth) = {
+        let config = state.config.lock().unwrap();
+        if let Some(upstream) = config.upstreams.get(&provider) {
+            let auth = match upstream.upstream_type {
+                crate::types::UpstreamType::Anthropic => "x-api-key",
+                crate::types::UpstreamType::Openai => "bearer",
+            };
+            (upstream.base_url.clone(), upstream.api_key.clone(), auth.to_string())
+        } else if let Some((url, a)) = get_provider_default(&provider) {
+            (url.to_string(), String::new(), a.to_string())
+        } else {
+            return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "bad_request",
+                "message": format!("Unknown provider: {}", provider)
+            }))).into_response();
+        }
+    }; // lock dropped here
 
     // Build the target URL. base_url is taken as-is from config; actual_path is the
     // path captured after the provider prefix. We strip a leading "/v1" from the path
@@ -141,7 +144,7 @@ async fn provider_proxy(
     request = request.header("Content-Type", "application/json");
 
     // Set auth header based on upstream type
-    match auth {
+    match auth.as_str() {
         "x-api-key" => {
             request = request.header("x-api-key", api_key);
             if provider == "anthropic" {
@@ -242,7 +245,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let models: Vec<_> = state.config.models.iter()
+    let models: Vec<_> = state.config.lock().unwrap().models.iter()
         .map(|(id, route)| {
             serde_json::json!({
                 "id": id,

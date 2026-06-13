@@ -30,6 +30,23 @@ pub fn load_config() -> GatewayConfig {
     config
 }
 
+pub fn get_config_path() -> Option<std::path::PathBuf> {
+    find_config_path()
+}
+
+pub fn save_config(config: &GatewayConfig) -> Result<(), String> {
+    let config_path = find_config_path()
+        .ok_or_else(|| "无法找到配置文件路径".to_string())?;
+
+    let yaml = serde_yaml::to_string(config)
+        .map_err(|e| format!("序列化配置失败: {}", e))?;
+
+    fs::write(&config_path, yaml)
+        .map_err(|e| format!("写入配置文件失败: {}", e))?;
+
+    Ok(())
+}
+
 fn find_config_path() -> Option<std::path::PathBuf> {
     if let Ok(env_path) = std::env::var("CONFIG_PATH") {
         let path = Path::new(&env_path);

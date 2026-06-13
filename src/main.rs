@@ -11,7 +11,7 @@ use admin::apikeys::ApiKeyStore;
 use admin::fallback::FallbackPolicyStore;
 use admin::usage as admin_usage;
 use axum::Router;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber;
 
@@ -20,7 +20,7 @@ use crate::router::Router as GatewayRouter;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<types::GatewayConfig>,
+    pub config: Arc<Mutex<types::GatewayConfig>>,
     pub router: Arc<GatewayRouter>,
     pub thaw_tracker: Option<Arc<thaw::ThawTracker>>,
     pub api_key_store: Arc<ApiKeyStore>,
@@ -47,7 +47,7 @@ async fn main() {
     let gateway_router = GatewayRouter::new(config.clone(), thaw_tracker.clone());
 
     let state = AppState {
-        config: Arc::new(config.clone()),
+        config: Arc::new(Mutex::new(config.clone())),
         router: Arc::new(gateway_router),
         thaw_tracker,
         api_key_store: Arc::new(ApiKeyStore::new()),

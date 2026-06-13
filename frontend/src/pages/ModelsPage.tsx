@@ -33,7 +33,7 @@ export const ModelsPage: React.FC = () => {
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [loading, setLoading] = useState(true);
   const [editModal, setEditModal] = useState<ModelConfig | null>(null);
-  const [formData, setFormData] = useState({ timeout_secs: 30, price_per_input: 0, price_per_output: 0 });
+  const [formData, setFormData] = useState({ name: '', timeout_secs: 30, price_per_input: 0, price_per_output: 0 });
   const [saving, setSaving] = useState(false);
 
   const fetchModels = async () => {
@@ -55,6 +55,7 @@ export const ModelsPage: React.FC = () => {
   const openEditModal = (model: ModelConfig) => {
     setEditModal(model);
     setFormData({
+      name: model.name,
       timeout_secs: model.timeout_secs,
       price_per_input: model.price_per_input || 0,
       price_per_output: model.price_per_output || 0,
@@ -66,6 +67,7 @@ export const ModelsPage: React.FC = () => {
     setSaving(true);
     try {
       await updateModel(editModal.id, {
+        name: formData.name,
         timeout_secs: formData.timeout_secs,
         price_per_input: formData.price_per_input,
         price_per_output: formData.price_per_output,
@@ -159,7 +161,7 @@ export const ModelsPage: React.FC = () => {
         {editModal && (
           <>
             <div className="field-row">
-              <Input label="模型名称" value={editModal.name} readOnly />
+              <Input label="模型名称" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} />
               <Input label="供应商" value={editModal.provider} readOnly />
             </div>
             <div className="field-row">

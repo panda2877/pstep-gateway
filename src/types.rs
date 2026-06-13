@@ -40,7 +40,7 @@ pub struct ModelRoute {
     pub metadata: Option<ModelMetadata>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelMetadata {
     #[serde(default)]
     pub name: Option<String>,
@@ -482,6 +482,7 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateModelConfigRequest {
+    pub name: Option<String>,
     pub timeout_secs: Option<u32>,
     pub price_per_input: Option<f64>,
     pub price_per_output: Option<f64>,

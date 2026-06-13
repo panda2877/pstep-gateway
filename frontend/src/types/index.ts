@@ -35,6 +35,7 @@ export interface ModelConfig {
 }
 
 export interface ModelConfigUpdate {
+  name?: string;
   timeout_secs?: number;
   price_per_input?: number;
   price_per_output?: number;
