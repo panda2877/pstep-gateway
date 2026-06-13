@@ -153,8 +153,9 @@ pub async fn update_model(
                 });
             }
         }
-        if let Some(timeout) = timeout_secs {
-            route.fallback = Some(timeout.to_string());
+        if let Some(_timeout) = timeout_secs {
+            // Note: ModelRoute 暂无 timeout_secs 字段，先不持久化以免污染配置。
+            // 之前错误地写入 fallback，导致校验失败。这里只接受值但不写盘。
         }
     }
 
