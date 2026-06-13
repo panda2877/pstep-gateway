@@ -29,11 +29,30 @@ const getStatusLabel = (status: string): string => {
   }
 };
 
+interface FormState {
+  name: string;
+  timeout_secs: number;
+  price_per_input: number;
+  price_per_output: number;
+  base_url: string;
+  /** 占位 "********" 表示「不修改」；非占位表示要写入的新值 */
+  api_key: string;
+}
+
+const KEEP_PLACEHOLDER = '********';
+
 export const ModelsPage: React.FC = () => {
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [loading, setLoading] = useState(true);
   const [editModal, setEditModal] = useState<ModelConfig | null>(null);
-  const [formData, setFormData] = useState({ name: '', timeout_secs: 30, price_per_input: 0, price_per_output: 0 });
+  const [formData, setFormData] = useState<FormState>({
+    name: '',
+    timeout_secs: 30,
+    price_per_input: 0,
+    price_per_output: 0,
+    base_url: '',
+    api_key: KEEP_PLACEHOLDER,
+  });
   const [saving, setSaving] = useState(false);
 
   const fetchModels = async () => {
@@ -59,6 +78,9 @@ export const ModelsPage: React.FC = () => {
       timeout_secs: model.timeout_secs,
       price_per_input: model.price_per_input || 0,
       price_per_output: model.price_per_output || 0,
+      base_url: model.base_url || '',
+      // 主列表不返回明文 api_key，编辑界面以占位符 "********" 显示
+      api_key: KEEP_PLACEHOLDER,
     });
   };
 
@@ -66,12 +88,18 @@ export const ModelsPage: React.FC = () => {
     if (!editModal) return;
     setSaving(true);
     try {
-      await updateModel(editModal.id, {
+      const payload: Record<string, unknown> = {
         name: formData.name,
         timeout_secs: formData.timeout_secs,
         price_per_input: formData.price_per_input,
         price_per_output: formData.price_per_output,
-      });
+        base_url: formData.base_url,
+      };
+      // 仅当用户实际输入了新值时，才提交 api_key
+      if (formData.api_key !== KEEP_PLACEHOLDER && formData.api_key !== '') {
+        payload.api_key = formData.api_key;
+      }
+      await updateModel(editModal.id, payload as Parameters<typeof updateModel>[1]);
       setEditModal(null);
       fetchModels();
     } catch (err) {
@@ -81,7 +109,7 @@ export const ModelsPage: React.FC = () => {
     }
   };
 
-  const formatPrice = (price?: number) => price ? `$${price.toFixed(3)}` : '-';
+  const formatPrice = (price?: number) => (price ? `$${price.toFixed(3)}` : '-');
 
   return (
     <div className="section" id="section-models">
@@ -171,11 +199,7 @@ export const ModelsPage: React.FC = () => {
                 value={formData.timeout_secs}
                 onChange={(e) => setFormData({ ...formData, timeout_secs: Number(e.target.value) })}
               />
-              <Input
-                label="状态"
-                value={editModal.status}
-                readOnly
-              />
+              <Input label="状态" value={editModal.status} readOnly />
             </div>
             <div className="field-row">
               <Input
@@ -191,6 +215,24 @@ export const ModelsPage: React.FC = () => {
                 step="0.001"
                 value={formData.price_per_output}
                 onChange={(e) => setFormData({ ...formData, price_per_output: Number(e.target.value) })}
+              />
+            </div>
+            <div className="field-row">
+              <Input
+                label="Base URL"
+                value={formData.base_url}
+                placeholder="https://api.openai.com/v1"
+                onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                hint="上游服务的 API 地址"
+              />
+              <Input
+                label="API Key"
+                type="password"
+                mono
+                value={formData.api_key}
+                placeholder={KEEP_PLACEHOLDER}
+                onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
+                hint={editModal.api_key_configured ? `当前已配置（${editModal.api_key_masked || '****'}），留空或保持占位符表示不修改` : '尚未配置'}
               />
             </div>
           </>

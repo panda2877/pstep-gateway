@@ -32,6 +32,12 @@ export interface ModelConfig {
   price_per_output?: number;
   upstream: string;
   fallback_chain: string[];
+  /** 上游的 base_url（仅编辑界面使用，主列表不展示） */
+  base_url?: string;
+  /** 上游 api_key 的脱敏展示（如 sk-***abcd） */
+  api_key_masked?: string;
+  /** 上游 api_key 是否已配置 */
+  api_key_configured: boolean;
 }
 
 export interface ModelConfigUpdate {
@@ -40,6 +46,14 @@ export interface ModelConfigUpdate {
   price_per_input?: number;
   price_per_output?: number;
   status?: string;
+  /** 编辑时使用：覆盖上游的 base_url */
+  base_url?: string;
+  /** 编辑时使用：覆盖上游的 api_key
+   * - 不传 / 空字符串 = 不变
+   * - 特殊占位 "********" = 不变（前端展示脱敏值时不变更）
+   * - 其他值 = 覆盖
+   */
+  api_key?: string;
 }
 
 // API Key Types

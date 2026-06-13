@@ -478,6 +478,15 @@ pub struct ModelConfig {
     pub price_per_output: Option<f64>,
     pub upstream: String,
     pub fallback_chain: Vec<String>,
+    /// 上游的 base_url（仅在编辑界面使用，主列表不展示）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// 上游的 api_key 脱敏显示（如 sk-****abcd）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_masked: Option<String>,
+    /// 标记上游 api_key 是否被设置（用于前端判断是否显示脱敏值）
+    #[serde(default)]
+    pub api_key_configured: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -487,6 +496,15 @@ pub struct UpdateModelConfigRequest {
     pub price_per_input: Option<f64>,
     pub price_per_output: Option<f64>,
     pub status: Option<String>,
+    /// 编辑时使用：覆盖上游的 base_url
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 编辑时使用：覆盖上游的 api_key
+    /// - None  / "" 表示不变
+    /// - 特殊占位 "********" 表示不变（用于前端展示脱敏值时不变更）
+    /// - 其他任意值将覆盖
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// API Key for admin
