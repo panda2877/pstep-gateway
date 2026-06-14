@@ -13,7 +13,7 @@ export const FallbackChain: React.FC<FallbackChainProps> = ({ chain, showError =
         <React.Fragment key={i}>
           {i > 0 && <div className="chain-arrow">→</div>}
           <div className="chain-node">
-            <span className="provider">{node.provider}</span>
+            <span className="provider">{node.upstream}</span>
             <span className="model">{node.model}</span>
           </div>
         </React.Fragment>

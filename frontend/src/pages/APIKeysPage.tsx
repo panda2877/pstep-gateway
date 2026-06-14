@@ -5,7 +5,6 @@ import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
-import { Select } from '../components/ui/Select';
 import {
   getApiKeys,
   createApiKey,
@@ -87,11 +86,6 @@ export const APIKeysPage: React.FC = () => {
   useEffect(() => {
     fetchAll();
   }, []);
-
-  const modelOptions = [
-    { value: 'all', label: '全部模型' },
-    ...models.map((m) => ({ value: m.id, label: `${m.name} (${m.id})` })),
-  ];
 
   const handleCreate = async () => {
     if (!newKey.name.trim()) return;
