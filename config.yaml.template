@@ -1,67 +1,129 @@
+# =============================================================================
+# pstep-gateway config.yaml.template
+# =============================================================================
+# v0.2 结构（与 docs/config-redesign.md 同步）：
+#   1. fallback_policies  ← 命名的 fallback 链，可被 model 或 client_api_key 引用
+#   2. models             ← 对外暴露的 model id；4 字段 (type/base_url/api_key/model) 扁平在本身上
+#   3. client_api_keys    ← 客户端访问本网关的 key（持久化，重启不丢）
+#   4. usage_tracking     ← 用量统计开关
+#   5. thaw               ← 自动冻结/解冻（可选）
+#
+# 字段约定：
+#   - ${VAR}  加载时从环境变量解析
+#   - 模型 status: active | rate_limited | disabled
+#   - 修改 base_url / api_key / type / model 需重启服务
+#   - 修改 name / status / price / fallback_policy 立即生效
+# =============================================================================
+
 port: 3002
 public_url: "http://localhost:3002"
 
-upstreams:
-  openai:
-    type: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"
+# =============================================================================
+# 1. Fallback 策略（命名链）
+# =============================================================================
+fallback_policies:
+  high_availability:
+    description: "高可用：Claude → Mimo → GPT-4o"
+    enabled: true
+    chain:
+      - upstream: anthropic
+        model: claude-3-5-sonnet-20241022
+      - upstream: anthropic
+        model: mimo-v2.5
+      - upstream: openai
+        model: gpt-4o
 
-  anthropic:
+  cost_first:
+    description: "便宜优先：Mimo → Claude"
+    enabled: true
+    chain:
+      - upstream: anthropic
+        model: mimo-v2.5
+      - upstream: anthropic
+        model: claude-3-5-sonnet-20241022
+
+# =============================================================================
+# 2. Models
+# 字段：type / base_url / api_key / model (4 字段扁平)
+# 可选：fallback_policy (引用顶层策略), metadata.{name,status,price_per_input,price_per_output}
+# =============================================================================
+models:
+  claude-sonnet:
     type: anthropic
     base_url: "https://api.anthropic.com/v1"
     api_key: "${ANTHROPIC_API_KEY}"
-
-  deepseek:
-    type: openai
-    base_url: "https://api.deepseek.com/v1"
-    api_key: "${DEEPSEEK_API_KEY}"
-
-  minimax:
-    type: anthropic
-    base_url: "https://api.minimax.io/anthropic"
-    api_key: "${MINIMAX_API_KEY}"
-
-models:
-  gpt-4o:
-    upstream: openai
-    model: "gpt-4o"
-
-  claude-sonnet:
-    upstream: anthropic
     model: "claude-3-5-sonnet-20241022"
-    fallback_chain:
-      - gpt-4o        # First fallback
-      - deepseek-chat # Second fallback
+    fallback_policy: high_availability
     metadata:
       name: "Claude Sonnet"
-      reasoning: false
-      input: ["text", "images"]
-      context_window: 200000
-      max_tokens: 8192
+      status: active
+      price_per_input: 3.0
+      price_per_output: 15.0
 
-  deepseek-chat:
-    upstream: deepseek
-    model: "deepseek-chat"
+  mimo:
+    type: anthropic
+    base_url: "https://token-plan-cn.xiaomimino.com/anthropic/v1"
+    api_key: "${MIMO_API_KEY}"
+    model: "mimo-v2.5"
+    metadata:
+      name: "Mimo"
+      status: active
+      price_per_input: 0.1
+      price_per_output: 0.1
 
-  minimax-abab:
-    upstream: minimax
-    model: "abab6.5s-chat"
+  gpt-4o:
+    type: openai
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    model: "gpt-4o"
+    fallback_policy: cost_first
+    metadata:
+      name: "GPT-4o"
+      status: active
+      price_per_input: 2.5
+      price_per_output: 10.0
 
-# Standard Base URLs - Provider Passthrough
-# These routes allow direct access to provider APIs:
-# - /provider/openai/v1/* -> https://api.openai.com/v1/*
-# - /provider/anthropic/v1/* -> https://api.anthropic.com/v1/*
-# - /provider/deepseek/v1/* -> https://api.deepseek.com/v1/*
-# - /provider/minimax/anthropic/* -> https://api.minimax.io/anthropic/*
+# =============================================================================
+# 3. 客户端 API 密钥（持久化，重启不丢）
+# 字段：
+#   name                  # 备注名
+#   key                   # 明文 key（创建时随机生成；list API 走脱敏）
+#   model_permissions     # 可用模型 id 列表；空 = 全部
+#   fallback_policy       # 可选：该 Key 专用 fallback 链（覆盖模型默认）
+#   quota_limit           # 配额上限 token 数，0 = 不限
+#   created_at            # 秒时间戳
+# =============================================================================
+client_api_keys:
+  # 示例：生产环境用高可用链
+  prod_high_availability:
+    name: "生产-高可用"
+    key: "sk-gw-prod-xxxxxxxxxxxxxxxxxxxxxxxx"
+    model_permissions: []
+    fallback_policy: high_availability
+    quota_limit: 10000000
+    created_at: 1718342400
 
+  # 示例：内部测试用便宜链
+  internal_cheap:
+    name: "内部-便宜"
+    key: "sk-gw-internal-yyyyyyyyyyyyyyyyyyyy"
+    model_permissions:
+      - claude-sonnet
+      - mimo
+    fallback_policy: cost_first
+    quota_limit: 1000000
+    created_at: 1718342400
+
+# =============================================================================
+# 4. Server-side runtime state
+# =============================================================================
 usage_tracking:
   enabled: true
   retention_hours: 24
 
-# Thaw (freeze/unfreeze) configuration for automatic model recovery
-# thaw:
-#   freeze_duration_minutes: 15    # How long to keep a model frozen after failure
-#   recovery_threshold: 0.8        # Success rate threshold (>= 80%) to consider healthy
-#   min_requests_to_freeze: 5      # Minimum requests before triggering freeze
-#   recovering_attempts: 3         # Consecutive successes needed to recover
+# 自动冻结/解冻（可选）
+thaw:
+  freeze_duration_minutes: 15    # 失败后冻结时长
+  recovery_threshold: 0.8        # 解冻成功率阈值
+  min_requests_to_freeze: 5      # 触发冻结的最小请求数
+  recovering_attempts: 3         # 解冻需要的连续成功次数

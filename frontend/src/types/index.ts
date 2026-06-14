@@ -20,70 +20,68 @@ export interface UsageDistribution {
   period: string;
 }
 
-// Model Config Types
+// ============== Model Config ==============
+
+/** 服务端响应的单条 model 配置 */
 export interface ModelConfig {
   id: string;
   name: string;
   provider: string;
   version: string;
-  status: string;
+  status: 'active' | 'rate_limited' | 'disabled' | string;
   timeout_secs: number;
   price_per_input?: number;
   price_per_output?: number;
   upstream: string;
-  fallback_chain: string[];
-  /** 上游的 base_url（仅编辑界面使用，主列表不展示） */
+  /** upstream 语义标签，例如 'anthropic' / 'openai' */
+  upstream_type: string;
+  /** 引用的 fallback 策略 id */
+  fallback_policy?: string | null;
+  /** 服务端展开后的链节点（UI 展示用） */
+  fallback_chain: ChainNode[];
+  /** 上游 base_url（仅编辑界面使用） */
   base_url?: string;
-  /** 上游 api_key 的脱敏展示（如 sk-***abcd） */
+  /** 上游 api_key 的脱敏显示 */
   api_key_masked?: string;
   /** 上游 api_key 是否已配置 */
   api_key_configured: boolean;
+  /** 实际发到上游的 model id */
+  upstream_model: string;
 }
 
+/** PUT /api/admin/models/:id 的请求体 */
 export interface ModelConfigUpdate {
+  // 热更新字段
   name?: string;
-  timeout_secs?: number;
+  status?: 'active' | 'rate_limited' | 'disabled';
   price_per_input?: number;
   price_per_output?: number;
-  status?: string;
-  /** 编辑时使用：覆盖上游的 base_url */
+  fallback_policy?: string;
+  // 需重启字段
+  upstream_type?: 'openai' | 'anthropic';
   base_url?: string;
-  /** 编辑时使用：覆盖上游的 api_key
-   * - 不传 / 空字符串 = 不变
-   * - 特殊占位 "********" = 不变（前端展示脱敏值时不变更）
-   * - 其他值 = 覆盖
-   */
+  model?: string;
+  /** None / "" = 不变；"********" = 不变；其他 = 覆盖 */
   api_key?: string;
 }
 
-// API Key Types
-export interface ApiKey {
+export interface ModelsResponse {
+  models: ModelConfig[];
+}
+
+export interface FallbackPolicyMini {
   id: string;
-  name: string;
-  key_prefix: string;
-  key_masked: string;
-  model_permissions: string[];
-  quota_limit: number;
-  quota_used: number;
-  quota_percent: number;
-  created_at: number;
 }
 
-export interface ApiKeyCreate {
-  name: string;
-  model_permissions: string[];
-  quota_limit: number;
+export interface FallbackPolicyMiniResponse {
+  policies: FallbackPolicyMini[];
 }
 
-export interface ApiKeyCreated {
-  success: boolean;
-  key: ApiKey;
-  raw_key: string;
-}
+// ============== Fallback Policy ==============
 
-// Fallback Policy Types
 export interface ChainNode {
-  provider: string;
+  /** 语义标签，如 'anthropic' / 'mimo' / 'openai' */
+  upstream: string;
   model: string;
 }
 
@@ -96,32 +94,66 @@ export interface FallbackPolicy {
   created_at: number;
 }
 
-export interface FallbackPolicyCreate {
+export interface CreateFallbackPolicyRequest {
+  id: string;
   name: string;
-  description?: string;
+  description: string;
   enabled: boolean;
   chain: ChainNode[];
 }
 
-export interface FallbackPolicyUpdate {
+export interface UpdateFallbackPolicyRequest {
   name?: string;
   description?: string;
   enabled?: boolean;
   chain?: ChainNode[];
 }
 
-// API Key response types
-export type TimePeriod = '1d' | '7d' | '30d';
+export interface PoliciesResponse {
+  policies: FallbackPolicy[];
+}
 
-// Response wrapper types
-export interface ModelsResponse {
-  models: ModelConfig[];
+// ============== API Key ==============
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  key_masked: string;
+  model_permissions: string[];
+  /** 该 Key 专用 fallback 链（覆盖模型默认） */
+  fallback_policy?: string | null;
+  quota_limit: number;
+  quota_used: number;
+  quota_percent: number;
+  created_at: number;
+}
+
+export interface ApiKeyCreate {
+  name: string;
+  model_permissions: string[];
+  fallback_policy?: string;
+  quota_limit: number;
+}
+
+export interface ApiKeyUpdate {
+  name?: string;
+  model_permissions?: string[];
+  /** 外层 Some 表示「要更新」；内层 None 表示「置空」 */
+  fallback_policy?: string | null;
+  quota_limit?: number;
+}
+
+export interface ApiKeyCreated {
+  success: boolean;
+  key: ApiKey;
+  raw_key: string;
 }
 
 export interface KeysResponse {
   keys: ApiKey[];
 }
 
-export interface PoliciesResponse {
-  policies: FallbackPolicy[];
-}
+// ============== Misc ==============
+
+export type TimePeriod = '1d' | '7d' | '30d';

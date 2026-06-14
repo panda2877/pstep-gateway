@@ -4,62 +4,56 @@ import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
-import { getModels, updateModel } from '../services/api';
-import type { ModelConfig } from '../types';
+import { getModels, updateModel, getFallbackPoliciesMini } from '../services/api';
+import type { ModelConfig, FallbackPolicyMini } from '../types';
 
-const getStatusVariant = (status: string): 'success' | 'warn' | 'default' => {
-  switch (status) {
-    case 'active':
-      return 'success';
-    case 'rate_limited':
-      return 'warn';
-    default:
-      return 'default';
-  }
-};
+const KEEP_PLACEHOLDER = '********';
 
-const getStatusLabel = (status: string): string => {
-  switch (status) {
-    case 'active':
-      return '活跃';
-    case 'rate_limited':
-      return '限流中';
-    default:
-      return '已禁用';
-  }
+const STATUS_LABEL: Record<string, string> = {
+  active: '活跃',
+  rate_limited: '限流中',
+  disabled: '已禁用',
 };
 
 interface FormState {
   name: string;
-  timeout_secs: number;
+  status: 'active' | 'rate_limited' | 'disabled';
   price_per_input: number;
   price_per_output: number;
+  upstream_type: 'openai' | 'anthropic';
   base_url: string;
-  /** 占位 "********" 表示「不修改」；非占位表示要写入的新值 */
+  model: string;
+  fallback_policy: string;
   api_key: string;
 }
 
-const KEEP_PLACEHOLDER = '********';
+const buildFormState = (m: ModelConfig): FormState => ({
+  name: m.name,
+  status: (m.status as FormState['status']) || 'active',
+  price_per_input: m.price_per_input || 0,
+  price_per_output: m.price_per_output || 0,
+  upstream_type: (m.upstream_type as FormState['upstream_type']) || 'anthropic',
+  base_url: m.base_url || '',
+  model: m.upstream_model || '',
+  fallback_policy: m.fallback_policy || '',
+  api_key: KEEP_PLACEHOLDER,
+});
 
 export const ModelsPage: React.FC = () => {
   const [models, setModels] = useState<ModelConfig[]>([]);
+  const [policies, setPolicies] = useState<FallbackPolicyMini[]>([]);
   const [loading, setLoading] = useState(true);
   const [editModal, setEditModal] = useState<ModelConfig | null>(null);
-  const [formData, setFormData] = useState<FormState>({
-    name: '',
-    timeout_secs: 30,
-    price_per_input: 0,
-    price_per_output: 0,
-    base_url: '',
-    api_key: KEEP_PLACEHOLDER,
-  });
+  const [formData, setFormData] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
+  const [resultMsg, setResultMsg] = useState<string | null>(null);
 
   const fetchModels = async () => {
     setLoading(true);
     try {
-      const data = await getModels();
-      setModels(data);
+      const [ms, ps] = await Promise.all([getModels(), getFallbackPoliciesMini()]);
+      setModels(ms);
+      setPolicies(ps);
     } catch (err) {
       console.error('Failed to fetch models:', err);
     } finally {
@@ -73,37 +67,35 @@ export const ModelsPage: React.FC = () => {
 
   const openEditModal = (model: ModelConfig) => {
     setEditModal(model);
-    setFormData({
-      name: model.name,
-      timeout_secs: model.timeout_secs,
-      price_per_input: model.price_per_input || 0,
-      price_per_output: model.price_per_output || 0,
-      base_url: model.base_url || '',
-      // 主列表不返回明文 api_key，编辑界面以占位符 "********" 显示
-      api_key: KEEP_PLACEHOLDER,
-    });
+    setFormData(buildFormState(model));
+    setResultMsg(null);
   };
 
   const handleSave = async () => {
-    if (!editModal) return;
+    if (!editModal || !formData) return;
     setSaving(true);
+    setResultMsg(null);
     try {
       const payload: Record<string, unknown> = {
         name: formData.name,
-        timeout_secs: formData.timeout_secs,
+        status: formData.status,
         price_per_input: formData.price_per_input,
         price_per_output: formData.price_per_output,
+        upstream_type: formData.upstream_type,
         base_url: formData.base_url,
+        model: formData.model,
+        fallback_policy: formData.fallback_policy,
       };
-      // 仅当用户实际输入了新值时，才提交 api_key
       if (formData.api_key !== KEEP_PLACEHOLDER && formData.api_key !== '') {
         payload.api_key = formData.api_key;
       }
-      await updateModel(editModal.id, payload as Parameters<typeof updateModel>[1]);
-      setEditModal(null);
+      const resp = await updateModel(editModal.id, payload as Parameters<typeof updateModel>[1]);
+      setResultMsg(resp.message);
+      // 不立即关 modal，让用户看到「需重启」提示
       fetchModels();
     } catch (err) {
       console.error('Failed to update model:', err);
+      setResultMsg('保存失败');
     } finally {
       setSaving(false);
     }
@@ -128,7 +120,7 @@ export const ModelsPage: React.FC = () => {
                 <th>模型</th>
                 <th>供应商</th>
                 <th>状态</th>
-                <th>超时</th>
+                <th>Fallback 策略</th>
                 <th>输入单价</th>
                 <th>输出单价</th>
                 <th>操作</th>
@@ -153,11 +145,11 @@ export const ModelsPage: React.FC = () => {
                     <td style={{ fontWeight: 500 }}>{model.name}</td>
                     <td className="meta">{model.provider}</td>
                     <td>
-                      <Badge variant={getStatusVariant(model.status)}>
-                        {getStatusLabel(model.status)}
+                      <Badge variant={model.status === 'active' ? 'success' : model.status === 'rate_limited' ? 'warn' : 'default'}>
+                        {STATUS_LABEL[model.status] || model.status}
                       </Badge>
                     </td>
-                    <td className="num-col" style={{ textAlign: 'left' }}>{model.timeout_secs}s</td>
+                    <td className="meta">{model.fallback_policy || '—'}</td>
                     <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_input)}</td>
                     <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_output)}</td>
                     <td className="actions">
@@ -180,27 +172,53 @@ export const ModelsPage: React.FC = () => {
         footer={
           <>
             <Button variant="secondary" onClick={() => setEditModal(null)}>取消</Button>
-            <Button onClick={handleSave} disabled={saving}>
+            <Button onClick={handleSave} disabled={saving || !formData}>
               {saving ? '保存中...' : '保存'}
             </Button>
           </>
         }
       >
-        {editModal && (
+        {editModal && formData && (
           <>
             <div className="field-row">
-              <Input label="模型名称" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} />
+              <Input
+                label="模型名称"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
               <Input label="供应商" value={editModal.provider} readOnly />
             </div>
+
             <div className="field-row">
-              <Input
-                label="超时 (秒)"
-                type="number"
-                value={formData.timeout_secs}
-                onChange={(e) => setFormData({ ...formData, timeout_secs: Number(e.target.value) })}
-              />
-              <Input label="状态" value={editModal.status} readOnly />
+              <div className="field">
+                <label>状态</label>
+                <select
+                  className="select"
+                  value={formData.status}
+                  onChange={(e) =>
+                    setFormData({ ...formData, status: e.target.value as FormState['status'] })
+                  }
+                >
+                  <option value="active">活跃</option>
+                  <option value="rate_limited">限流中</option>
+                  <option value="disabled">已禁用</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Fallback 策略</label>
+                <select
+                  className="select"
+                  value={formData.fallback_policy}
+                  onChange={(e) => setFormData({ ...formData, fallback_policy: e.target.value })}
+                >
+                  <option value="">（不设置）</option>
+                  {policies.map((p) => (
+                    <option key={p.id} value={p.id}>{p.id}</option>
+                  ))}
+                </select>
+              </div>
             </div>
+
             <div className="field-row">
               <Input
                 label="输入单价 ($/1M tokens)"
@@ -217,6 +235,31 @@ export const ModelsPage: React.FC = () => {
                 onChange={(e) => setFormData({ ...formData, price_per_output: Number(e.target.value) })}
               />
             </div>
+
+            <div className="section-divider"><span>上游配置（变更需重启服务）</span></div>
+
+            <div className="field-row">
+              <div className="field">
+                <label>上游类型</label>
+                <select
+                  className="select"
+                  value={formData.upstream_type}
+                  onChange={(e) =>
+                    setFormData({ ...formData, upstream_type: e.target.value as FormState['upstream_type'] })
+                  }
+                >
+                  <option value="openai">openai</option>
+                  <option value="anthropic">anthropic</option>
+                </select>
+              </div>
+              <Input
+                label="上游模型 id"
+                value={formData.model}
+                placeholder="例如：claude-3-5-sonnet-20241022"
+                onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+              />
+            </div>
+
             <div className="field-row">
               <Input
                 label="Base URL"
@@ -232,9 +275,19 @@ export const ModelsPage: React.FC = () => {
                 value={formData.api_key}
                 placeholder={KEEP_PLACEHOLDER}
                 onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
-                hint={editModal.api_key_configured ? `当前已配置（${editModal.api_key_masked || '****'}），留空或保持占位符表示不修改` : '尚未配置'}
+                hint={
+                  editModal.api_key_configured
+                    ? `当前已配置（${editModal.api_key_masked || '****'}），留空或保持占位符表示不修改`
+                    : '尚未配置'
+                }
               />
             </div>
+
+            {resultMsg && (
+              <div className="field-hint" style={{ marginTop: 8, color: 'var(--fg-2)' }}>
+                {resultMsg}
+              </div>
+            )}
           </>
         )}
       </Modal>

@@ -6,8 +6,15 @@ import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
-import { getApiKeys, createApiKey, deleteApiKey } from '../services/api';
-import type { ApiKey } from '../types';
+import {
+  getApiKeys,
+  createApiKey,
+  updateApiKey,
+  deleteApiKey,
+  getModels,
+  getFallbackPoliciesMini,
+} from '../services/api';
+import type { ApiKey, ModelConfig, FallbackPolicyMini } from '../types';
 
 const getQuotaColor = (percent: number): string => {
   if (percent < 50) return 'var(--success)';
@@ -15,37 +22,76 @@ const getQuotaColor = (percent: number): string => {
   return 'var(--danger)';
 };
 
-const MODEL_OPTIONS = [
-  { value: 'all', label: '全部模型' },
-  { value: 'gpt-4o', label: 'GPT-4o' },
-  { value: 'claude-3-5-sonnet', label: 'Claude 3.5' },
-  { value: 'gemini-2.0', label: 'Gemini 2.0' },
-];
+interface NewKeyForm {
+  name: string;
+  models: string;
+  fallback_policy: string;
+  quota: number;
+}
+
+interface EditKeyForm {
+  name: string;
+  models: string;
+  fallback_policy: string;
+  quota: number;
+}
+
+const permToForm = (perms: string[]): string =>
+  perms.length === 0 ? 'all' : perms.join(',');
+
+const formToPerm = (s: string): string[] =>
+  s === 'all' || !s.trim() ? [] : s.split(',').map((x) => x.trim()).filter(Boolean);
 
 export const APIKeysPage: React.FC = () => {
   const [keys, setKeys] = useState<ApiKey[]>([]);
+  const [models, setModels] = useState<ModelConfig[]>([]);
+  const [policies, setPolicies] = useState<FallbackPolicyMini[]>([]);
   const [loading, setLoading] = useState(true);
   const [createModal, setCreateModal] = useState(false);
-  const [newKey, setNewKey] = useState({ name: '', models: 'all', quota: 1000000 });
+  const [editKey, setEditKey] = useState<ApiKey | null>(null);
+  const [newKey, setNewKey] = useState<NewKeyForm>({
+    name: '',
+    models: 'all',
+    fallback_policy: '',
+    quota: 1000000,
+  });
+  const [editForm, setEditForm] = useState<EditKeyForm>({
+    name: '',
+    models: 'all',
+    fallback_policy: '',
+    quota: 0,
+  });
   const [creating, setCreating] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const fetchKeys = async () => {
+  const fetchAll = async () => {
     setLoading(true);
     try {
-      const data = await getApiKeys();
-      setKeys(data);
+      const [ks, ms, ps] = await Promise.all([
+        getApiKeys(),
+        getModels(),
+        getFallbackPoliciesMini(),
+      ]);
+      setKeys(ks);
+      setModels(ms);
+      setPolicies(ps);
     } catch (err) {
-      console.error('Failed to fetch API keys:', err);
+      console.error('Failed to fetch data:', err);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchKeys();
+    fetchAll();
   }, []);
+
+  const modelOptions = [
+    { value: 'all', label: '全部模型' },
+    ...models.map((m) => ({ value: m.id, label: `${m.name} (${m.id})` })),
+  ];
 
   const handleCreate = async () => {
     if (!newKey.name.trim()) return;
@@ -53,11 +99,12 @@ export const APIKeysPage: React.FC = () => {
     try {
       const result = await createApiKey({
         name: newKey.name,
-        model_permissions: newKey.models === 'all' ? [] : [newKey.models],
+        model_permissions: formToPerm(newKey.models),
+        fallback_policy: newKey.fallback_policy || undefined,
         quota_limit: Number(newKey.quota),
       });
       setCreatedKey(result.raw_key);
-      fetchKeys();
+      fetchAll();
     } catch (err) {
       console.error('Failed to create API key:', err);
     } finally {
@@ -65,11 +112,41 @@ export const APIKeysPage: React.FC = () => {
     }
   };
 
+  const openEditModal = (key: ApiKey) => {
+    setEditKey(key);
+    setEditForm({
+      name: key.name,
+      models: permToForm(key.model_permissions),
+      fallback_policy: key.fallback_policy || '',
+      quota: key.quota_limit,
+    });
+  };
+
+  const handleUpdate = async () => {
+    if (!editKey) return;
+    setSaving(true);
+    try {
+      await updateApiKey(editKey.id, {
+        name: editForm.name,
+        model_permissions: formToPerm(editForm.models),
+        // 始终更新：传 Some(string|null) — 后端用 None / Some 区分
+        fallback_policy: editForm.fallback_policy || null,
+        quota_limit: Number(editForm.quota),
+      });
+      setEditKey(null);
+      fetchAll();
+    } catch (err) {
+      console.error('Failed to update API key:', err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleDelete = async (id: string) => {
     if (!confirm('确定要撤销此密钥吗？')) return;
     try {
       await deleteApiKey(id);
-      fetchKeys();
+      fetchAll();
     } catch (err) {
       console.error('Failed to delete API key:', err);
     }
@@ -90,9 +167,16 @@ export const APIKeysPage: React.FC = () => {
       <div className="section-header">
         <div>
           <h2 className="section-title">API 密钥</h2>
-          <p className="section-desc">创建与管理访问密钥</p>
+          <p className="section-desc">创建与管理访问密钥（持久化到 config.yaml）</p>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => { setCreateModal(true); setCreatedKey(null); }}>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => {
+            setCreateModal(true);
+            setCreatedKey(null);
+          }}
+        >
           <Plus size={14} />
           新建密钥
         </Button>
@@ -106,6 +190,7 @@ export const APIKeysPage: React.FC = () => {
                 <th>名称</th>
                 <th>密钥</th>
                 <th>模型权限</th>
+                <th>Fallback 链</th>
                 <th>剩余配额</th>
                 <th>创建时间</th>
                 <th>操作</th>
@@ -114,13 +199,13 @@ export const APIKeysPage: React.FC = () => {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={6} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
                     加载中...
                   </td>
                 </tr>
               ) : keys.length === 0 ? (
                 <tr>
-                  <td colSpan={6} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
                     暂无密钥
                   </td>
                 </tr>
@@ -146,16 +231,35 @@ export const APIKeysPage: React.FC = () => {
                           : key.model_permissions.join(' / ')}
                       </Badge>
                     </td>
+                    <td className="meta">{key.fallback_policy || '—'}</td>
                     <td className="num-col" style={{ textAlign: 'left' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <div style={{ flex: 1, height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
-                          <div style={{ width: `${key.quota_percent}%`, height: '100%', background: getQuotaColor(key.quota_percent), borderRadius: 2 }}></div>
+                        <div
+                          style={{
+                            flex: 1,
+                            height: 4,
+                            background: 'var(--border)',
+                            borderRadius: 2,
+                            overflow: 'hidden',
+                          }}
+                        >
+                          <div
+                            style={{
+                              width: `${Math.min(100, key.quota_percent)}%`,
+                              height: '100%',
+                              background: getQuotaColor(key.quota_percent),
+                              borderRadius: 2,
+                            }}
+                          ></div>
                         </div>
                         <span className="meta">{key.quota_percent.toFixed(0)}%</span>
                       </div>
                     </td>
                     <td className="meta">{new Date(key.created_at * 1000).toLocaleDateString()}</td>
                     <td className="actions">
+                      <Button variant="secondary" size="sm" onClick={() => openEditModal(key)}>
+                        编辑
+                      </Button>
                       <Button variant="danger" size="sm" onClick={() => handleDelete(key.id)}>
                         撤销
                       </Button>
@@ -168,9 +272,13 @@ export const APIKeysPage: React.FC = () => {
         </div>
       </Card>
 
+      {/* Create Modal */}
       <Modal
         isOpen={createModal}
-        onClose={() => { setCreateModal(false); setCreatedKey(null); }}
+        onClose={() => {
+          setCreateModal(false);
+          setCreatedKey(null);
+        }}
         title="新建 API 密钥"
         footer={
           createdKey ? (
@@ -207,14 +315,35 @@ export const APIKeysPage: React.FC = () => {
               value={newKey.name}
               onChange={(e) => setNewKey({ ...newKey, name: e.target.value })}
             />
-            <Select
-              label="模型权限"
-              options={MODEL_OPTIONS}
-              value={newKey.models}
-              onChange={(e) => setNewKey({ ...newKey, models: e.target.value })}
-            />
+            <div className="field">
+              <label>模型权限</label>
+              <select
+                className="select"
+                value={newKey.models}
+                onChange={(e) => setNewKey({ ...newKey, models: e.target.value })}
+              >
+                <option value="all">全部模型</option>
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name} ({m.id})</option>
+                ))}
+              </select>
+              <span className="field-hint">如需多选：'mimo,gpt-4o'</span>
+            </div>
+            <div className="field">
+              <label>Fallback 链（覆盖模型默认）</label>
+              <select
+                className="select"
+                value={newKey.fallback_policy}
+                onChange={(e) => setNewKey({ ...newKey, fallback_policy: e.target.value })}
+              >
+                <option value="">（使用模型默认）</option>
+                {policies.map((p) => (
+                  <option key={p.id} value={p.id}>{p.id}</option>
+                ))}
+              </select>
+            </div>
             <Input
-              label="月度配额上限"
+              label="配额上限"
               type="number"
               mono
               placeholder="1000000"
@@ -222,6 +351,69 @@ export const APIKeysPage: React.FC = () => {
               onChange={(e) => setNewKey({ ...newKey, quota: Number(e.target.value) })}
               hint="设置为 0 表示不限制"
             />
+          </>
+        )}
+      </Modal>
+
+      {/* Edit Modal */}
+      <Modal
+        isOpen={!!editKey}
+        onClose={() => setEditKey(null)}
+        title={`编辑密钥：${editKey?.name || ''}`}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setEditKey(null)}>取消</Button>
+            <Button onClick={handleUpdate} disabled={saving}>
+              {saving ? '保存中...' : '保存'}
+            </Button>
+          </>
+        }
+      >
+        {editKey && (
+          <>
+            <Input
+              label="密钥名称"
+              value={editForm.name}
+              onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
+            />
+            <div className="field">
+              <label>模型权限</label>
+              <select
+                className="select"
+                value={editForm.models}
+                onChange={(e) => setEditForm({ ...editForm, models: e.target.value })}
+              >
+                <option value="all">全部模型</option>
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name} ({m.id})</option>
+                ))}
+              </select>
+              <span className="field-hint">多选用逗号分隔，例如 'mimo,gpt-4o'</span>
+            </div>
+            <div className="field">
+              <label>Fallback 链（覆盖模型默认）</label>
+              <select
+                className="select"
+                value={editForm.fallback_policy}
+                onChange={(e) => setEditForm({ ...editForm, fallback_policy: e.target.value })}
+              >
+                <option value="">（使用模型默认）</option>
+                {policies.map((p) => (
+                  <option key={p.id} value={p.id}>{p.id}</option>
+                ))}
+              </select>
+            </div>
+            <Input
+              label="配额上限"
+              type="number"
+              mono
+              value={editForm.quota}
+              onChange={(e) => setEditForm({ ...editForm, quota: Number(e.target.value) })}
+              hint="设置为 0 表示不限制"
+            />
+            <div className="field-hint" style={{ marginTop: 8 }}>
+              注：修改 Key 明文需删除后重建
+            </div>
           </>
         )}
       </Modal>

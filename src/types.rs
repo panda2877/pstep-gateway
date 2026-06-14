@@ -1,59 +1,180 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ============= Core Config =============
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GatewayConfig {
     pub port: u16,
-    pub upstreams: HashMap<String, UpstreamConfig>,
-    pub models: HashMap<String, ModelRoute>,
-    pub usage_tracking: UsageConfig,
     #[serde(default)]
     pub public_url: Option<String>,
+
+    pub models: HashMap<String, ModelRoute>,
+
+    /// 可命名的 fallback 策略，可被 model 或 client_api_key 引用
+    #[serde(default)]
+    pub fallback_policies: HashMap<String, FallbackPolicyConfig>,
+
+    /// 客户端 API Key（持久化）。运行期 quota_used 在内存中，**不**写盘。
+    #[serde(default)]
+    pub client_api_keys: HashMap<String, ClientApiKeyConfig>,
+
+    pub usage_tracking: UsageConfig,
     #[serde(default)]
     pub thaw: Option<ThawConfig>,
+
+    /// 兼容旧 config：旧版本顶层有 `upstreams` HashMap；新版本合并到 model 上。
+    /// 读取时通过 `load_config` 迁移，结构上不再持有。
+    #[serde(default, skip_serializing)]
+    pub _legacy_upstreams: Option<serde_yaml::Value>,
 }
 
+/// 一个对外暴露的 model id，4 字段（type / base_url / api_key / model）扁平在自身。
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct UpstreamConfig {
+pub struct ModelRoute {
+    /// `type` / `base_url` / `api_key` / `model` 决定上游签名
     #[serde(rename = "type")]
+    pub upstream_type: UpstreamType,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+
+    /// 引用的 fallback 策略 id（在 `fallback_policies` 里）
+    #[serde(default)]
+    pub fallback_policy: Option<String>,
+
+    #[serde(default)]
+    pub metadata: Option<ModelMetadata>,
+
+    /// 兼容旧配置：旧版有 `fallback: '30'` 与 `fallback_chain: [...]`。
+    /// 读侧由 `load_config` 转换为新结构，写侧不再输出。
+    #[serde(default, skip_serializing)]
+    pub _legacy_fallback: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub _legacy_fallback_chain: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub _legacy_upstream: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamType {
+    #[default]
+    Openai,
+    Anthropic,
+}
+
+impl UpstreamType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn auth_header(&self) -> &'static str {
+        match self {
+            Self::Openai => "bearer",
+            Self::Anthropic => "x-api-key",
+        }
+    }
+}
+
+/// Providers 层的「投影」：仅供 router/providers 之间传递用，不参与持久化。
+/// `ModelRoute` 通过 `as_upstream()` 借用得到。
+#[derive(Debug, Clone)]
+pub struct UpstreamConfig {
     pub upstream_type: UpstreamType,
     pub base_url: String,
     pub api_key: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UpstreamType {
-    Openai,
-    Anthropic,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelRoute {
-    pub upstream: String,
-    pub model: String,
-    #[serde(default)]
-    pub fallback: Option<String>,  // 兼容旧配置
-    #[serde(default)]
-    pub fallback_chain: Vec<String>,  // 新增：链式 fallback
-    #[serde(default)]
-    pub metadata: Option<ModelMetadata>,
+impl ModelRoute {
+    /// 投影为 providers 需要的 `UpstreamConfig`（零拷贝借用）。
+    pub fn as_upstream(&self) -> UpstreamConfig {
+        UpstreamConfig {
+            upstream_type: self.upstream_type,
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelMetadata {
     #[serde(default)]
     pub name: Option<String>,
+    /// 枚举小写字符串: `active` | `rate_limited` | `disabled`
     #[serde(default)]
-    pub reasoning: bool,
+    pub status: ModelStatus,
     #[serde(default)]
-    pub input: Vec<String>,
+    pub price_per_input: Option<f64>,
     #[serde(default)]
-    pub context_window: Option<u32>,
+    pub price_per_output: Option<f64>,
+
+    #[serde(default, skip_serializing)]
+    pub _legacy_reasoning: Option<bool>,
+    #[serde(default, skip_serializing)]
+    pub _legacy_input: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub _legacy_context_window: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelStatus {
+    #[default]
+    Active,
+    RateLimited,
+    Disabled,
+}
+
+impl ModelStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::RateLimited => "rate_limited",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FallbackPolicyConfig {
     #[serde(default)]
-    pub price_per_input: Option<f64>,   // 价格: 每 1M input tokens 的美元价格
+    pub description: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub chain: Vec<ChainNodeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChainNodeConfig {
+    /// 语义标签（如 anthropic / mimo / openai），仅用于 UI 展示
+    pub upstream: String,
+    pub model: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClientApiKeyConfig {
+    pub name: String,
+    /// 明文 key；list API 返回 `key_masked` / `key_prefix`
+    pub key: String,
+    /// 可用模型 id 列表；空 = 全部
     #[serde(default)]
-    pub price_per_output: Option<f64>,  // 价格: 每 1M output tokens 的美元价格
+    pub model_permissions: Vec<String>,
+    /// 该 Key 专用 fallback 链（覆盖模型默认）
+    #[serde(default)]
+    pub fallback_policy: Option<String>,
+    /// 配额上限 token 数；0 = 不限
+    pub quota_limit: u64,
+    /// 秒时间戳
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -74,9 +195,17 @@ pub struct ThawConfig {
     pub recovering_attempts: u8,
 }
 
-fn default_freeze_duration() -> u32 { 15 }
-fn default_recovery_threshold() -> f32 { 0.8 }
-fn default_recovering_attempts() -> u8 { 3 }
+fn default_freeze_duration() -> u32 {
+    15
+}
+fn default_recovery_threshold() -> f32 {
+    0.8
+}
+fn default_recovering_attempts() -> u8 {
+    3
+}
+
+// ============= Runtime types =============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelHealthStatus {
@@ -199,7 +328,6 @@ impl TokenUsage {
             let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
-            // message_start carries input_tokens
             if current_prefix == "message_start" {
                 if let Some(u) = json.get("message").and_then(|m| m.get("usage")) {
                     prompt_tokens = u.get("input_tokens")
@@ -207,7 +335,6 @@ impl TokenUsage {
                         .unwrap_or(0) as u32;
                 }
             }
-            // message_delta carries cumulative output_tokens
             if current_prefix == "message_delta" {
                 if let Some(u) = json.get("usage") {
                     let out = u.get("output_tokens")
@@ -219,7 +346,10 @@ impl TokenUsage {
                 }
             }
         }
-        Self { prompt_tokens, completion_tokens }
+        Self {
+            prompt_tokens,
+            completion_tokens,
+        }
     }
 }
 
@@ -244,6 +374,8 @@ pub struct UpstreamStats {
     pub requests: u32,
     pub tokens: u32,
 }
+
+// ============= API request/response types =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionsRequest {
@@ -465,7 +597,7 @@ pub struct AdminDistributionResponse {
     pub period: String,
 }
 
-/// Model configuration for admin
+/// 响应给前端的单条 model 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
@@ -477,37 +609,48 @@ pub struct ModelConfig {
     pub price_per_input: Option<f64>,
     pub price_per_output: Option<f64>,
     pub upstream: String,
-    pub fallback_chain: Vec<String>,
-    /// 上游的 base_url（仅在编辑界面使用，主列表不展示）
+    pub upstream_type: String,
+    /// 引用的 fallback 策略 id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_policy: Option<String>,
+    /// 服务端展开后的链节点（便利字段，前端展示用）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_chain: Vec<ChainNodeConfig>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// 上游的 api_key 脱敏显示（如 sk-****abcd）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_masked: Option<String>,
-    /// 标记上游 api_key 是否被设置（用于前端判断是否显示脱敏值）
     #[serde(default)]
     pub api_key_configured: bool,
+    /// 实际发到上游的 model id
+    #[serde(default)]
+    pub upstream_model: String,
 }
 
+/// PUT /api/admin/models/:id 的请求体
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateModelConfigRequest {
     pub name: Option<String>,
-    pub timeout_secs: Option<u32>,
+    pub status: Option<String>,
     pub price_per_input: Option<f64>,
     pub price_per_output: Option<f64>,
-    pub status: Option<String>,
-    /// 编辑时使用：覆盖上游的 base_url
-    #[serde(default)]
+
+    // 需重启字段
+    pub upstream_type: Option<String>,
     pub base_url: Option<String>,
-    /// 编辑时使用：覆盖上游的 api_key
-    /// - None  / "" 表示不变
-    /// - 特殊占位 "********" 表示不变（用于前端展示脱敏值时不变更）
-    /// - 其他任意值将覆盖
+    pub model: Option<String>,
+    pub fallback_policy: Option<String>,
+
+    /// 编辑上游 api_key：
+    /// - None / "" = 不变
+    /// - 特殊占位 "********" = 不变
+    /// - 其他值 = 覆盖
     #[serde(default)]
     pub api_key: Option<String>,
 }
 
-/// API Key for admin
+/// API Key 列表项（响应给前端）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: String,
@@ -515,6 +658,8 @@ pub struct ApiKey {
     pub key_prefix: String,
     pub key_masked: String,
     pub model_permissions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_policy: Option<String>,
     pub quota_limit: u64,
     pub quota_used: u64,
     pub quota_percent: f32,
@@ -524,7 +669,10 @@ pub struct ApiKey {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateApiKeyRequest {
     pub name: String,
+    #[serde(default)]
     pub model_permissions: Vec<String>,
+    #[serde(default)]
+    pub fallback_policy: Option<String>,
     pub quota_limit: u64,
 }
 
@@ -534,29 +682,33 @@ pub struct CreateApiKeyResponse {
     pub raw_key: String,
 }
 
-/// Fallback policy for admin
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateApiKeyRequest {
+    pub name: Option<String>,
+    #[serde(default)]
+    pub model_permissions: Option<Vec<String>>,
+    pub fallback_policy: Option<Option<String>>,
+    pub quota_limit: Option<u64>,
+}
+
+/// Fallback policy 列表项（响应给前端）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FallbackPolicy {
     pub id: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
-    pub chain: Vec<ChainNode>,
+    pub chain: Vec<ChainNodeConfig>,
     pub created_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChainNode {
-    pub provider: String,
-    pub model: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateFallbackPolicyRequest {
+    pub id: String,
     pub name: String,
     pub description: String,
     pub enabled: bool,
-    pub chain: Vec<ChainNode>,
+    pub chain: Vec<ChainNodeConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -564,5 +716,5 @@ pub struct UpdateFallbackPolicyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
-    pub chain: Option<Vec<ChainNode>>,
+    pub chain: Option<Vec<ChainNodeConfig>>,
 }

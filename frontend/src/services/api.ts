@@ -6,14 +6,17 @@ import type {
   ModelConfigUpdate,
   ApiKey,
   ApiKeyCreate,
+  ApiKeyUpdate,
   ApiKeyCreated,
   FallbackPolicy,
-  FallbackPolicyCreate,
-  FallbackPolicyUpdate,
+  CreateFallbackPolicyRequest,
+  UpdateFallbackPolicyRequest,
+  FallbackPolicyMini,
   TimePeriod,
   ModelsResponse,
   KeysResponse,
   PoliciesResponse,
+  FallbackPolicyMiniResponse,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:3002';
@@ -47,8 +50,26 @@ export const getModel = async (id: string): Promise<ModelConfig> => {
   return response.data;
 };
 
-export const updateModel = async (id: string, data: ModelConfigUpdate): Promise<void> => {
-  await api.put(`/api/admin/models/${id}`, data);
+export interface UpdateModelResponse {
+  success: boolean;
+  message: string;
+  model_id: string;
+  restart_required: boolean;
+  changes: Record<string, unknown>;
+  model: ModelConfig;
+}
+
+export const updateModel = async (
+  id: string,
+  data: ModelConfigUpdate,
+): Promise<UpdateModelResponse> => {
+  const response = await api.put<UpdateModelResponse>(`/api/admin/models/${id}`, data);
+  return response.data;
+};
+
+export const getFallbackPoliciesMini = async (): Promise<FallbackPolicyMini[]> => {
+  const response = await api.get<FallbackPolicyMiniResponse>('/api/admin/models/fallback-policies');
+  return response.data.policies;
 };
 
 // API Key APIs
@@ -60,6 +81,11 @@ export const getApiKeys = async (): Promise<ApiKey[]> => {
 export const createApiKey = async (data: ApiKeyCreate): Promise<ApiKeyCreated> => {
   const response = await api.post<ApiKeyCreated>('/api/admin/keys', data);
   return response.data;
+};
+
+export const updateApiKey = async (id: string, data: ApiKeyUpdate): Promise<ApiKey> => {
+  const response = await api.put<{ success: boolean; key: ApiKey }>(`/api/admin/keys/${id}`, data);
+  return response.data.key;
 };
 
 export const deleteApiKey = async (id: string): Promise<void> => {
@@ -77,13 +103,24 @@ export const getFallbackPolicy = async (id: string): Promise<FallbackPolicy> => 
   return response.data;
 };
 
-export const createFallbackPolicy = async (data: FallbackPolicyCreate): Promise<FallbackPolicy> => {
-  const response = await api.post<{ success: boolean; policy: FallbackPolicy }>('/api/admin/fallback/policies', data);
+export const createFallbackPolicy = async (
+  data: CreateFallbackPolicyRequest,
+): Promise<FallbackPolicy> => {
+  const response = await api.post<{ success: boolean; policy: FallbackPolicy }>(
+    '/api/admin/fallback/policies',
+    data,
+  );
   return response.data.policy;
 };
 
-export const updateFallbackPolicy = async (id: string, data: FallbackPolicyUpdate): Promise<FallbackPolicy> => {
-  const response = await api.put<{ success: boolean; policy: FallbackPolicy }>(`/api/admin/fallback/policies/${id}`, data);
+export const updateFallbackPolicy = async (
+  id: string,
+  data: UpdateFallbackPolicyRequest,
+): Promise<FallbackPolicy> => {
+  const response = await api.put<{ success: boolean; policy: FallbackPolicy }>(
+    `/api/admin/fallback/policies/${id}`,
+    data,
+  );
   return response.data.policy;
 };
 

@@ -49,22 +49,29 @@ pub async fn api_models(State(state): State<AppState>) -> impl IntoResponse {
                 "api": "openai-completions",
                 "provider": "pstep-gateway",
                 "baseUrl": base_url,
-                "reasoning": meta.map(|m| m.reasoning).unwrap_or(false),
-                "input": meta.map(|m| m.input.clone()).unwrap_or_else(|| vec!["text".to_string()]),
+                "status": meta.map(|m| m.status.as_str()).unwrap_or("active"),
                 "cost": {
                     "input": meta.and_then(|m| m.price_per_input).unwrap_or(0.0),
                     "output": meta.and_then(|m| m.price_per_output).unwrap_or(0.0),
                     "cacheRead": 0,
                     "cacheWrite": 0
                 },
-                "contextWindow": meta.and_then(|m| m.context_window).unwrap_or(128000),
+                "contextWindow": 128000,
             })
         })
         .collect();
 
+    // 选一把 client_api_key 作为对外 apiKey；空则用占位
+    let first_key = config
+        .client_api_keys
+        .values()
+        .next()
+        .map(|k| k.key.clone())
+        .unwrap_or_else(|| String::new());
+
     Json(serde_json::json!({
         "models": models,
-        "apiKey": "pstep-gateway-key"
+        "apiKey": first_key
     }))
 }
 

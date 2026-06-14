@@ -7,8 +7,7 @@ mod thaw;
 mod types;
 mod usage;
 
-use admin::apikeys::ApiKeyStore;
-use admin::fallback::FallbackPolicyStore;
+use admin::apikeys::ApiKeyQuotaTracker;
 use admin::usage as admin_usage;
 use axum::Router;
 use std::sync::{Arc, Mutex};
@@ -23,8 +22,8 @@ pub struct AppState {
     pub config: Arc<Mutex<types::GatewayConfig>>,
     pub router: Arc<GatewayRouter>,
     pub thaw_tracker: Option<Arc<thaw::ThawTracker>>,
-    pub api_key_store: Arc<ApiKeyStore>,
-    pub fallback_policy_store: Arc<FallbackPolicyStore>,
+    /// 运行期 quota tracker（不写盘）
+    pub api_key_quota: Arc<Mutex<ApiKeyQuotaTracker>>,
 }
 
 #[tokio::main]
@@ -37,7 +36,6 @@ async fn main() {
 
     let config = load_config();
 
-    // Initialize thaw tracker if configured
     let thaw_tracker = if let Some(thaw_config) = &config.thaw {
         Some(Arc::new(thaw::ThawTracker::new(thaw_config.clone())))
     } else {
@@ -50,8 +48,7 @@ async fn main() {
         config: Arc::new(Mutex::new(config.clone())),
         router: Arc::new(gateway_router),
         thaw_tracker,
-        api_key_store: Arc::new(ApiKeyStore::new()),
-        fallback_policy_store: Arc::new(FallbackPolicyStore::new()),
+        api_key_quota: Arc::new(Mutex::new(ApiKeyQuotaTracker::default())),
     };
 
     let cors = CorsLayer::new()
@@ -69,18 +66,62 @@ async fn main() {
         .route("/api/health", axum::routing::get(handlers::health_status))
         // Admin API routes
         .route("/api/admin/usage/stats", axum::routing::get(admin_usage::usage_stats))
-        .route("/api/admin/usage/distribution", axum::routing::get(admin_usage::usage_distribution))
-        .route("/api/admin/models", axum::routing::get(admin::models::list_models))
-        .route("/api/admin/models/{id}", axum::routing::get(admin::models::get_model))
-        .route("/api/admin/models/{id}", axum::routing::put(admin::models::update_model))
-        .route("/api/admin/keys", axum::routing::get(admin::apikeys::list_keys))
-        .route("/api/admin/keys", axum::routing::post(admin::apikeys::create_key))
-        .route("/api/admin/keys/{id}", axum::routing::delete(admin::apikeys::delete_key))
-        .route("/api/admin/fallback/policies", axum::routing::get(admin::fallback::list_policies))
-        .route("/api/admin/fallback/policies", axum::routing::post(admin::fallback::create_policy))
-        .route("/api/admin/fallback/policies/{id}", axum::routing::get(admin::fallback::get_policy))
-        .route("/api/admin/fallback/policies/{id}", axum::routing::put(admin::fallback::update_policy))
-        .route("/api/admin/fallback/policies/{id}", axum::routing::delete(admin::fallback::delete_policy))
+        .route(
+            "/api/admin/usage/distribution",
+            axum::routing::get(admin_usage::usage_distribution),
+        )
+        .route(
+            "/api/admin/models",
+            axum::routing::get(admin::models::list_models),
+        )
+        .route(
+            "/api/admin/models/fallback-policies",
+            axum::routing::get(admin::models::list_fallback_policies_mini),
+        )
+        .route(
+            "/api/admin/models/{id}",
+            axum::routing::get(admin::models::get_model),
+        )
+        .route(
+            "/api/admin/models/{id}",
+            axum::routing::put(admin::models::update_model),
+        )
+        .route(
+            "/api/admin/keys",
+            axum::routing::get(admin::apikeys::list_keys),
+        )
+        .route(
+            "/api/admin/keys",
+            axum::routing::post(admin::apikeys::create_key),
+        )
+        .route(
+            "/api/admin/keys/{id}",
+            axum::routing::put(admin::apikeys::update_key),
+        )
+        .route(
+            "/api/admin/keys/{id}",
+            axum::routing::delete(admin::apikeys::delete_key),
+        )
+        .route(
+            "/api/admin/fallback/policies",
+            axum::routing::get(admin::fallback::list_policies),
+        )
+        .route(
+            "/api/admin/fallback/policies",
+            axum::routing::post(admin::fallback::create_policy),
+        )
+        .route(
+            "/api/admin/fallback/policies/{id}",
+            axum::routing::get(admin::fallback::get_policy),
+        )
+        .route(
+            "/api/admin/fallback/policies/{id}",
+            axum::routing::put(admin::fallback::update_policy),
+        )
+        .route(
+            "/api/admin/fallback/policies/{id}",
+            axum::routing::delete(admin::fallback::delete_policy),
+        )
         .layer(cors)
         .with_state(state);
 
@@ -90,8 +131,15 @@ async fn main() {
     println!("✅ 网关已启动: http://{}:{}", "0.0.0.0", port);
     let models: Vec<_> = config.models.keys().map(|s| s.as_str()).collect();
     println!("📋 已配置模型: {}", models.join(", "));
-    println!("🔒 API Key 校验: 已启用");
-    println!("📊 用量统计: {}", if config.usage_tracking.enabled { "已启用" } else { "已禁用" });
+    println!("🔒 API Key 校验: 已启用（基于 config.client_api_keys）");
+    println!(
+        "📊 用量统计: {}",
+        if config.usage_tracking.enabled {
+            "已启用"
+        } else {
+            "已禁用"
+        }
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

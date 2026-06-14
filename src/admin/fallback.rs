@@ -1,104 +1,35 @@
+use crate::config::save_config;
 use crate::types::{CreateFallbackPolicyRequest, FallbackPolicy, UpdateFallbackPolicyRequest};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
-use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// In-memory fallback policy store
-pub struct FallbackPolicyStore {
-    policies: RwLock<HashMap<String, FallbackPolicy>>,
-}
-
-impl FallbackPolicyStore {
-    pub fn new() -> Self {
-        Self {
-            policies: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn list(&self) -> Vec<FallbackPolicy> {
-        self.policies.read().unwrap().values().cloned().collect()
-    }
-
-    pub fn get(&self, id: &str) -> Option<FallbackPolicy> {
-        self.policies.read().unwrap().get(id).cloned()
-    }
-
-    pub fn create(&self, req: CreateFallbackPolicyRequest) -> FallbackPolicy {
-        let id = uuid_v4();
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let policy = FallbackPolicy {
-            id: id.clone(),
-            name: req.name,
-            description: req.description,
-            enabled: req.enabled,
-            chain: req.chain,
-            created_at,
-        };
-
-        self.policies.write().unwrap().insert(id, policy.clone());
-        policy
-    }
-
-    pub fn update(&self, id: &str, req: UpdateFallbackPolicyRequest) -> Option<FallbackPolicy> {
-        let mut policies = self.policies.write().unwrap();
-        if let Some(policy) = policies.get_mut(id) {
-            if let Some(name) = req.name {
-                policy.name = name;
-            }
-            if let Some(description) = req.description {
-                policy.description = description;
-            }
-            if let Some(enabled) = req.enabled {
-                policy.enabled = enabled;
-            }
-            if let Some(chain) = req.chain {
-                policy.chain = chain;
-            }
-            return Some(policy.clone());
-        }
-        None
-    }
-
-    pub fn delete(&self, id: &str) -> bool {
-        self.policies.write().unwrap().remove(id).is_some()
-    }
-}
-
-impl Default for FallbackPolicyStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn uuid_v4() -> String {
-    let now = SystemTime::now()
+fn now_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let random: u64 = (now & 0xFFFFFFFFFFFFFFFF) as u64;
-    format!(
-        "{:016x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        now as u64,
-        (random >> 48) as u16,
-        (random >> 32) as u16 & 0x0FFF,
-        ((random >> 16) as u16 & 0x3FFF) | 0x8000,
-        random & 0xFFFFFFFFFFFF
-    )
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// GET /api/admin/fallback/policies
 pub async fn list_policies(State(state): State<AppState>) -> impl IntoResponse {
-    let policies = state.fallback_policy_store.list();
+    let config = state.config.lock().unwrap();
+    let policies: Vec<FallbackPolicy> = config
+        .fallback_policies
+        .iter()
+        .map(|(id, p)| FallbackPolicy {
+            id: id.clone(),
+            name: id.clone(),
+            description: p.description.clone().unwrap_or_default(),
+            enabled: p.enabled,
+            chain: p.chain.clone(),
+            created_at: 0,
+        })
+        .collect();
     Json(serde_json::json!({ "policies": policies }))
 }
 
@@ -106,28 +37,97 @@ pub async fn list_policies(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn create_policy(
     State(state): State<AppState>,
     Json(req): Json<CreateFallbackPolicyRequest>,
-) -> impl IntoResponse {
-    let policy = state.fallback_policy_store.create(req);
-    Json(serde_json::json!({
-        "success": true,
-        "policy": policy
-    }))
+) -> Response {
+    let mut config = state.config.lock().unwrap();
+
+    if config.fallback_policies.contains_key(&req.id) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_exists",
+                "message": format!("Policy '{}' already exists", req.id)
+            })),
+        )
+            .into_response();
+    }
+
+    let policy = crate::types::FallbackPolicyConfig {
+        description: if req.description.is_empty() { None } else { Some(req.description) },
+        enabled: req.enabled,
+        chain: req.chain,
+    };
+    config.fallback_policies.insert(req.id.clone(), policy);
+
+    if let Err(e) = save_config(&config) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "save_failed",
+                "message": e
+            })),
+        )
+            .into_response();
+    }
+
+    let resp_policy = {
+        let id = req.id;
+        FallbackPolicy {
+            id: id.clone(),
+            name: id.clone(),
+            description: config
+                .fallback_policies
+                .get(&id)
+                .and_then(|p| p.description.clone())
+                .unwrap_or_default(),
+            enabled: config
+                .fallback_policies
+                .get(&id)
+                .map(|p| p.enabled)
+                .unwrap_or(true),
+            chain: config
+                .fallback_policies
+                .get(&id)
+                .map(|p| p.chain.clone())
+                .unwrap_or_default(),
+            created_at: now_secs(),
+        }
+    };
+    (
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!({
+            "success": true,
+            "policy": resp_policy
+        })),
+    )
+        .into_response()
 }
 
 /// GET /api/admin/fallback/policies/:id
 pub async fn get_policy(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.fallback_policy_store.get(&id) {
-        Some(policy) => (axum::http::StatusCode::OK, Json(serde_json::json!(policy))),
+) -> Response {
+    let config = state.config.lock().unwrap();
+    match config.fallback_policies.get(&id) {
+        Some(p) => {
+            let resp = FallbackPolicy {
+                id: id.clone(),
+                name: id,
+                description: p.description.clone().unwrap_or_default(),
+                enabled: p.enabled,
+                chain: p.chain.clone(),
+                created_at: 0,
+            };
+            (axum::http::StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         None => (
             axum::http::StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "not_found",
                 "message": format!("Policy '{}' not found", id)
             })),
-        ),
+        )
+            .into_response(),
     }
 }
 
@@ -136,36 +136,120 @@ pub async fn update_policy(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateFallbackPolicyRequest>,
-) -> impl IntoResponse {
-    match state.fallback_policy_store.update(&id, req) {
-        Some(policy) => (axum::http::StatusCode::OK, Json(serde_json::json!({
-            "success": true,
-            "policy": policy
-        }))),
-        None => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "not_found",
-                "message": format!("Policy '{}' not found", id)
-            })),
-        ),
-    }
-}
+) -> Response {
+    let mut config = state.config.lock().unwrap();
 
-/// DELETE /api/admin/fallback/policies/:id
-pub async fn delete_policy(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    if state.fallback_policy_store.delete(&id) {
-        (axum::http::StatusCode::OK, Json(serde_json::json!({ "success": true, "message": "Policy deleted" })))
-    } else {
-        (
+    let Some(policy) = config.fallback_policies.get_mut(&id) else {
+        return (
             axum::http::StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "not_found",
                 "message": format!("Policy '{}' not found", id)
             })),
         )
+            .into_response();
+    };
+
+    if let Some(description) = req.description {
+        policy.description = if description.is_empty() { None } else { Some(description) };
     }
+    if let Some(enabled) = req.enabled {
+        policy.enabled = enabled;
+    }
+    if let Some(chain) = req.chain {
+        policy.chain = chain;
+    }
+
+    if let Err(e) = save_config(&config) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "save_failed",
+                "message": e
+            })),
+        )
+            .into_response();
+    }
+
+    let p = config.fallback_policies.get(&id).cloned().unwrap();
+    let resp = FallbackPolicy {
+        id: id.clone(),
+        name: id,
+        description: p.description.unwrap_or_default(),
+        enabled: p.enabled,
+        chain: p.chain,
+        created_at: 0,
+    };
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "policy": resp
+        })),
+    )
+        .into_response()
+}
+
+/// DELETE /api/admin/fallback/policies/:id
+pub async fn delete_policy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut config = state.config.lock().unwrap();
+
+    // 检查引用
+    let referenced_by_models: Vec<String> = config
+        .models
+        .iter()
+        .filter(|(_, r)| r.fallback_policy.as_deref() == Some(&id))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let referenced_by_keys: Vec<String> = config
+        .client_api_keys
+        .iter()
+        .filter(|(_, k)| k.fallback_policy.as_deref() == Some(&id))
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    if !referenced_by_models.is_empty() || !referenced_by_keys.is_empty() {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "in_use",
+                "message": format!(
+                    "Policy '{}' 仍被引用：models={:?}, keys={:?}",
+                    id, referenced_by_models, referenced_by_keys
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    if config.fallback_policies.remove(&id).is_none() {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("Policy '{}' not found", id)
+            })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = save_config(&config) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "save_failed",
+                "message": e
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "message": "Policy deleted" })),
+    )
+        .into_response()
 }

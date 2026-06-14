@@ -1,95 +1,39 @@
-use crate::types::{ApiKey, CreateApiKeyRequest, CreateApiKeyResponse};
+use crate::config::save_config;
+use crate::types::{
+    ApiKey, ClientApiKeyConfig, CreateApiKeyRequest, CreateApiKeyResponse, UpdateApiKeyRequest,
+};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// In-memory API key store (in production, use a database)
-pub struct ApiKeyStore {
-    keys: RwLock<HashMap<String, ApiKey>>,
+/// 运行期 quota_used：key_id → 累计 token。
+/// 不写盘，重启清零。
+#[derive(Default)]
+pub struct ApiKeyQuotaTracker {
+    used: Mutex<std::collections::HashMap<String, u64>>,
 }
 
-impl ApiKeyStore {
-    pub fn new() -> Self {
-        Self {
-            keys: RwLock::new(HashMap::new()),
-        }
+impl ApiKeyQuotaTracker {
+    pub fn record(&self, key_id: &str, tokens: u64) {
+        let mut m = self.used.lock().unwrap();
+        *m.entry(key_id.to_string()).or_insert(0) += tokens;
     }
 
-    pub fn list(&self) -> Vec<ApiKey> {
-        self.keys.read().unwrap().values().cloned().collect()
-    }
-
-    pub fn get(&self, id: &str) -> Option<ApiKey> {
-        self.keys.read().unwrap().get(id).cloned()
-    }
-
-    pub fn create(&self, req: CreateApiKeyRequest) -> CreateApiKeyResponse {
-        let id = uuid_v4();
-        let raw_key = format!("sk-gw-{}-{}", random_suffix(), random_suffix());
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let key = ApiKey {
-            id: id.clone(),
-            name: req.name,
-            key_prefix: raw_key.chars().take(15).collect(),
-            key_masked: format!("{} ************************************", &raw_key[..15]),
-            model_permissions: req.model_permissions,
-            quota_limit: req.quota_limit,
-            quota_used: 0,
-            quota_percent: 0.0,
-            created_at,
-        };
-
-        self.keys.write().unwrap().insert(id, key.clone());
-
-        CreateApiKeyResponse { key, raw_key }
-    }
-
-    pub fn delete(&self, id: &str) -> bool {
-        self.keys.write().unwrap().remove(id).is_some()
-    }
-
-    pub fn update_quota(&self, id: &str, used: u64) {
-        if let Some(key) = self.keys.write().unwrap().get_mut(id) {
-            key.quota_used = used;
-            key.quota_percent = if key.quota_limit > 0 {
-                (used as f32 / key.quota_limit as f32) * 100.0
-            } else {
-                0.0
-            };
-        }
+    pub fn get(&self, key_id: &str) -> u64 {
+        self.used.lock().unwrap().get(key_id).copied().unwrap_or(0)
     }
 }
 
-impl Default for ApiKeyStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
+fn now_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let random: u64 = (now & 0xFFFFFFFFFFFFFFFF) as u64;
-    format!("{:016x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        now as u64,
-        (random >> 48) as u16,
-        (random >> 32) as u16 & 0x0FFF,
-        ((random >> 16) as u16 & 0x3FFF) | 0x8000,
-        random & 0xFFFFFFFFFFFF
-    )
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn random_suffix() -> String {
@@ -101,15 +45,53 @@ fn random_suffix() -> String {
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
     (0..8)
         .map(|i| {
-            let idx = ((seed >> (i * 4)) as usize) % chars.len();
+            let idx = ((seed >> (i * 4)) as usize + i * 17) % chars.len();
             chars[idx]
         })
         .collect()
 }
 
+fn mask_key(key: &str) -> (String, String) {
+    let prefix: String = key.chars().take(15).collect();
+    let rest = "*".repeat(key.chars().count().saturating_sub(15).max(15));
+    (prefix.clone(), format!("{} {}", prefix, rest))
+}
+
+/// 把持久化的 `ClientApiKeyConfig` 转换为响应给前端的 `ApiKey`。
+fn build_api_key(
+    id: &str,
+    cfg: &ClientApiKeyConfig,
+    used: u64,
+) -> ApiKey {
+    let (key_prefix, key_masked) = mask_key(&cfg.key);
+    let quota_percent = if cfg.quota_limit > 0 {
+        (used as f32 / cfg.quota_limit as f32) * 100.0
+    } else {
+        0.0
+    };
+    ApiKey {
+        id: id.to_string(),
+        name: cfg.name.clone(),
+        key_prefix,
+        key_masked,
+        model_permissions: cfg.model_permissions.clone(),
+        fallback_policy: cfg.fallback_policy.clone(),
+        quota_limit: cfg.quota_limit,
+        quota_used: used,
+        quota_percent,
+        created_at: cfg.created_at,
+    }
+}
+
 /// GET /api/admin/keys
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
-    let keys = state.api_key_store.list();
+    let config = state.config.lock().unwrap();
+    let quota = state.api_key_quota.lock().unwrap();
+    let keys: Vec<ApiKey> = config
+        .client_api_keys
+        .iter()
+        .map(|(id, cfg)| build_api_key(id, cfg, quota.get(id)))
+        .collect();
     Json(serde_json::json!({ "keys": keys }))
 }
 
@@ -117,26 +99,148 @@ pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn create_key(
     State(state): State<AppState>,
     Json(req): Json<CreateApiKeyRequest>,
-) -> impl IntoResponse {
-    let result = state.api_key_store.create(req);
-    Json(serde_json::json!({
-        "success": true,
-        "key": result.key,
-        "raw_key": result.raw_key
-    }))
+) -> Response {
+    let mut config = state.config.lock().unwrap();
+
+    // 生成 id：用 name 简单 slug 化 + 后缀，避免冲突
+    let base_id = req
+        .name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect::<String>();
+    let id = if config.client_api_keys.contains_key(&base_id) {
+        format!("{}_{}", base_id, random_suffix().chars().take(4).collect::<String>())
+    } else {
+        base_id
+    };
+
+    let raw_key = format!("sk-gw-{}-{}", random_suffix(), random_suffix());
+    let cfg = ClientApiKeyConfig {
+        name: req.name,
+        key: raw_key.clone(),
+        model_permissions: req.model_permissions,
+        fallback_policy: req.fallback_policy,
+        quota_limit: req.quota_limit,
+        created_at: now_secs(),
+    };
+
+    config.client_api_keys.insert(id.clone(), cfg);
+    if let Err(e) = save_config(&config) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "save_failed",
+                "message": e
+            })),
+        )
+            .into_response();
+    }
+
+    let resp = build_api_key(&id, config.client_api_keys.get(&id).unwrap(), 0);
+    let response = CreateApiKeyResponse {
+        key: resp,
+        raw_key,
+    };
+    (
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!({
+            "success": true,
+            "key": response.key,
+            "raw_key": response.raw_key
+        })),
+    )
+        .into_response()
+}
+
+/// PUT /api/admin/keys/:id
+/// 注：不允许修改 `key`（明文），需要改 key 就 delete+recreate。
+pub async fn update_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateApiKeyRequest>,
+) -> Response {
+    let mut config = state.config.lock().unwrap();
+
+    let Some(cfg) = config.client_api_keys.get_mut(&id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("Key '{}' not found", id)
+            })),
+        )
+            .into_response();
+    };
+
+    if let Some(name) = req.name {
+        cfg.name = name;
+    }
+    if let Some(perms) = req.model_permissions {
+        cfg.model_permissions = perms;
+    }
+    // fallback_policy: Option<Option<String>> —— 外层 Some 表示「要更新」；
+    // 内层 None 表示「置空」；内层 Some 表示「设置新值」
+    if let Some(fb) = req.fallback_policy {
+        cfg.fallback_policy = fb;
+    }
+    if let Some(quota) = req.quota_limit {
+        cfg.quota_limit = quota;
+    }
+
+    // 先复制出需要的字段（放下 cfg 借用）
+    let saved_cfg = cfg.clone();
+    if let Err(e) = save_config(&config) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "save_failed",
+                "message": e
+            })),
+        )
+            .into_response();
+    }
+
+    let quota = state.api_key_quota.lock().unwrap();
+    let updated = build_api_key(&id, &saved_cfg, quota.get(&id));
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "key": updated
+        })),
+    )
+        .into_response()
 }
 
 /// DELETE /api/admin/keys/:id
 pub async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    if state.api_key_store.delete(&id) {
-        (axum::http::StatusCode::OK, Json(serde_json::json!({ "success": true, "message": "Key deleted" })))
-    } else {
-        (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "not_found",
-            "message": format!("Key '{}' not found", id)
-        })))
+) -> Response {
+    let mut config = state.config.lock().unwrap();
+    if config.client_api_keys.remove(&id).is_none() {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("Key '{}' not found", id)
+            })),
+        )
+            .into_response();
     }
+    if let Err(e) = save_config(&config) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "save_failed",
+                "message": e
+            })),
+        )
+            .into_response();
+    }
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "message": "Key deleted" })),
+    )
+        .into_response()
 }
