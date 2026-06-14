@@ -203,9 +203,9 @@ pub async fn update_model(
             .unwrap_or(false)
         || model.is_some();
 
-    // 写盘前先验证 fallback_policy 引用
+    // 写盘前先验证 fallback_policy 引用（非空才校验）
     if let Some(ref fp) = fallback_policy {
-        if !config.fallback_policies.contains_key(fp) {
+        if !fp.is_empty() && !config.fallback_policies.contains_key(fp) {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
