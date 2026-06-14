@@ -23,6 +23,11 @@ pub struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thaw: Option<ThawConfig>,
 
+    /// SQLite 数据库文件路径。None = 保持旧行为（纯内存，重启丢数据）。
+    /// 设置后，usage_records 与 quota_usage 会持久化到该文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_db: Option<String>,
+
     /// 兼容旧 config：旧版本顶层有 `upstreams` HashMap；新版本合并到 model 上。
     /// 读取时通过 `load_config` 迁移，结构上不再持有。
     #[serde(default, skip_serializing)]
@@ -30,6 +35,9 @@ pub struct GatewayConfig {
 }
 
 /// 一个对外暴露的 model id，4 字段（type / base_url / api_key / model）扁平在自身。
+///
+/// 决策（v0.3）：model 不再持有 `fallback_policy`。fallback 关系由 policy 的
+/// `chain[*].model` 反向表达：同一个 model 可以被多个 policy 复用。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelRoute {
     /// `type` / `base_url` / `api_key` / `model` 决定上游签名
@@ -38,10 +46,6 @@ pub struct ModelRoute {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
-
-    /// 引用的 fallback 策略 id（在 `fallback_policies` 里）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_policy: Option<String>,
 
     #[serde(default)]
     pub metadata: Option<ModelMetadata>,
@@ -52,6 +56,8 @@ pub struct ModelRoute {
     pub _legacy_fallback: Option<String>,
     #[serde(default, skip_serializing)]
     pub _legacy_fallback_chain: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub _legacy_fallback_policy: Option<String>,
     #[serde(default, skip_serializing)]
     pub _legacy_upstream: Option<String>,
 }
@@ -431,6 +437,9 @@ pub struct ContentPart {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageUrl {
     pub url: String,
+    /// OpenAI 风格的可选字段。data URL 情况下可自动从前缀推导。
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -524,6 +533,25 @@ pub struct AnthropicContentBlock {
     pub tool_use_id: Option<String>,
     #[serde(default)]
     pub content: Option<serde_json::Value>,
+    /// v0.3: 多模态图片
+    #[serde(default)]
+    pub source: Option<AnthropicImageSource>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnthropicImageSource {
+    /// "base64" | "url"
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// base64 数据（type=base64 时）
+    #[serde(default)]
+    pub data: Option<String>,
+    /// 远程 URL（type=url 时）
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -603,20 +631,14 @@ pub struct AdminDistributionResponse {
 pub struct ModelConfig {
     pub id: String,
     pub name: String,
-    pub provider: String,
     pub version: String,
     pub status: String,
     pub timeout_secs: u32,
     pub price_per_input: Option<f64>,
     pub price_per_output: Option<f64>,
-    pub upstream: String,
-    pub upstream_type: String,
-    /// 引用的 fallback 策略 id
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_policy: Option<String>,
-    /// 服务端展开后的链节点（便利字段，前端展示用）
+    /// 引用的 fallback 策略 id 列表（v0.3: 一个 model 可被多个 policy 引用）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_chain: Vec<ChainNodeConfig>,
+    pub referenced_by_policies: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -641,7 +663,6 @@ pub struct UpdateModelConfigRequest {
     pub upstream_type: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
-    pub fallback_policy: Option<String>,
 
     /// 编辑上游 api_key：
     /// - None / "" = 不变

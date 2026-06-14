@@ -6,7 +6,8 @@
 #   2. models             ← 对外暴露的 model id；4 字段 (type/base_url/api_key/model) 扁平在本身上
 #   3. client_api_keys    ← 客户端访问本网关的 key（持久化，重启不丢）
 #   4. usage_tracking     ← 用量统计开关
-#   5. thaw               ← 自动冻结/解冻（可选）
+#   5. usage_db           ← SQLite 持久化路径（可选；不设则保持纯内存行为）
+#   6. thaw               ← 自动冻结/解冻（可选）
 #
 # 字段约定：
 #   - ${VAR}  加载时从环境变量解析
@@ -17,6 +18,11 @@
 
 port: 3002
 public_url: "http://localhost:3002"
+
+# SQLite 数据库文件路径。设置后，usage_records 与 quota_usage 都会持久化到该文件，
+# 重启 / 重新部署后用量与配额不丢失。路径不存在会自动创建；文件权限强制 0600。
+# 留空或删除该字段 = 保持旧行为（纯内存，重启即丢）。
+# usage_db: /var/lib/pstep-gateway/usage.db
 
 # =============================================================================
 # 1. Fallback 策略（命名链）

@@ -26,19 +26,13 @@ export interface UsageDistribution {
 export interface ModelConfig {
   id: string;
   name: string;
-  provider: string;
   version: string;
   status: 'active' | 'rate_limited' | 'disabled' | string;
   timeout_secs: number;
   price_per_input?: number;
   price_per_output?: number;
-  upstream: string;
-  /** upstream 语义标签，例如 'anthropic' / 'openai' */
-  upstream_type: string;
-  /** 引用的 fallback 策略 id */
-  fallback_policy?: string | null;
-  /** 服务端展开后的链节点（UI 展示用） */
-  fallback_chain: ChainNode[];
+  /** v0.3: 引用此 model 的所有 fallback 策略 id */
+  referenced_by_policies?: string[];
   /** 上游 base_url（仅编辑界面使用） */
   base_url?: string;
   /** 上游 api_key 的脱敏显示 */
@@ -56,9 +50,7 @@ export interface ModelConfigUpdate {
   status?: 'active' | 'rate_limited' | 'disabled';
   price_per_input?: number;
   price_per_output?: number;
-  fallback_policy?: string;
   // 需重启字段
-  upstream_type?: 'openai' | 'anthropic';
   base_url?: string;
   model?: string;
   /** None / "" = 不变；"********" = 不变；其他 = 覆盖 */

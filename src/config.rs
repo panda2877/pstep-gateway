@@ -215,10 +215,8 @@ fn migrate_legacy(value: &mut Value) {
                     Value::from(policy_id.clone()),
                     serde_yaml::to_value(policy).unwrap_or(Value::Null),
                 );
-                model_map.insert(
-                    Value::from("fallback_policy"),
-                    Value::from(policy_id),
-                );
+                // v0.3: model 不再承载 fallback_policy 引用。
+                // 旧链迁移后只创建独立 policy，使用方需要在 API Key 上指定。
             }
         }
 
@@ -329,11 +327,15 @@ fn validate_config(config: &GatewayConfig) {
             eprintln!("❌ 模型 \"{}\" 未设置 api_key", name);
             std::process::exit(1);
         }
-        if let Some(policy_id) = &route.fallback_policy {
-            if !config.fallback_policies.contains_key(policy_id) {
+    }
+
+    // 校验 fallback policy 的 chain 中所有 model id 必须存在
+    for (policy_id, policy) in &config.fallback_policies {
+        for node in &policy.chain {
+            if !config.models.contains_key(&node.model) {
                 eprintln!(
-                    "❌ 模型 \"{}\" 引用了不存在的 fallback_policy \"{}\"",
-                    name, policy_id
+                    "❌ fallback_policy \"{}\" 的 chain 引用了不存在的 model \"{}\"",
+                    policy_id, node.model
                 );
                 std::process::exit(1);
             }

@@ -4,8 +4,8 @@ import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
-import { getModels, updateModel, getFallbackPoliciesMini } from '../services/api';
-import type { ModelConfig, FallbackPolicyMini } from '../types';
+import { getModels, updateModel } from '../services/api';
+import type { ModelConfig } from '../types';
 
 const KEEP_PLACEHOLDER = '********';
 
@@ -20,10 +20,8 @@ interface FormState {
   status: 'active' | 'rate_limited' | 'disabled';
   price_per_input: number;
   price_per_output: number;
-  upstream_type: 'openai' | 'anthropic';
   base_url: string;
   model: string;
-  fallback_policy: string;
   api_key: string;
 }
 
@@ -32,16 +30,13 @@ const buildFormState = (m: ModelConfig): FormState => ({
   status: (m.status as FormState['status']) || 'active',
   price_per_input: m.price_per_input || 0,
   price_per_output: m.price_per_output || 0,
-  upstream_type: (m.upstream_type as FormState['upstream_type']) || 'anthropic',
   base_url: m.base_url || '',
   model: m.upstream_model || '',
-  fallback_policy: m.fallback_policy || '',
   api_key: KEEP_PLACEHOLDER,
 });
 
 export const ModelsPage: React.FC = () => {
   const [models, setModels] = useState<ModelConfig[]>([]);
-  const [policies, setPolicies] = useState<FallbackPolicyMini[]>([]);
   const [loading, setLoading] = useState(true);
   const [editModal, setEditModal] = useState<ModelConfig | null>(null);
   const [formData, setFormData] = useState<FormState | null>(null);
@@ -51,9 +46,8 @@ export const ModelsPage: React.FC = () => {
   const fetchModels = async () => {
     setLoading(true);
     try {
-      const [ms, ps] = await Promise.all([getModels(), getFallbackPoliciesMini()]);
+      const ms = await getModels();
       setModels(ms);
-      setPolicies(ps);
     } catch (err) {
       console.error('Failed to fetch models:', err);
     } finally {
@@ -81,17 +75,14 @@ export const ModelsPage: React.FC = () => {
         status: formData.status,
         price_per_input: formData.price_per_input,
         price_per_output: formData.price_per_output,
-        upstream_type: formData.upstream_type,
         base_url: formData.base_url,
         model: formData.model,
-        fallback_policy: formData.fallback_policy,
       };
       if (formData.api_key !== KEEP_PLACEHOLDER && formData.api_key !== '') {
         payload.api_key = formData.api_key;
       }
       const resp = await updateModel(editModal.id, payload as Parameters<typeof updateModel>[1]);
       setResultMsg(resp.message);
-      // 不立即关 modal，让用户看到「需重启」提示
       fetchModels();
     } catch (err) {
       console.error('Failed to update model:', err);
@@ -108,7 +99,7 @@ export const ModelsPage: React.FC = () => {
       <div className="section-header">
         <div>
           <h2 className="section-title">模型配置</h2>
-          <p className="section-desc">管理模型参数与 fallback 策略</p>
+          <p className="section-desc">管理模型参数与上游连接</p>
         </div>
       </div>
 
@@ -118,9 +109,8 @@ export const ModelsPage: React.FC = () => {
             <thead>
               <tr>
                 <th>模型</th>
-                <th>供应商</th>
                 <th>状态</th>
-                <th>Fallback 策略</th>
+                <th>被引用策略</th>
                 <th>输入单价</th>
                 <th>输出单价</th>
                 <th>操作</th>
@@ -129,13 +119,13 @@ export const ModelsPage: React.FC = () => {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={7} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
+                  <td colSpan={6} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
                     加载中...
                   </td>
                 </tr>
               ) : models.length === 0 ? (
                 <tr>
-                  <td colSpan={7} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
+                  <td colSpan={6} style={{ textAlign: 'center', padding: '20px', color: 'var(--fg-2)' }}>
                     暂无数据
                   </td>
                 </tr>
@@ -143,13 +133,16 @@ export const ModelsPage: React.FC = () => {
                 models.map((model) => (
                   <tr key={model.id}>
                     <td style={{ fontWeight: 500 }}>{model.name}</td>
-                    <td className="meta">{model.provider}</td>
                     <td>
                       <Badge variant={model.status === 'active' ? 'success' : model.status === 'rate_limited' ? 'warn' : 'default'}>
                         {STATUS_LABEL[model.status] || model.status}
                       </Badge>
                     </td>
-                    <td className="meta">{model.fallback_policy || '—'}</td>
+                    <td className="meta">
+                      {model.referenced_by_policies && model.referenced_by_policies.length > 0
+                        ? model.referenced_by_policies.join(', ')
+                        : '—'}
+                    </td>
                     <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_input)}</td>
                     <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_output)}</td>
                     <td className="actions">
@@ -180,43 +173,25 @@ export const ModelsPage: React.FC = () => {
       >
         {editModal && formData && (
           <>
-            <div className="field-row">
-              <Input
-                label="模型名称"
-                value={formData.name}
-                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              />
-              <Input label="供应商" value={editModal.provider} readOnly />
-            </div>
+            <Input
+              label="模型名称"
+              value={formData.name}
+              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+            />
 
-            <div className="field-row">
-              <div className="field">
-                <label>状态</label>
-                <select
-                  className="select"
-                  value={formData.status}
-                  onChange={(e) =>
-                    setFormData({ ...formData, status: e.target.value as FormState['status'] })
-                  }
-                >
-                  <option value="active">活跃</option>
-                  <option value="rate_limited">限流中</option>
-                  <option value="disabled">已禁用</option>
-                </select>
-              </div>
-              <div className="field">
-                <label>Fallback 策略</label>
-                <select
-                  className="select"
-                  value={formData.fallback_policy}
-                  onChange={(e) => setFormData({ ...formData, fallback_policy: e.target.value })}
-                >
-                  <option value="">（不设置）</option>
-                  {policies.map((p) => (
-                    <option key={p.id} value={p.id}>{p.id}</option>
-                  ))}
-                </select>
-              </div>
+            <div className="field">
+              <label>状态</label>
+              <select
+                className="select"
+                value={formData.status}
+                onChange={(e) =>
+                  setFormData({ ...formData, status: e.target.value as FormState['status'] })
+                }
+              >
+                <option value="active">活跃</option>
+                <option value="rate_limited">限流中</option>
+                <option value="disabled">已禁用</option>
+              </select>
             </div>
 
             <div className="field-row">
@@ -238,50 +213,34 @@ export const ModelsPage: React.FC = () => {
 
             <div className="section-divider"><span>上游配置（变更需重启服务）</span></div>
 
-            <div className="field-row">
-              <div className="field">
-                <label>上游类型</label>
-                <select
-                  className="select"
-                  value={formData.upstream_type}
-                  onChange={(e) =>
-                    setFormData({ ...formData, upstream_type: e.target.value as FormState['upstream_type'] })
-                  }
-                >
-                  <option value="openai">openai</option>
-                  <option value="anthropic">anthropic</option>
-                </select>
-              </div>
-              <Input
-                label="上游模型 id"
-                value={formData.model}
-                placeholder="例如：claude-3-5-sonnet-20241022"
-                onChange={(e) => setFormData({ ...formData, model: e.target.value })}
-              />
-            </div>
+            <Input
+              label="上游模型 id"
+              value={formData.model}
+              placeholder="例如：claude-3-5-sonnet-20241022"
+              onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+            />
 
-            <div className="field-row">
-              <Input
-                label="Base URL"
-                value={formData.base_url}
-                placeholder="https://api.openai.com/v1"
-                onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
-                hint="上游服务的 API 地址"
-              />
-              <Input
-                label="API Key"
-                type="password"
-                mono
-                value={formData.api_key}
-                placeholder={KEEP_PLACEHOLDER}
-                onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
-                hint={
-                  editModal.api_key_configured
-                    ? `当前已配置（${editModal.api_key_masked || '****'}），留空或保持占位符表示不修改`
-                    : '尚未配置'
-                }
-              />
-            </div>
+            <Input
+              label="Base URL"
+              value={formData.base_url}
+              placeholder="https://api.openai.com/v1"
+              onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+              hint="上游服务的 API 地址"
+            />
+
+            <Input
+              label="API Key"
+              type="password"
+              mono
+              value={formData.api_key}
+              placeholder={KEEP_PLACEHOLDER}
+              onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
+              hint={
+                editModal.api_key_configured
+                  ? `当前已配置（${editModal.api_key_masked || '****'}），留空或保持占位符表示不修改`
+                  : '尚未配置'
+              }
+            />
 
             {resultMsg && (
               <div className="field-hint" style={{ marginTop: 8, color: 'var(--fg-2)' }}>

@@ -2,26 +2,66 @@ use crate::config::save_config;
 use crate::types::{
     ApiKey, ClientApiKeyConfig, CreateApiKeyRequest, CreateApiKeyResponse, UpdateApiKeyRequest,
 };
+use crate::usage_db::UsageDb;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
     Json,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 运行期 quota_used：key_id → 累计 token。
-/// 不写盘，重启清零。
+/// 启动时若 `usage_db` 已配置则从 DB 还原；`record()` 时同步写库。
 #[derive(Default)]
 pub struct ApiKeyQuotaTracker {
     used: Mutex<std::collections::HashMap<String, u64>>,
+    db: Option<Arc<UsageDb>>,
 }
 
 impl ApiKeyQuotaTracker {
+    pub fn set_db(&mut self, db: Arc<UsageDb>) {
+        self.db = Some(db);
+    }
+
+    /// 启动时调用：用 DB 中的累计值还原内存映射。
+    pub fn seed_from_db(&self) {
+        let Some(db) = &self.db else { return };
+        match db.load_all_quotas() {
+            Ok(map) => {
+                let mut m = self.used.lock().unwrap();
+                for (k, v) in map {
+                    m.insert(k, v);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "usage_db",
+                    error = %e,
+                    "quota_usage 启动还原失败；以空状态启动"
+                );
+            }
+        }
+    }
+
     pub fn record(&self, key_id: &str, tokens: u64) {
-        let mut m = self.used.lock().unwrap();
-        *m.entry(key_id.to_string()).or_insert(0) += tokens;
+        let new_total = {
+            let mut m = self.used.lock().unwrap();
+            let entry = m.entry(key_id.to_string()).or_insert(0);
+            *entry += tokens;
+            *entry
+        };
+        if let Some(db) = &self.db {
+            if let Err(e) = db.upsert_quota(key_id, new_total) {
+                tracing::warn!(
+                    target: "usage_db",
+                    error = %e,
+                    key_id,
+                    "quota_usage 写库失败"
+                );
+            }
+        }
     }
 
     pub fn get(&self, key_id: &str) -> u64 {

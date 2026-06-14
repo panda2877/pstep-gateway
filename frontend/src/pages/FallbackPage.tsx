@@ -81,7 +81,8 @@ export const FallbackPage: React.FC = () => {
     if (!first) return;
     setFormData({
       ...formData,
-      chain: [...formData.chain, { upstream: first.upstream_type, model: first.upstream_model }],
+      // v0.3: 移除 upstream_type 字段；用 model id 作为语义标签
+      chain: [...formData.chain, { upstream: first.id, model: first.upstream_model }],
     });
   };
 
@@ -247,13 +248,14 @@ export const FallbackPage: React.FC = () => {
                   onChange={(e) => {
                     const found = models.find((m) => m.upstream_model === e.target.value);
                     if (found) {
-                      updateChainNode(i, { upstream: found.upstream_type, model: found.upstream_model });
+                      // v0.3: 移除 upstream_type 字段；用 model id 作为语义标签
+                      updateChainNode(i, { upstream: found.id, model: found.upstream_model });
                     }
                   }}
                 >
                   {models.map((m) => (
                     <option key={m.upstream_model} value={m.upstream_model}>
-                      {m.upstream_type} · {m.upstream_model} ({m.name})
+                      {m.upstream_model} ({m.name})
                     </option>
                   ))}
                 </select>
@@ -321,13 +323,14 @@ export const FallbackPage: React.FC = () => {
                       onChange={(e) => {
                         const found = models.find((m) => m.upstream_model === e.target.value);
                         if (found) {
-                          updateChainNode(i, { upstream: found.upstream_type, model: found.upstream_model });
+                          // v0.3: 移除 upstream_type 字段；用 model id 作为语义标签
+                          updateChainNode(i, { upstream: found.id, model: found.upstream_model });
                         }
                       }}
                     >
                       {models.map((m) => (
                         <option key={m.upstream_model} value={m.upstream_model}>
-                          {m.upstream_type} · {m.upstream_model} ({m.name})
+                          {m.upstream_model} ({m.name})
                         </option>
                       ))}
                     </select>

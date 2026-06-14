@@ -326,7 +326,14 @@ async fn chat_completions(
 
     let result = state
         .router
-        .route(&model_name, &body_str, format, auth.fallback_policy.as_deref())
+        .route(
+            &model_name,
+            &body_str,
+            format,
+            auth.fallback_policy.as_deref(),
+            Some(&auth.key_id),
+            &state.api_key_quota,
+        )
         .await;
 
     match result {
@@ -377,6 +384,8 @@ async fn chat_completions_anthropic(
                 &body_str,
                 OutputFormat::Anthropic,
                 auth.fallback_policy.as_deref(),
+                Some(&auth.key_id),
+                &state.api_key_quota,
             )
             .await;
 
@@ -412,6 +421,8 @@ async fn chat_completions_anthropic(
                 &body_str,
                 OutputFormat::Anthropic,
                 auth.fallback_policy.as_deref(),
+                Some(&auth.key_id),
+                &state.api_key_quota,
             )
             .await;
 

@@ -6,6 +6,7 @@ mod router;
 mod thaw;
 mod types;
 mod usage;
+mod usage_db;
 
 use admin::apikeys::ApiKeyQuotaTracker;
 use admin::usage as admin_usage;
@@ -36,19 +37,41 @@ async fn main() {
 
     let config = load_config();
 
+    // 打开 SQLite usage_db（如果配置了的话）。None = 走纯内存路径（向后兼容）。
+    let usage_db: Option<Arc<usage_db::UsageDb>> = config
+        .usage_db
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let db = Arc::new(
+                usage_db::UsageDb::open(p).expect("无法打开 usage_db"),
+            );
+            db.migrate().expect("无法初始化 usage_db schema");
+            println!("💾 usage_db 已就绪: {}", p);
+            db
+        });
+
     let thaw_tracker = if let Some(thaw_config) = &config.thaw {
         Some(Arc::new(thaw::ThawTracker::new(thaw_config.clone())))
     } else {
         None
     };
 
-    let gateway_router = GatewayRouter::new(config.clone(), thaw_tracker.clone());
+    let gateway_router = GatewayRouter::new(config.clone(), thaw_tracker.clone(), usage_db.clone());
+
+    // ApiKeyQuotaTracker：若 DB 可用，挂上 DB 并从 DB 还原历史 quota
+    let mut quota_tracker = ApiKeyQuotaTracker::default();
+    if let Some(db) = &usage_db {
+        quota_tracker.set_db(db.clone());
+        quota_tracker.seed_from_db();
+    }
+    let api_key_quota = Arc::new(Mutex::new(quota_tracker));
 
     let state = AppState {
         config: Arc::new(Mutex::new(config.clone())),
         router: Arc::new(gateway_router),
         thaw_tracker,
-        api_key_quota: Arc::new(Mutex::new(ApiKeyQuotaTracker::default())),
+        api_key_quota,
     };
 
     let cors = CorsLayer::new()

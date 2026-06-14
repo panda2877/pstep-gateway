@@ -197,13 +197,8 @@ pub async fn delete_policy(
 ) -> Response {
     let mut config = state.config.lock().unwrap();
 
-    // 检查引用
-    let referenced_by_models: Vec<String> = config
-        .models
-        .iter()
-        .filter(|(_, r)| r.fallback_policy.as_deref() == Some(&id))
-        .map(|(k, _)| k.clone())
-        .collect();
+    // v0.3: model 不再引用 fallback_policy；引用关系由 policy.chain 反向表达。
+    // 删除前只需检查：1) 有没有 client_api_key 引用；2) 这个 policy 自身。
     let referenced_by_keys: Vec<String> = config
         .client_api_keys
         .iter()
@@ -211,14 +206,14 @@ pub async fn delete_policy(
         .map(|(k, _)| k.clone())
         .collect();
 
-    if !referenced_by_models.is_empty() || !referenced_by_keys.is_empty() {
+    if !referenced_by_keys.is_empty() {
         return (
             axum::http::StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "in_use",
                 "message": format!(
-                    "Policy '{}' 仍被引用：models={:?}, keys={:?}",
-                    id, referenced_by_models, referenced_by_keys
+                    "Policy '{}' 仍被引用：keys={:?}",
+                    id, referenced_by_keys
                 )
             })),
         )

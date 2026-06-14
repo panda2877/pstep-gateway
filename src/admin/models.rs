@@ -28,11 +28,11 @@ fn mask_api_key(key: &str) -> String {
     format!("{}{}{}", head, "*".repeat(len - 7), tail)
 }
 
-/// 把 ModelRoute 转换为响应给前端的 ModelConfig（含展开的 fallback_chain）。
+/// 把 ModelRoute 转换为响应给前端的 ModelConfig。
 fn build_model_config(
     id: &str,
     route: &crate::types::ModelRoute,
-    policy: Option<&crate::types::FallbackPolicyConfig>,
+    referenced_by_policies: Vec<String>,
 ) -> ModelConfig {
     let metadata = route.metadata.as_ref();
     let name = metadata
@@ -45,15 +45,9 @@ fn build_model_config(
         Some(mask_api_key(&route.api_key))
     };
 
-    let fallback_chain = policy
-        .filter(|p| p.enabled)
-        .map(|p| p.chain.clone())
-        .unwrap_or_default();
-
     ModelConfig {
         id: id.to_string(),
         name,
-        provider: route.upstream_type.as_str().to_string(),
         version: "2024-01-01".to_string(),
         status: metadata
             .map(|m| m.status.as_str().to_string())
@@ -61,15 +55,27 @@ fn build_model_config(
         timeout_secs: 30,
         price_per_input: metadata.and_then(|m| m.price_per_input),
         price_per_output: metadata.and_then(|m| m.price_per_output),
-        upstream: route.upstream_type.as_str().to_string(),
-        upstream_type: route.upstream_type.as_str().to_string(),
-        fallback_policy: route.fallback_policy.clone(),
-        fallback_chain,
+        referenced_by_policies,
         base_url: Some(route.base_url.clone()),
         api_key_masked,
         api_key_configured: !route.api_key.is_empty(),
         upstream_model: route.model.clone(),
     }
+}
+
+/// 找出引用了此 model 的所有 fallback policy id。
+fn policies_referencing_model(
+    config: &crate::types::GatewayConfig,
+    model_id: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = config
+        .fallback_policies
+        .iter()
+        .filter(|(_, p)| p.chain.iter().any(|n| n.model == model_id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    out.sort();
+    out
 }
 
 /// GET /api/admin/models
@@ -79,11 +85,8 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         .models
         .iter()
         .map(|(id, route)| {
-            let policy = route
-                .fallback_policy
-                .as_ref()
-                .and_then(|pid| config.fallback_policies.get(pid));
-            build_model_config(id, route, policy)
+            let refs = policies_referencing_model(&config, id);
+            build_model_config(id, route, refs)
         })
         .collect();
 
@@ -98,11 +101,8 @@ pub async fn get_model(
     let config = state.config.lock().unwrap();
     match config.models.get(&id) {
         Some(route) => {
-            let policy = route
-                .fallback_policy
-                .as_ref()
-                .and_then(|pid| config.fallback_policies.get(pid));
-            Json(build_model_config(&id, route, policy)).into_response()
+            let refs = policies_referencing_model(&config, &id);
+            Json(build_model_config(&id, route, refs)).into_response()
         }
         None => (
             axum::http::StatusCode::NOT_FOUND,
@@ -117,9 +117,10 @@ pub async fn get_model(
 
 /// PUT /api/admin/models/:id
 ///
-/// 字段分组（决策 #4）：
-/// - 热更新：name, status, price_per_input, price_per_output, fallback_policy
+/// 字段分组（v0.3）：
+/// - 热更新：name, status, price_per_input, price_per_output
 /// - 需重启：type (upstream_type), base_url, api_key, model
+/// - 移除：fallback_policy（关系由 policy.chain[*].model 反向表达）
 pub async fn update_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -134,7 +135,6 @@ pub async fn update_model(
     let base_url = req.base_url.clone();
     let model = req.model.clone();
     let api_key = req.api_key.clone();
-    let fallback_policy = req.fallback_policy.clone();
 
     // 解析 status
     let new_status = match status_str.as_deref() {
@@ -203,20 +203,6 @@ pub async fn update_model(
             .unwrap_or(false)
         || model.is_some();
 
-    // 写盘前先验证 fallback_policy 引用（非空才校验）
-    if let Some(ref fp) = fallback_policy {
-        if !fp.is_empty() && !config.fallback_policies.contains_key(fp) {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_fallback_policy",
-                    "message": format!("fallback_policy '{}' 不存在", fp)
-                })),
-            )
-                .into_response();
-        }
-    }
-
     if let Some(route) = config.models.get_mut(&id) {
         // --- 热更新字段 ---
         if let Some(n) = name.clone() {
@@ -263,9 +249,6 @@ pub async fn update_model(
                 }
             }
         }
-        if let Some(ref fp) = fallback_policy {
-            route.fallback_policy = if fp.is_empty() { None } else { Some(fp.clone()) };
-        }
 
         // --- 需重启字段 ---
         if let Some(ut) = new_upstream_type {
@@ -301,13 +284,11 @@ pub async fn update_model(
     }
 
     // 读回最新值
-    let updated = config.models.get(&id).map(|route| {
-        let policy = route
-            .fallback_policy
-            .as_ref()
-            .and_then(|pid| config.fallback_policies.get(pid));
-        build_model_config(&id, route, policy)
-    });
+    let refs = policies_referencing_model(&config, &id);
+    let updated = config
+        .models
+        .get(&id)
+        .map(|route| build_model_config(&id, route, refs));
 
     let api_key_changed = api_key
         .as_ref()
@@ -331,7 +312,6 @@ pub async fn update_model(
             "upstream_type": upstream_type_str,
             "base_url": base_url,
             "model": model,
-            "fallback_policy": fallback_policy,
             "api_key_changed": api_key_changed
         },
         "model": updated

@@ -2,6 +2,7 @@ use crate::providers::{self, OutputFormat};
 use crate::thaw::ThawTracker;
 use crate::types::GatewayConfig;
 use crate::usage::UsageTracker;
+use crate::usage_db::UsageDb;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -13,14 +14,26 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn new(config: GatewayConfig, thaw_tracker: Option<Arc<ThawTracker>>) -> Self {
+    pub fn new(
+        config: GatewayConfig,
+        thaw_tracker: Option<Arc<ThawTracker>>,
+        usage_db: Option<Arc<UsageDb>>,
+    ) -> Self {
         let usage_tracking = config.usage_tracking.clone();
-        Self {
-            config,
-            usage_tracker: Arc::new(UsageTracker::new(
+        let usage_tracker = match usage_db {
+            Some(db) => Arc::new(UsageTracker::with_db(
+                usage_tracking.enabled,
+                usage_tracking.retention_hours,
+                db,
+            )),
+            None => Arc::new(UsageTracker::new(
                 usage_tracking.enabled,
                 usage_tracking.retention_hours,
             )),
+        };
+        Self {
+            config,
+            usage_tracker,
             thaw_tracker,
             last_failover: Arc::new(RwLock::new(false)),
         }
@@ -40,15 +53,16 @@ impl Router {
 
     /// 构建完整 fallback 链：主模型 → 策略里的 chain 节点（按 model id 匹配）。
     ///
-    /// 策略里的 `upstream` 字段是语义标签，仅用于 UI 展示；`model` 是 `config.models` 的 key。
-    /// `key_fallback_policy` 来自请求附带的 API Key 元数据，可覆盖 model 默认策略。
+    /// 决策（v0.3）：model 不再自带 fallback_policy。fallback 关系由请求侧
+    /// `key_fallback_policy` 决定：API Key 可指定一个策略覆盖默认（无 key
+    /// 时无 fallback）。
     fn build_chain(
         &self,
         model_name: &str,
         key_fallback_policy: Option<&str>,
     ) -> Result<Vec<String>, String> {
-        let route = self.config.models.get(model_name).ok_or_else(|| {
-            format!(
+        if !self.config.models.contains_key(model_name) {
+            return Err(format!(
                 "未知模型: {}。可用模型: {}",
                 model_name,
                 self.config.models
@@ -56,15 +70,13 @@ impl Router {
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )
-        })?;
+            ));
+        }
 
         // 链：存的是 model id（即 config.models 的 key）
         let mut chain: Vec<String> = vec![model_name.to_string()];
 
-        let policy_id = key_fallback_policy.or(route.fallback_policy.as_deref());
-
-        if let Some(pid) = policy_id {
+        if let Some(pid) = key_fallback_policy {
             if let Some(policy) = self.config.fallback_policies.get(pid) {
                 if policy.enabled {
                     for node in &policy.chain {
@@ -96,6 +108,8 @@ impl Router {
         body: &str,
         format: OutputFormat,
         key_fallback_policy: Option<&str>,
+        key_id: Option<&str>,
+        quota_tracker: &Arc<std::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
     ) -> Result<String, String> {
         let chain = self.build_chain(model_name, key_fallback_policy)?;
         let route = self.config.models.get(model_name).unwrap();
@@ -159,6 +173,14 @@ impl Router {
                         latency_ms: start.elapsed().as_millis() as u64,
                     });
 
+                    // 累计到 client_api_key 的 quota_used（持久化由 tracker 内部处理）
+                    if let Some(kid) = key_id {
+                        quota_tracker
+                            .lock()
+                            .unwrap()
+                            .record(kid, (usage.prompt_tokens + usage.completion_tokens) as u64);
+                    }
+
                     return Ok(response);
                 }
                 Err(e) => {
@@ -193,6 +215,8 @@ impl Router {
         body: &str,
         format: OutputFormat,
         key_fallback_policy: Option<&str>,
+        key_id: Option<&str>,
+        quota_tracker: &Arc<std::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
     ) -> Result<String, String> {
         let chain = self.build_chain(model_name, key_fallback_policy)?;
         let route = self.config.models.get(model_name).unwrap();
@@ -257,6 +281,14 @@ impl Router {
                         success: true,
                         latency_ms: start.elapsed().as_millis() as u64,
                     });
+
+                    // 累计到 client_api_key 的 quota_used（持久化由 tracker 内部处理）
+                    if let Some(kid) = key_id {
+                        quota_tracker
+                            .lock()
+                            .unwrap()
+                            .record(kid, (usage.prompt_tokens + usage.completion_tokens) as u64);
+                    }
 
                     return Ok(response);
                 }

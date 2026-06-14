@@ -1,10 +1,10 @@
 use crate::providers::OutputFormat;
 use crate::types::{
     AnthropicRequest, AnthropicContent, AnthropicMessage, AnthropicContentBlock,
-    AnthropicTool, AnthropicToolChoice, TokenUsage,
+    AnthropicImageSource, AnthropicTool, AnthropicToolChoice, TokenUsage,
     UpstreamConfig, ChatCompletionsRequest, ContentValue, Message as OaiMessage,
     AnthropicMessagesRequest, AnthropicSystem,
-    Tool as OaiTool, ToolChoice, ContentPart, FunctionDef,
+    Tool as OaiTool, ToolChoice, ContentPart, FunctionDef, ImageUrl,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -276,6 +276,7 @@ fn openai_to_anthropic_request(
                     input: None,
                     tool_use_id: Some(tool_use_id),
                     content: Some(json!(result_text)),
+                    source: None,
                 };
                 return AnthropicMessage {
                     role: "user".to_string(),
@@ -308,6 +309,7 @@ fn openai_to_anthropic_request(
                             input: Some(input),
                             tool_use_id: None,
                             content: None,
+                            source: None,
                         });
                     }
                 }
@@ -322,6 +324,7 @@ fn openai_to_anthropic_request(
                             text: Some(s.clone()),
                             id: None, name: None, input: None,
                             tool_use_id: None, content: None,
+                            source: None,
                         });
                     } else {
                         // text-only assistant or user string
@@ -333,6 +336,15 @@ fn openai_to_anthropic_request(
                 }
                 ContentValue::Array(arr) => {
                     for part in arr {
+                        // v0.3: image_url → Anthropic image block
+                        if part.part_type == "image_url" {
+                            if let Some(img) = &part.image_url {
+                                if let Some(block) = openai_image_url_to_anthropic(img) {
+                                    blocks.push(block);
+                                    continue;
+                                }
+                            }
+                        }
                         let mut obj = serde_json::Map::new();
                         obj.insert("type".to_string(), json!(part.part_type));
                         if let Some(text) = &part.text {
@@ -400,6 +412,54 @@ fn openai_to_anthropic_request(
         tools,
         tool_choice,
         stop_sequences: None,
+    })
+}
+
+/// v0.3 多模态: 把 OpenAI `image_url` 转换为 Anthropic image content block。
+///
+/// - `data:image/<media_type>;base64,<data>` → `{ type: base64, media_type, data }`
+/// - `https://...` → `{ type: url, url }`
+fn openai_image_url_to_anthropic(img: &ImageUrl) -> Option<AnthropicContentBlock> {
+    let url = img.url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    if let Some(rest) = url.strip_prefix("data:") {
+        // data:<media>;base64,<payload>
+        if let Some((meta, payload)) = rest.split_once(";base64,") {
+            return Some(AnthropicContentBlock {
+                block_type: "image".to_string(),
+                text: None,
+                id: None,
+                name: None,
+                input: None,
+                tool_use_id: None,
+                content: None,
+                source: Some(AnthropicImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some(meta.to_string()),
+                    data: Some(payload.to_string()),
+                    url: None,
+                }),
+            });
+        }
+        return None;
+    }
+    // remote URL
+    Some(AnthropicContentBlock {
+        block_type: "image".to_string(),
+        text: None,
+        id: None,
+        name: None,
+        input: None,
+        tool_use_id: None,
+        content: None,
+        source: Some(AnthropicImageSource {
+            source_type: "url".to_string(),
+            media_type: None,
+            data: None,
+            url: Some(url.to_string()),
+        }),
     })
 }
 
@@ -494,15 +554,41 @@ pub fn anthropic_request_to_openai_json(
                                 tool_calls: None,
                             });
                         }
-                        // skip thinking, image, etc.
+                        "image" => {
+                            // v0.3: Anthropic image block → openai image_url part
+                            has_non_tool_result = true;
+                            if let Some(source) = v.get("source") {
+                                let url = match (
+                                    source.get("type").and_then(|t| t.as_str()),
+                                    source.get("media_type").and_then(|t| t.as_str()),
+                                    source.get("data").and_then(|d| d.as_str()),
+                                    source.get("url").and_then(|u| u.as_str()),
+                                ) {
+                                    (Some("base64"), Some(media), Some(data), _) => {
+                                        Some(format!("data:{};base64,{}", media, data))
+                                    }
+                                    (Some("url"), _, _, Some(u)) => Some(u.to_string()),
+                                    _ => None,
+                                };
+                                if let Some(url) = url {
+                                    text_parts.push(ContentPart {
+                                        part_type: "image_url".to_string(),
+                                        text: None,
+                                        image_url: Some(ImageUrl { url, detail: None }),
+                                    });
+                                }
+                            }
+                        }
+                        // skip thinking, etc.
                         _ => {}
                     }
                 }
                 if text_parts.is_empty() {
                     ContentValue::String(String::new())
-                } else if text_parts.len() == 1 {
+                } else if text_parts.len() == 1 && text_parts[0].part_type == "text" {
                     ContentValue::String(text_parts[0].text.clone().unwrap_or_default())
                 } else {
+                    // 多个 part（含 image_url）必须以 array 形式发出
                     ContentValue::Array(text_parts)
                 }
             }
