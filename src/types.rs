@@ -16,11 +16,11 @@ pub struct GatewayConfig {
     pub fallback_policies: HashMap<String, FallbackPolicyConfig>,
 
     /// 客户端 API Key（持久化）。运行期 quota_used 在内存中，**不**写盘。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub client_api_keys: HashMap<String, ClientApiKeyConfig>,
 
     pub usage_tracking: UsageConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thaw: Option<ThawConfig>,
 
     /// 兼容旧 config：旧版本顶层有 `upstreams` HashMap；新版本合并到 model 上。
@@ -40,7 +40,7 @@ pub struct ModelRoute {
     pub model: String,
 
     /// 引用的 fallback 策略 id（在 `fallback_policies` 里）
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_policy: Option<String>,
 
     #[serde(default)]
@@ -152,6 +152,7 @@ pub struct FallbackPolicyConfig {
 pub struct ChainNodeConfig {
     /// 语义标签（如 anthropic / mimo / openai），仅用于 UI 展示
     pub upstream: String,
+    /// 对应 `models` map 的 key（即对外的 model id）
     pub model: String,
 }
 

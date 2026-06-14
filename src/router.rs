@@ -1,6 +1,6 @@
 use crate::providers::{self, OutputFormat};
 use crate::thaw::ThawTracker;
-use crate::types::{ChainNodeConfig, GatewayConfig};
+use crate::types::GatewayConfig;
 use crate::usage::UsageTracker;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -38,17 +38,15 @@ impl Router {
         *self.last_failover.read().await
     }
 
-    /// 构建完整 fallback 链：主模型 → 策略里的 chain 节点（按 model 匹配）。
+    /// 构建完整 fallback 链：主模型 → 策略里的 chain 节点（按 model id 匹配）。
     ///
-    /// 策略里的 `upstream` 字段是语义标签，仅用于 UI 展示；实际 fallback 时按 `model` 字符串
-    /// 匹配回 `config.models` 找到对应的 `ModelRoute`，取其 4 字段签名。
-    ///
+    /// 策略里的 `upstream` 字段是语义标签，仅用于 UI 展示；`model` 是 `config.models` 的 key。
     /// `key_fallback_policy` 来自请求附带的 API Key 元数据，可覆盖 model 默认策略。
     fn build_chain(
         &self,
         model_name: &str,
         key_fallback_policy: Option<&str>,
-    ) -> Result<Vec<ChainNodeConfig>, String> {
+    ) -> Result<Vec<String>, String> {
         let route = self.config.models.get(model_name).ok_or_else(|| {
             format!(
                 "未知模型: {}。可用模型: {}",
@@ -61,35 +59,28 @@ impl Router {
             )
         })?;
 
-        // 主节点
-        let mut chain: Vec<ChainNodeConfig> = vec![ChainNodeConfig {
-            upstream: route.upstream_type.as_str().to_string(),
-            model: route.model.clone(),
-        }];
+        // 链：存的是 model id（即 config.models 的 key）
+        let mut chain: Vec<String> = vec![model_name.to_string()];
 
-        // 优先级：key 覆盖 > 模型默认
-        let policy_id = key_fallback_policy
-            .or(route.fallback_policy.as_deref());
+        let policy_id = key_fallback_policy.or(route.fallback_policy.as_deref());
 
         if let Some(pid) = policy_id {
             if let Some(policy) = self.config.fallback_policies.get(pid) {
                 if policy.enabled {
                     for node in &policy.chain {
-                        // 跳过主节点本身
-                        if node.model == route.model {
+                        if node.model == model_name {
                             continue;
                         }
-                        // 跳过配置中不存在的 model（容错）
                         if !self.config.models.contains_key(&node.model) {
                             tracing::warn!(
                                 target: "router",
                                 policy = %pid,
                                 model = %node.model,
-                                "fallback 策略节点 model 不在 models 中，跳过"
+                                "fallback 策略节点 model id 不在 models 中，跳过"
                             );
                             continue;
                         }
-                        chain.push(node.clone());
+                        chain.push(node.model.clone());
                     }
                 }
             }
@@ -113,12 +104,12 @@ impl Router {
         let start = std::time::Instant::now();
         let mut last_error = String::new();
 
-        for (i, node) in chain.iter().enumerate() {
+        for (i, target_model_id) in chain.iter().enumerate() {
             let target_route = self
                 .config
                 .models
-                .get(&node.model)
-                .ok_or_else(|| format!("fallback 模型 {} 不存在", node.model))?;
+                .get(target_model_id)
+                .ok_or_else(|| format!("fallback 模型 {} 不存在", target_model_id))?;
 
             if i == 0 {
                 if let Some(ref tracker) = self.thaw_tracker {
@@ -174,7 +165,7 @@ impl Router {
                     last_error = e;
                     tracing::error!(
                         target: "router",
-                        model = %node.model,
+                        model = %target_model_id,
                         upstream = %target_route.upstream_type.as_str(),
                         error = %last_error,
                         "upstream request failed"
@@ -210,12 +201,12 @@ impl Router {
         let start = std::time::Instant::now();
         let mut last_error = String::new();
 
-        for (i, node) in chain.iter().enumerate() {
+        for (i, target_model_id) in chain.iter().enumerate() {
             let target_route = self
                 .config
                 .models
-                .get(&node.model)
-                .ok_or_else(|| format!("fallback 模型 {} 不存在", node.model))?;
+                .get(target_model_id)
+                .ok_or_else(|| format!("fallback 模型 {} 不存在", target_model_id))?;
 
             if i == 0 {
                 if let Some(ref tracker) = self.thaw_tracker {
@@ -273,7 +264,7 @@ impl Router {
                     last_error = e;
                     tracing::error!(
                         target: "router",
-                        model = %node.model,
+                        model = %target_model_id,
                         upstream = %target_route.upstream_type.as_str(),
                         error = %last_error,
                         "upstream request failed"
