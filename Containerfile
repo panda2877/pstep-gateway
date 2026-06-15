@@ -42,9 +42,10 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /build/target/release/pstep-gateway /usr/local/bin/pstep-gateway
 
-# Embed default config; bind-mounted /etc/pstep-gateway/config.yaml at runtime
-# overrides this.
-COPY config.yaml /etc/pstep-gateway/config.yaml
+# Embed default config from template (real config.yaml is excluded by
+# .containerignore; bind-mounted /etc/pstep-gateway/config.yaml at runtime
+# overrides this default).
+COPY config.yaml.template /etc/pstep-gateway/config.yaml
 
 ENV CONFIG_PATH=/etc/pstep-gateway/config.yaml \
     RUST_LOG=info
