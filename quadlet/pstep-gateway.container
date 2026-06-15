@@ -1,0 +1,47 @@
+# =============================================================================
+# Pstep Gateway — Podman Quadlet unit
+#
+# Quadlet auto-generates a systemd service named `pstep-gateway.service`
+# when placed in /etc/containers/systemd/pstep/ on the server.
+#
+# The image name is local-only (loaded via `podman load` from CI artifact),
+# so no registry namespace is required here.
+#
+# Server-side deploy steps:
+#   sudo mkdir -p /etc/containers/systemd/pstep
+#   sudo cp quadlet/pstep-gateway.container \
+#            /etc/containers/systemd/pstep/pstep-gateway.container
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pstep-gateway.service
+# =============================================================================
+
+[Unit]
+Description=Pstep Gateway (Rust API gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=pstep-gateway:latest
+ContainerName=pstep-gateway
+Network=host
+
+# Hardening
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+SecurityLabelDisable=true
+
+# Config bind mount (server-side /etc/pstep-gateway/config.yaml)
+Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
+
+Environment=RUST_LOG=info
+Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target default.target

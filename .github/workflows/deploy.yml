@@ -1,19 +1,20 @@
 # ============================================================================
-# Pstep Gateway — 自动部署工作流（前后端）
+# Pstep Gateway — 自动部署工作流（前后端 + 容器化镜像）
+#
 # 触发方式：
-#   1. 手动触发 (workflow_dispatch)
-#   2. push 到 main 分支时自动触发
+#   1. push 到 main 分支（src/frontend/Cargo/Containerfile/quadlet 等）
+#   2. 手动触发 (workflow_dispatch)
+#
+# 设计：
+#   - 后端构建为 Podman Quadlet 镜像；前端仍由主机 nginx 静态托管
+#   - 镜像不走 registry，由 CI 直接 scp 到服务器、podman load
+#   - 服务器保留最近 5 个镜像版本，实现原子回滚
 # ============================================================================
 
 name: 🚀 Deploy Gateway
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: '版本号 (如 0.1.0)'
-        required: false
-        type: string
   push:
     branches:
       - main
@@ -23,111 +24,198 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
-      - 'package.json'
+      - 'Containerfile'
+      - '.containerignore'
+      - 'quadlet/**'
       - '.github/workflows/deploy.yml'
 
 jobs:
-  deploy:
-    name: Build & Deploy Gateway
+  # ==========================================================================
+  # 1. 后端构建：Podman Quadlet 镜像（并行执行）
+  # ==========================================================================
+  build-gateway:
+    name: 🦀 Build Gateway Image
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
-
     steps:
-      - name: 🔨 Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      # ============ 后端构建 ============
-      - name: 🦀 Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: 📦 Build Backend Release
-        run: cargo build --release
+      - name: Build & export image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: false
+          tags: pstep-gateway:${{ github.sha }}
+          outputs: type=local,dest=/tmp/gateway-image
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: 📤 Copy Backend Binary
-        run: cp target/release/pstep-gateway ./gateway-bin
+      - name: Compress image tar
+        run: |
+          cd /tmp/gateway-image
+          gzip -1 pstep-gateway.tar
+          ls -lh pstep-gateway.tar.gz
 
-      # ============ 前端构建 ============
-      - name: 📦 Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-image
+          path: /tmp/gateway-image/pstep-gateway.tar.gz
+          retention-days: 3
+
+  # ==========================================================================
+  # 2. 前端构建：dist 由主机 nginx 静态托管（并行执行）
+  # ==========================================================================
+  build-admin:
+    name: 🎨 Build Admin Frontend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: 'frontend/package-lock.json'
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: 📦 Install Frontend Dependencies
-        working-directory: ./frontend
+      - working-directory: ./frontend
         run: npm ci
 
-      - name: 🎨 Build Frontend
-        working-directory: ./frontend
+      - working-directory: ./frontend
         run: npm run build
 
-      # ============ 部署到服务器 ============
-      - name: 🚀 Deploy to server
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-dist
+          path: frontend/dist
+          retention-days: 3
+
+  # ==========================================================================
+  # 3. 部署到服务器（等待两个构建完成）
+  # ==========================================================================
+  deploy:
+    name: 🚀 Deploy to Server
+    needs: [build-gateway, build-admin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Deploy via SSH
         env:
           SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_HOST: ${{ vars.SERVER_HOST }}
           SERVER_USER: ${{ vars.SERVER_USER }}
         run: |
-          set -x
-          echo "SERVER_HOST: $SERVER_HOST"
-          echo "SERVER_USER: $SERVER_USER"
-          echo "SSH_KEY length: ${#SSH_KEY_B64}"
+          set -euo pipefail
 
-          # 配置 SSH
+          # ---- 配置 SSH ----
           mkdir -p ~/.ssh
-          ssh-keyscan -H $SERVER_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
           echo "$SSH_KEY_B64" | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
           SSHD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key ${SERVER_USER}@${SERVER_HOST}"
-          echo "Testing SSH connection..."
-          $SSHD 'echo "SSH OK"' || { echo "SSH connection failed"; exit 1; }
+          SCP="scp -i ~/.ssh/deploy_key"
 
-          echo '停止旧服务...'
-          $SSHD 'sudo systemctl stop pstep-gateway || true'
-          $SSHD 'sudo systemctl stop pstep-admin || true'
+          # ---- 1. 部署前端（主机 nginx 静态服务）----
+          echo "📦 部署前端 dist..."
+          rsync -az --delete \
+            -e "$SCP" \
+            ./artifacts/admin-dist/ \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/admin-dist/
 
-          echo '备份...'
-          TS=$(date +%Y%m%d_%H%M%S)
-          $SSHD "if [ -d /opt/pstep ]; then sudo mkdir -p /opt/pstep/backups/\${TS} && sudo cp -r /opt/pstep/gateway /opt/pstep/backups/\${TS}/ 2>/dev/null || true; fi"
-
-          # ============ 部署后端 ============
-          echo '部署后端 gateway (端口 3002)...'
-          $SSHD 'sudo mkdir -p /opt/pstep/gateway'
-          cat ./gateway-bin | $SSHD 'sudo tee /opt/pstep/gateway/pstep-gateway > /dev/null'
-          $SSHD 'sudo chmod +x /opt/pstep/gateway/pstep-gateway'
-          $SSHD 'sudo systemctl start pstep-gateway'
-
-          # ============ 部署前端 ============
-          echo '部署前端 admin (端口 3003)...'
-          $SSHD 'sudo mkdir -p /opt/pstep/admin'
-          $SSHD 'sudo rm -rf /opt/pstep/admin/dist'
-          tar -czf frontend-dist.tar.gz -C ./frontend dist
-          cat ./frontend-dist.tar.gz | $SSHD 'sudo tar -xzf - -C /opt/pstep/admin'
-          $SSHD 'sudo chown -R root:root /opt/pstep/admin'
-
-          # 配置 nginx 反向代理
-          cat .github/workflows/nginx.conf | $SSHD 'sudo tee /etc/nginx/sites-available/pstep-admin > /dev/null'
-          $SSHD "sudo ln -sf /etc/nginx/sites-available/pstep-admin /etc/nginx/sites-enabled/"
-          $SSHD "sudo nginx -t && sudo systemctl reload nginx"
-
-          echo '健康检查...'
-          sleep 5
           $SSHD '
-            echo "=== Gateway Status ==="
-            sudo systemctl is-active pstep-gateway
-            echo "=== Admin Status ==="
-            sudo systemctl is-active pstep-admin
-            echo "=== Health Check (Gateway) ==="
-            curl -s http://localhost:3002/health || echo "health endpoint not available"
-            echo ""
-            echo "=== Health Check (Admin) ==="
-            curl -s -o /dev/null -w "%{http_code}" http://localhost:3003 || echo "admin not available"
-            echo ""
+            set -e
+            sudo mkdir -p /opt/pstep/admin
+            sudo rsync -a --delete /tmp/admin-dist/ /opt/pstep/admin/dist/
+            rm -rf /tmp/admin-dist
+            echo "✅ 前端 dist 已部署"
           '
 
-          echo "=== Deploy Complete ==="
-          echo "Deploy Complete - Backend: port 3002, Frontend: port 3003"
+          # ---- 2. 推送 Quadlet 单元文件 ----
+          echo "📜 推送 Quadlet..."
+          $SCP quadlet/pstep-gateway.container \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.container
+          $SSHD '
+            set -e
+            sudo mkdir -p /etc/containers/systemd/pstep
+            sudo install -m 0644 /tmp/pstep-gateway.container \
+              /etc/containers/systemd/pstep/pstep-gateway.container
+            rm -f /tmp/pstep-gateway.container
+            sudo systemctl daemon-reload
+          '
+
+          # ---- 3. 直传镜像 ----
+          echo "🐳 直传 gateway 镜像..."
+          $SCP ./artifacts/gateway-image/pstep-gateway.tar.gz \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.tar.gz
+
+          # ---- 4. 服务器端：load + restart + 健康检查 + 镜像保留 ----
+          $SSHD '
+            set -e
+
+            echo "📥 load 新镜像..."
+            gunzip -f /tmp/pstep-gateway.tar.gz
+            sudo podman load -i /tmp/pstep-gateway.tar
+            sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
+            rm -f /tmp/pstep-gateway.tar
+
+            echo "🔄 重启 pstep-gateway（容器化）..."
+            sudo systemctl restart pstep-gateway.service
+
+            echo "🏥 健康检查（重试 6 次，每次间隔 5s）..."
+            healthy=false
+            for i in 1 2 3 4 5 6; do
+              if curl -sf http://127.0.0.1:3002/health > /dev/null; then
+                echo "✅ Gateway healthy (attempt $i)"
+                healthy=true
+                break
+              fi
+              echo "⏳ attempt $i failed, retrying in 5s..."
+              sleep 5
+            done
+
+            if [ "$healthy" != "true" ]; then
+              echo "❌ Health check failed after 30s"
+              echo "---- journalctl tail ----"
+              sudo journalctl -u pstep-gateway.service --no-pager -n 80 || true
+              exit 1
+            fi
+
+            echo "🌐 验证前端可访问..."
+            if ! curl -sf http://127.0.0.1:3003/ > /dev/null; then
+              echo "❌ Frontend check failed"
+              exit 1
+            fi
+            echo "✅ Frontend reachable"
+
+            # ---- 5. 镜像保留策略：保留最近 5 个版本 ----
+            echo "🧹 清理旧镜像（保留最近 5 个）..."
+            KEEP=5
+            sudo podman images --format "{{.ID}} {{.CreatedAt}} {{.Repository}}:{{.Tag}}" \
+              | grep "pstep-gateway" \
+              | grep -v ":latest" \
+              | sort -k2,3 -r \
+              | tail -n +$((KEEP + 1)) \
+              | awk "{print \$1}" \
+              | xargs -r sudo podman rmi -f > /dev/null 2>&1 || true
+
+            echo "✅ 部署完成"
+          '
+
+      - name: Cleanup local artifacts
+        if: always()
+        run: rm -rf ./artifacts

@@ -1,0 +1,44 @@
+# Build artifacts
+target
+**/target
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+**/.cache
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# CI / docs
+.github
+docs
+protype
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Logs / env (config.yaml.template is needed by Containerfile COPY)
+*.log
+.env
+.env.*
+!.env.template
+
+# Archives (CI artifacts, locally built images)
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Local-only configs (server has its own /etc/pstep-gateway/config.yaml)
+config.yaml
+config.yaml.local
+config.yaml.bak
