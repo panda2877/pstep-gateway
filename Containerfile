@@ -16,21 +16,23 @@ FROM docker.io/library/rust:1-slim AS builder
 WORKDIR /build
 
 # Cache manifest deps: copies only Cargo.toml/Cargo.lock first, builds a dummy
-# binary to populate target/, then removes the dummy binary. The next `cargo
-# build` (with real src) reuses cached deps.
+# binary to populate target/. The next step replaces src/ with the real source
+# and rebuilds; `cargo clean -p pstep-gateway` forces a fresh compile of the
+# package (without it, cargo's incremental metadata mistakenly treats the
+# placeholder binary as up-to-date).
 COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     mkdir -p src && \
-    echo 'fn main() { println!("placeholder"); }' > src/main.rs && \
-    cargo build --release && \
-    rm -rf src target/release/deps/pstep_gateway*
+    echo 'fn main() {}' > src/main.rs && \
+    cargo build --release
 
 # Real build with src/ in place.
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    cargo clean -p pstep-gateway && \
     cargo build --release
 
 # =============================================================================
