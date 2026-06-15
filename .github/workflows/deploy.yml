@@ -44,28 +44,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build & export image
+      - name: Build & load image into local docker
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
           push: false
+          load: true
           tags: pstep-gateway:${{ github.sha }}
-          outputs: type=local,dest=/tmp/gateway-image
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Compress image tar
+      - name: Save image to tar.gz
         run: |
-          cd /tmp/gateway-image
-          gzip -1 pstep-gateway.tar
-          ls -lh pstep-gateway.tar.gz
+          docker save pstep-gateway:${{ github.sha }} > /tmp/pstep-gateway.tar
+          gzip -1 /tmp/pstep-gateway.tar
+          ls -lh /tmp/pstep-gateway.tar.gz
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
           name: gateway-image
-          path: /tmp/gateway-image/pstep-gateway.tar.gz
+          path: /tmp/pstep-gateway.tar.gz
           retention-days: 3
 
   # ==========================================================================
