@@ -145,6 +145,20 @@ jobs:
             sudo systemctl daemon-reload
           '
 
+          # ---- 2.5 准备运行时目录（idempotent）----
+          # config.yaml 需世界可读（distroless 以 UID 65532 运行，无 /etc/passwd 项）
+          # /var/lib/pstep-gateway 需 chown 65532 让 usage_db 能写
+          echo "🔧 准备运行时目录..."
+          $SSHD '
+            set -e
+            if [ -f /etc/pstep-gateway/config.yaml ]; then
+              sudo chmod 644 /etc/pstep-gateway/config.yaml
+            fi
+            sudo mkdir -p /var/lib/pstep-gateway
+            sudo chown 65532:65532 /var/lib/pstep-gateway
+            sudo chmod 755 /var/lib/pstep-gateway
+          '
+
           # ---- 3. 直传镜像 ----
           echo "🐳 直传 gateway 镜像..."
           $SCP /tmp/pstep-gateway.tar.gz \

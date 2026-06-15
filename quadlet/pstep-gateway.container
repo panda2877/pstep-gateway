@@ -32,7 +32,13 @@ DropCapability=ALL
 SecurityLabelDisable=true
 
 # Config bind mount (server-side /etc/pstep-gateway/config.yaml)
+# Must be world-readable on the host (chmod 644) because the distroless
+# nonroot image runs as UID 65532, which has no /etc/passwd entry.
 Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
+
+# Writable scratch for usage_db (SQLite). The gateway creates /var/lib/pstep-gateway
+# at startup; the host dir must be chown 65532:65532 to match the container user.
+Volume=/var/lib/pstep-gateway:/var/lib/pstep-gateway:rw
 
 Environment=RUST_LOG=info
 Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
