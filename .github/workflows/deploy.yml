@@ -114,12 +114,13 @@ jobs:
           ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
           SSHD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key ${SERVER_USER}@${SERVER_HOST}"
+          SSHCMD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key"
           SCP="scp -i ~/.ssh/deploy_key"
 
           # ---- 1. 部署前端（主机 nginx 静态服务）----
           echo "📦 部署前端 dist..."
           rsync -az --delete \
-            -e "$SCP" \
+            -e "$SSHCMD" \
             ./artifacts/admin-dist/ \
             ${SERVER_USER}@${SERVER_HOST}:/tmp/admin-dist/
 
