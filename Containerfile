@@ -15,25 +15,21 @@ FROM docker.io/library/rust:1-slim AS builder
 
 WORKDIR /build
 
-# Cache manifest deps: copies only Cargo.toml/Cargo.lock first, builds a dummy
-# binary to populate target/. The next step replaces src/ with the real source
-# and rebuilds; `cargo clean -p pstep-gateway` forces a fresh compile of the
-# package (without it, cargo's incremental metadata mistakenly treats the
-# placeholder binary as up-to-date).
+# Copy everything in one go, then build with BuildKit cache mounts for cargo.
+# Previous attempt used a dummy-source-then-replace trick with `cargo clean -p`
+# to force a fresh compile, but the interaction between BuildKit's overlay
+# cache mount and cargo's incremental metadata produced an essentially-empty
+# binary (301 KB, only libc imports). Simpler is more reliable: let cargo
+# handle the whole build in one go. Cache mounts give cargo its previous
+# target/ between builds so unchanged deps aren't recompiled.
 COPY Cargo.toml Cargo.lock ./
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    mkdir -p src && \
-    echo 'fn main() {}' > src/main.rs && \
-    cargo build --release
-
-# Real build with src/ in place.
 COPY src ./src
+
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo clean -p pstep-gateway && \
-    cargo build --release
+    cargo build --release && \
+    ls -lh target/release/pstep-gateway
 
 # =============================================================================
 # Stage 2: Runtime
