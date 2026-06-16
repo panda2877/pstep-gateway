@@ -223,14 +223,17 @@ npm run build      # 产物在 dist/
 
 1. push 到 `main` 触发（或手动 `workflow_dispatch`）
 2. `build-admin` job：npm ci + npm run build → 上传 dist artifact
-3. `deploy` job：cargo 编译 → `docker build` 镜像（BuildKit + GHA cache）→ **`docker push` 到 GHCR**
-   → REST API 把包改为 public（让服务器免密拉取）
-4. SSH 到服务器：`podman pull` GHCR 新镜像 → tag 为 `latest` → `systemctl restart`
-   → 6 次重试健康检查 → 清理 5 个版本之前的旧镜像
+3. `deploy` job：cargo 编译 → `docker build` 镜像（BuildKit + GHA cache，**`load: true`** 加载到 runner）
+4. **双路分发**：
+   - **`docker save` + scp 直传** → 服务器 `podman load` → `systemctl restart`
+     （主路径；**国内拉 registry 慢**，所以走 scp）
+   - **`docker push` 到 GHCR**（`ghcr.io/panda2877/pstep-gateway`）
+     （**异地备份**；全量保留，不清理）
+5. 6 次重试健康检查 → 清理 5 个版本之前的本地旧镜像（GHCR 端不动）
 
-> 镜像走 **GHCR**（`ghcr.io/panda2877/pstep-gateway`），不再 scp 直传。
-> 包设为 **public**，服务器 `podman pull` 无需登录；如需私有化，把包改 private 并在服务器 `podman login ghcr.io` 用 PAT。
-> 保留最近 5 个 commit 的镜像便于回滚。
+> 主路径用 **scp**（中国服务器拉 GHCR 慢，实测 ~10KB/s），所以服务器侧 `podman load` 而不是 `podman pull`。
+> 备份用 **GHCR**（`ghcr.io/panda2877/pstep-gateway`），全量保留历史版本；用于异地容灾 / 跨服务器分发。
+> 想要从 GHCR 恢复某版本：`podman pull ghcr.io/panda2877/pstep-gateway:<sha>` 然后 `podman tag ... pstep-gateway:latest && systemctl restart`。
 
 **服务器**：`134.175.163.213`（root，容器 systemd unit `pstep-gateway.service` 由 Quadlet 生成）。
 
@@ -244,7 +247,7 @@ Containerfile  .containerignore  quadlet/**  .github/workflows/deploy.yml
 **容器形态**（[quadlet/pstep-gateway.container](quadlet/pstep-gateway.container)）：
 
 - 基础镜像：`gcr.io/distroless/cc-debian12:nonroot`（无 shell，UID 65532）
-- `Image=ghcr.io/panda2877/pstep-gateway:latest`（启动时引用本地缓存镜像，**不会自动 pull**——由 deploy 脚本负责）
+- `Image=pstep-gateway:latest`（**本地镜像**，由 deploy 脚本 load 后 tag 为 latest；不会自动 pull）
 - 加固：`ReadOnly=true` / `NoNewPrivileges=true` / `DropCapability=ALL`
 - 挂载：
   - `/etc/pstep-gateway:/etc/pstep-gateway:ro`（config；需 `chmod 644`，因为 distroless 无 /etc/passwd）
@@ -256,9 +259,22 @@ Containerfile  .containerignore  quadlet/**  .github/workflows/deploy.yml
 
 ```bash
 ssh root@134.175.163.213
-sudo podman images | grep ghcr.io/panda2877/pstep-gateway        # 列出可用的 :<sha> 标签
-sudo podman tag ghcr.io/panda2877/pstep-gateway:<旧sha> \
-              ghcr.io/panda2877/pstep-gateway:latest
+sudo podman images | grep pstep-gateway        # 本地最近 5 个版本
+sudo podman tag pstep-gateway:<旧sha> pstep-gateway:latest
+sudo systemctl restart pstep-gateway.service
+```
+
+**从 GHCR 备份恢复**（新服务器 / 本地 5 个版本已全清的情况）：
+
+```bash
+# 1. 服务器上登录 GHCR（PAT 需要 read:packages 权限）
+sudo podman login ghcr.io -u <github-user>
+
+# 2. 拉指定版本
+sudo podman pull ghcr.io/panda2877/pstep-gateway:<sha>
+
+# 3. tag + restart
+sudo podman tag ghcr.io/panda2877/pstep-gateway:<sha> pstep-gateway:latest
 sudo systemctl restart pstep-gateway.service
 ```
 

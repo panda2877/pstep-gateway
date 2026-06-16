@@ -7,9 +7,9 @@
 #
 # 设计：
 #   - 后端构建为 Podman Quadlet 镜像；前端仍由主机 nginx 静态托管
-#   - 镜像推到 GHCR (ghcr.io/<owner>/pstep-gateway)，服务器 `podman pull` 拉取
-#   - GHCR 包设为 public，服务器免密拉取
-#   - 服务器保留最近 5 个镜像版本，实现原子回滚
+#   - 部署走 **scp 直传**（避免从中国拉 GHCR 速度问题）；服务器 `podman load`
+#   - 同时把镜像 **推一份到 GHCR** 作为异地备份（全量保留，不做清理）
+#   - 服务器本地保留最近 5 个镜像版本，便于快速回滚
 #   - gateway 构建内联到 deploy job，避免 10 MB artifact 下载的 GH Actions
 #     偶发失败问题。frontend 仍并行构建（artifact 仅 90 KB，稳定）
 # ============================================================================
@@ -64,7 +64,7 @@ jobs:
           retention-days: 3
 
   # ==========================================================================
-  # 2. 构建 + 推 GHCR + 远程部署
+  # 2. 构建镜像 → scp 直传 + 推 GHCR 备份 → 远程 restart
   # ==========================================================================
   deploy:
     name: 🚀 Build Gateway & Deploy
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write   # GHCR push 需要
+      packages: write   # GHCR 推送备份需要
     steps:
       - uses: actions/checkout@v6
 
@@ -85,41 +85,39 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      - name: Login to GHCR (for backup push)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push gateway image (with GHA cache)
+      - name: Build gateway image (with GHA cache)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/pstep-gateway:latest
+          push: false       # 不直推；通过本地 load → save + push 两路分发
+          load: true        # 加载到 runner 的 docker daemon，供下面 save / push 用
+          tags: pstep-gateway:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Make GHCR package public
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Save image to tar.gz (for scp)
         run: |
-          # 让服务器可以匿名拉取（首次 push 后包自动创建为 private，这里改 public）
-          # 失败不影响本次部署（可手动在 GitHub Packages UI 改 public 后重跑）
-          status=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/pstep-gateway" \
-            -d '{"visibility":"public"}')
-          if [ "$status" = "200" ]; then
-            echo "✅ GHCR package set to public"
-          else
-            echo "⚠️  visibility API returned $status（继续部署；如需匿名拉取请手动在 GitHub UI 改 public）"
-          fi
+          docker save pstep-gateway:${{ github.sha }} > /tmp/pstep-gateway.tar
+          gzip -1 /tmp/pstep-gateway.tar
+          ls -lh /tmp/pstep-gateway.tar.gz
+
+      - name: Push image to GHCR (off-site backup, full retention)
+        run: |
+          docker tag pstep-gateway:${{ github.sha }} \
+                     ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}
+          docker tag pstep-gateway:${{ github.sha }} \
+                     ghcr.io/${{ github.repository_owner }}/pstep-gateway:latest
+          docker push ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository_owner }}/pstep-gateway:latest
+          echo "✅ GHCR backup pushed (无清理；全量保留)"
 
       - name: Deploy via SSH
         env:
@@ -181,63 +179,64 @@ jobs:
             sudo chmod 755 /var/lib/pstep-gateway
           '
 
-          # ---- 3. 服务器端：pull + restart + 健康检查 + 镜像保留 ----
-          $SSHD "
+          # ---- 3. 直传镜像 ----
+          echo "🐳 直传 gateway 镜像..."
+          $SCP /tmp/pstep-gateway.tar.gz \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.tar.gz
+
+          # ---- 4. 服务器端：load + restart + 健康检查 + 镜像保留 ----
+          $SSHD '
             set -e
 
-            echo \"📥 pull 新镜像 from GHCR...\"
-            sudo podman pull ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}
-            sudo podman tag  ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }} \
-                             ghcr.io/${{ github.repository_owner }}/pstep-gateway:latest
+            echo "📥 load 新镜像..."
+            gunzip -f /tmp/pstep-gateway.tar.gz
+            sudo podman load -i /tmp/pstep-gateway.tar
+            sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
+            rm -f /tmp/pstep-gateway.tar
 
-            echo \"🔄 重启 pstep-gateway（容器化）...\"
+            echo "🔄 重启 pstep-gateway（容器化）..."
             sudo systemctl restart pstep-gateway.service
 
-            echo \"🏥 健康检查（重试 6 次，每次间隔 5s）...\"
+            echo "🏥 健康检查（重试 6 次，每次间隔 5s）..."
             healthy=false
             for i in 1 2 3 4 5 6; do
               if curl -sf http://127.0.0.1:3002/health > /dev/null; then
-                echo \"✅ Gateway healthy (attempt \$i)\"
+                echo "✅ Gateway healthy (attempt $i)"
                 healthy=true
                 break
               fi
-              echo \"⏳ attempt \$i failed, retrying in 5s...\"
+              echo "⏳ attempt $i failed, retrying in 5s..."
               sleep 5
             done
 
-            if [ \"\$healthy\" != \"true\" ]; then
-              echo \"❌ Health check failed after 30s\"
-              echo \"---- journalctl tail ----\"
+            if [ "$healthy" != "true" ]; then
+              echo "❌ Health check failed after 30s"
+              echo "---- journalctl tail ----"
               sudo journalctl -u pstep-gateway.service --no-pager -n 80 || true
               exit 1
             fi
 
-            echo \"🌐 验证前端可访问...\"
+            echo "🌐 验证前端可访问..."
             if ! curl -sf http://127.0.0.1:3003/ > /dev/null; then
-              echo \"❌ Frontend check failed\"
+              echo "❌ Frontend check failed"
               exit 1
             fi
-            echo \"✅ Frontend reachable\"
+            echo "✅ Frontend reachable"
 
-            # ---- 4. 镜像保留策略：保留最近 5 个版本 ----
-            echo \"🧹 清理旧镜像（保留最近 5 个）...\"
+            # ---- 5. 镜像保留策略：保留最近 5 个版本 ----
+            echo "🧹 清理旧镜像（保留最近 5 个）..."
             KEEP=5
-            sudo podman images --format '{{.ID}} {{.CreatedAt}} {{.Repository}}:{{.Tag}}' \
-              | grep 'ghcr.io/${{ github.repository_owner }}/pstep-gateway' \
-              | grep -v ':latest' \
+            sudo podman images --format "{{.ID}} {{.CreatedAt}} {{.Repository}}:{{.Tag}}" \
+              | grep "pstep-gateway" \
+              | grep -v ":latest" \
               | sort -k2,3 -r \
-              | tail -n +\$((KEEP + 1)) \
-              | awk '{print \$1}' \
+              | tail -n +$((KEEP + 1)) \
+              | awk "{print \$1}" \
               | xargs -r sudo podman rmi -f > /dev/null 2>&1 || true
 
-            # 清理 scp 时代遗留的本地 pstep-gateway:* 镜像（无 ghcr.io 前缀）
-            sudo podman images --format '{{.ID}} {{.Repository}}' \
-              | awk '\$2 == \"pstep-gateway\" || \$2 == \"localhost/pstep-gateway\" {print \$1}' \
-              | xargs -r sudo podman rmi -f > /dev/null 2>&1 || true
-
-            echo \"✅ 部署完成\"
-          "
+            echo "✅ 部署完成"
+          '
 
       - name: Cleanup local artifacts
         if: always()
-        run: rm -rf ./artifacts
+        run: rm -rf ./artifacts /tmp/pstep-gateway.tar.gz

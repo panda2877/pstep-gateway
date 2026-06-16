@@ -21,7 +21,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/panda2877/pstep-gateway:latest
+Image=pstep-gateway:latest
 ContainerName=pstep-gateway
 Network=host
 
