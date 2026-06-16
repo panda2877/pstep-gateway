@@ -1,0 +1,62 @@
+# =============================================================================
+# Pstep Gateway — slot A (蓝绿部署的"蓝"位)
+#
+# 与 slot B 共享同一份 pstep-gateway:latest 镜像；区别仅在：
+#   - ContainerName: pstep-gateway-a
+#   - PublishPort:  3002:3002  (主端口，nginx 上游命中它)
+#   - Volume:       /var/lib/pstep-gateway-a (独立 SQLite)
+#   - GATEWAY_PORT: 3002       (覆盖 config.yaml 的 port)
+#
+# 部署时两个 unit 一起被 install 上去；nginx upstream 决定哪个 slot 接收流量。
+# 不接收流量的 slot 处于 "standby" 状态（仍在跑，但上游没有打到它）。
+#
+# 服务器部署位置: /etc/containers/systemd/pstep/pstep-gateway-a.container
+# Quadlet 会自动生成同名 systemd unit: pstep-gateway-a.service
+# =============================================================================
+
+[Unit]
+Description=Pstep Gateway (slot A)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=pstep-gateway:latest
+ContainerName=pstep-gateway-a
+
+# netavark bridge 网络 + rootful：等价于 Docker 的 bridge 网络。
+# PublishPort=3002:3002 把容器内 3002 映射到宿主机 0.0.0.0:3002（公网可达）。
+# Slot A 改走 bridge（之前是 Network=host），换来"容器只露 3002"的能力。
+Network=bridge
+
+PublishPort=3002:3002
+
+# Hardening
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+SecurityLabelDisable=true
+
+# Config bind mount (server-side /etc/pstep-gateway/config.yaml)
+# 必须 chmod 644 — distroless 容器内 UID 65532 无 /etc/passwd 项。
+Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
+
+# Writable scratch for usage_db (SQLite). The gateway creates /var/lib/pstep-gateway
+# at startup; the host dir must be chown 65532:65532 to match the container user.
+# Slot A 用独立目录避免与 slot B 共享 SQLite WAL 文件（数据一致性 + 各自重启用各自的 DB）。
+Volume=/var/lib/pstep-gateway-a:/var/lib/pstep-gateway:rw
+
+Environment=RUST_LOG=info
+Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
+# 让 binary 绑 3002，覆盖 config.yaml 里的 port。
+Environment=GATEWAY_PORT=3002
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+# 130s > reqwest 上游超时 120s + 5s 缓冲，让 SIGTERM drain 真正有时间
+# 等到 in-flight 请求走完。systemd 在 130s 后兜底 SIGKILL。
+TimeoutStopSec=130
+
+[Install]
+WantedBy=multi-user.target default.target

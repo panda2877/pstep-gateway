@@ -1,0 +1,53 @@
+# =============================================================================
+# Pstep Gateway — slot B (蓝绿部署的"绿"位)
+#
+# 与 slot A 互为备份：同一份镜像、不同 ContainerName、不同 host volume、
+# 不同 PublishPort。每次 deploy 由 deploy 脚本切 nginx upstream 决定
+# active 端口 (3002 ↔ 3003)。
+#
+# 关键差异（相对 slot A）：
+#   - ContainerName: pstep-gateway-b
+#   - PublishPort:  127.0.0.1:3003:3002  (仅本机可访问，nginx 走这里)
+#   - Volume:       /var/lib/pstep-gateway-b (独立 SQLite)
+#   - GATEWAY_PORT: 3002  (容器内仍跑 3002；通过 127.0.0.1:3003 暴露)
+#
+# 服务器部署位置: /etc/containers/systemd/pstep/pstep-gateway-b.container
+# =============================================================================
+
+[Unit]
+Description=Pstep Gateway (slot B)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=pstep-gateway:latest
+ContainerName=pstep-gateway-b
+
+# 与 slot A 同样的 netavark bridge。PublishPort 显式绑到 127.0.0.1，
+# 所以 slot B 的 3002 只在 127.0.0.1:3003 上可见，外部不可达 —— 这是关键：
+# 避免 slot B 在 standby 期间意外接收直连流量（绕过 nginx 的流量切换）。
+Network=bridge
+
+PublishPort=127.0.0.1:3003:3002
+
+# Hardening
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+SecurityLabelDisable=true
+
+Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
+Volume=/var/lib/pstep-gateway-b:/var/lib/pstep-gateway:rw
+
+Environment=RUST_LOG=info
+Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
+Environment=GATEWAY_PORT=3002
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=130
+
+[Install]
+WantedBy=multi-user.target default.target

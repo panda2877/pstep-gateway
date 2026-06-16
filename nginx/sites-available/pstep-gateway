@@ -1,0 +1,63 @@
+# =============================================================================
+# Pstep Gateway — 前置 nginx (蓝绿软切)
+#
+# 监听 0.0.0.0:3002，反代到 pstep-gateway-a 或 pstep-gateway-b 容器。
+# 部署脚本会改写 upstream pstep_active 中的 server 行（3002 ↔ 3003），
+# 然后 `nginx -s reload` 切流。
+#
+# 服务器部署位置: /etc/nginx/sites-enabled/pstep-gateway
+# （sites-enabled 通常是 sites-available 的 symlink）
+# =============================================================================
+
+upstream pstep_active {
+    # 当前 active 容器。deploy 脚本会 sed 改这一行（3002 ↔ 3003），
+    # 然后 nginx -s reload 让新 worker 读新配置。
+    # keepalive 32 让 nginx 与上游 gateway 之间复用 TCP 连接 —— 切流时
+    # 旧连接的 in-flight 请求能走完才被新 worker 关掉。
+    server 127.0.0.1:3002 max_fails=3 fail_timeout=10s;
+    keepalive 32;
+}
+
+server {
+    listen 3002;
+    listen [::]:3002;
+    server_name _;
+
+    # === 长连接 / SSE 友好 ===
+    # 不缓冲：SSE 必须让字节立即刷到客户端。
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 300s;     # 上游最长 chat completion 时间
+    proxy_send_timeout 300s;
+    proxy_connect_timeout 5s;
+
+    # 真实 IP 透传
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # 让 upstream 配置里的 keepalive 32 生效
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    # 上游连接复用
+    proxy_socket_keepalive on;
+
+    # 上传大 body（chat 请求 body 不大，但保留）
+    client_max_body_size 10m;
+
+    # === access log：让 5xx 一眼能查 ===
+    access_log /var/log/nginx/pstep-gateway.access.log;
+    error_log  /var/log/nginx/pstep-gateway.error.log warn;
+
+    location / {
+        proxy_pass http://pstep_active;
+    }
+
+    # 健康检查路径直接放行（不打 log，免得 nagios 刷屏）
+    location = /health {
+        access_log off;
+        proxy_pass http://pstep_active;
+    }
+}

@@ -30,6 +30,7 @@ on:
       - 'Containerfile'
       - '.containerignore'
       - 'quadlet/**'
+      - 'nginx/**'
       - '.github/workflows/deploy.yml'
 
 jobs:
@@ -152,31 +153,72 @@ jobs:
             echo "✅ 前端 dist 已部署"
           '
 
-          # ---- 2. 推送 Quadlet 单元文件 ----
-          echo "📜 推送 Quadlet..."
-          $SCP quadlet/pstep-gateway.container \
-            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.container
-          $SSHD '
-            set -e
-            sudo mkdir -p /etc/containers/systemd/pstep
-            sudo install -m 0644 /tmp/pstep-gateway.container \
-              /etc/containers/systemd/pstep/pstep-gateway.container
-            rm -f /tmp/pstep-gateway.container
-            sudo systemctl daemon-reload
-          '
+          # ---- 2. 推送 Quadlet 单元文件（双实例 a/b）----
+          echo "📜 推送 Quadlet a/b..."
+          $SCP quadlet/pstep-gateway-a.container \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway-a.container
+          $SCP quadlet/pstep-gateway-b.container \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway-b.container
+
+          # ---- 2.1 推送 nginx 蓝绿软切配置（首次部署才装）----
+          echo "📜 推送 nginx pstep-gateway 站点配置..."
+          $SCP nginx/sites-available/pstep-gateway \
+            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.nginx
 
           # ---- 2.5 准备运行时目录（idempotent）----
           # config.yaml 需世界可读（distroless 以 UID 65532 运行，无 /etc/passwd 项）
-          # /var/lib/pstep-gateway 需 chown 65532 让 usage_db 能写
+          # /var/lib/pstep-gateway-{a,b} 需 chown 65532 让 usage_db 能写
           echo "🔧 准备运行时目录..."
           $SSHD '
             set -e
             if [ -f /etc/pstep-gateway/config.yaml ]; then
               sudo chmod 644 /etc/pstep-gateway/config.yaml
             fi
-            sudo mkdir -p /var/lib/pstep-gateway
-            sudo chown 65532:65532 /var/lib/pstep-gateway
-            sudo chmod 755 /var/lib/pstep-gateway
+            # 蓝绿双 slot 各自的 SQLite 目录
+            sudo mkdir -p /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
+            sudo chown 65532:65532 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
+            sudo chmod 755 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
+
+            # Quadlet
+            sudo mkdir -p /etc/containers/systemd/pstep
+            sudo install -m 0644 /tmp/pstep-gateway-a.container \
+              /etc/containers/systemd/pstep/pstep-gateway-a.container
+            sudo install -m 0644 /tmp/pstep-gateway-b.container \
+              /etc/containers/systemd/pstep/pstep-gateway-b.container
+            rm -f /tmp/pstep-gateway-a.container /tmp/pstep-gateway-b.container
+            sudo systemctl daemon-reload
+
+            # ---- 迁移期：停掉老的单实例 pstep-gateway.service ----
+            # 第一次部署蓝绿版时：旧 .container 文件已不存在（被新的 a/b 替代），
+            # 但 daemon-reload 不会自动停掉已 active 的旧 service。
+            # 这里主动停，避免它继续占着 3002 与新 nginx 站点冲突。
+            if sudo systemctl is-active --quiet pstep-gateway.service 2>/dev/null; then
+              echo "🔁 检测到旧 pstep-gateway.service 在跑，迁移到蓝绿..."
+              sudo systemctl stop pstep-gateway.service || true
+              sudo systemctl disable pstep-gateway.service 2>/dev/null || true
+              sudo podman rm -f pstep-gateway 2>/dev/null || true
+              echo "✅ 旧单实例已停"
+            fi
+
+            # nginx 站点（仅首次或文件不存在时启用）
+            if [ ! -e /etc/nginx/sites-enabled/pstep-gateway ]; then
+              sudo install -m 0644 /tmp/pstep-gateway.nginx \
+                /etc/nginx/sites-available/pstep-gateway
+              sudo ln -sf /etc/nginx/sites-available/pstep-gateway \
+                          /etc/nginx/sites-enabled/pstep-gateway
+              # 首次安装：移除可能冲突的旧 :3002 监听（pstep-admin 的
+              # 0.0.0.0:3003 server_name_* 不会冲突，但 134.175.163.213 上
+              # 3002 之前是 gateway 直连，nginx 第一次切上去会冲突 0.0.0.0:3002）
+              # 用 nginx -t 预检，发现冲突就 fail 让人介入。
+              sudo nginx -t
+              sudo systemctl reload nginx
+              echo "✅ nginx pstep-gateway 站点已启用"
+            else
+              # 后续 deploy：仅同步源文件，不动 enable
+              sudo install -m 0644 /tmp/pstep-gateway.nginx \
+                /etc/nginx/sites-available/pstep-gateway
+            fi
+            rm -f /tmp/pstep-gateway.nginx
           '
 
           # ---- 3. 直传镜像 ----
@@ -184,7 +226,15 @@ jobs:
           $SCP /tmp/pstep-gateway.tar.gz \
             ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.tar.gz
 
-          # ---- 4. 服务器端：load + restart + 健康检查 + 镜像保留 ----
+          # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
+          # 蓝绿流程：
+          #  1. 加载新镜像
+          #  2. 找到当前 nginx upstream 指向哪个端口（3002=A / 3003=B）
+          #  3. 把 *新* systemd unit (slot 对调) enable + start
+          #  4. 等备用 slot 跑起来
+          #  5. sed 改 nginx upstream 指向新 slot，nginx -s reload
+          #  6. 停掉旧 slot（drain 由 Phase 1 的 SIGTERM handler 处理）
+          #  7. 镜像保留 5 个版本
           $SSHD '
             set -e
 
@@ -194,29 +244,77 @@ jobs:
             sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
             rm -f /tmp/pstep-gateway.tar
 
-            echo "🔄 重启 pstep-gateway（容器化）..."
-            sudo systemctl restart pstep-gateway.service
+            NGINX_CONF=/etc/nginx/sites-enabled/pstep-gateway
+            ACTIVE_PORT=$(sudo grep -oE "127.0.0.1:(3002|3003)" "$NGINX_CONF" | head -1 | cut -d: -f2)
+            if [ -z "$ACTIVE_PORT" ]; then
+              echo "❌ 无法从 $NGINX_CONF 解析当前 active 端口，退出"
+              exit 1
+            fi
+            echo "🔍 当前 active 端口: $ACTIVE_PORT"
 
-            echo "🏥 健康检查（重试 6 次，每次间隔 5s）..."
+            if [ "$ACTIVE_PORT" = "3002" ]; then
+              STANDBY_PORT=3003
+              STANDBY_UNIT=pstep-gateway-b.service
+              STANDBY_CONTAINER=pstep-gateway-b
+              OLD_UNIT=pstep-gateway-a.service
+              OLD_CONTAINER=pstep-gateway-a
+            else
+              STANDBY_PORT=3002
+              STANDBY_UNIT=pstep-gateway-a.service
+              STANDBY_CONTAINER=pstep-gateway-a
+              OLD_UNIT=pstep-gateway-b.service
+              OLD_CONTAINER=pstep-gateway-b
+            fi
+            echo "🎯 新 active 将切到 $STANDBY_PORT ($STANDBY_UNIT)"
+
+            # ---- 4.1 启动备用 slot ----
+            # 镜像已 load 成 :latest，Quadlet 启动时直接用
+            echo "🚀 启动备用 slot $STANDBY_UNIT..."
+            sudo systemctl enable --now "$STANDBY_UNIT" || true
+
+            # ---- 4.2 等备用 slot 起来（健康）----
+            echo "🏥 等备用 slot healthy..."
             healthy=false
-            for i in 1 2 3 4 5 6; do
-              if curl -sf http://127.0.0.1:3002/health > /dev/null; then
-                echo "✅ Gateway healthy (attempt $i)"
+            for i in $(seq 1 15); do
+              if curl -sf "http://127.0.0.1:$STANDBY_PORT/health" > /dev/null; then
+                echo "✅ Standby healthy (attempt $i, port $STANDBY_PORT)"
                 healthy=true
                 break
               fi
-              echo "⏳ attempt $i failed, retrying in 5s..."
-              sleep 5
+              sleep 2
             done
-
             if [ "$healthy" != "true" ]; then
-              echo "❌ Health check failed after 30s"
-              echo "---- journalctl tail ----"
-              sudo journalctl -u pstep-gateway.service --no-pager -n 80 || true
+              echo "❌ Standby slot $STANDBY_PORT 起来失败"
+              echo "---- journalctl tail ($STANDBY_UNIT) ----"
+              sudo journalctl -u "$STANDBY_UNIT" --no-pager -n 60 || true
               exit 1
             fi
 
-            echo "🌐 验证前端可访问..."
+            # ---- 4.3 切 nginx upstream ----
+            echo "🔀 切 nginx upstream → $STANDBY_PORT..."
+            sudo sed -i "s/127.0.0.1:300[23]/127.0.0.1:$STANDBY_PORT/g" "$NGINX_CONF"
+            sudo nginx -t
+            sudo nginx -s reload
+
+            # ---- 4.4 给 keepalive 连接 3s 老化 ----
+            echo "⏳ 等 3s 让旧连接走完..."
+            sleep 3
+
+            # ---- 4.5 停掉旧 slot（SIGTERM，drainer 等 in-flight 走完）----
+            echo "🛑 停掉旧 slot $OLD_UNIT (Phase 1 drainer 接管)..."
+            sudo systemctl stop "$OLD_UNIT" || true
+            sudo podman rm -f "$OLD_CONTAINER" 2>/dev/null || true
+
+            # ---- 4.6 公网端到端验证 ----
+            echo "🌐 公网健康检查..."
+            if ! curl -sf http://127.0.0.1:3002/health > /dev/null; then
+              echo "❌ 公网 3002 健康检查失败"
+              echo "---- nginx error log ----"
+              sudo tail -20 /var/log/nginx/pstep-gateway.error.log || true
+              exit 1
+            fi
+            echo "✅ Gateway 公网 3002 OK"
+
             if ! curl -sf http://127.0.0.1:3003/ > /dev/null; then
               echo "❌ Frontend check failed"
               exit 1
@@ -234,7 +332,7 @@ jobs:
               | awk "{print \$1}" \
               | xargs -r sudo podman rmi -f > /dev/null 2>&1 || true
 
-            echo "✅ 部署完成"
+            echo "✅ 蓝绿部署完成（active=$STANDBY_PORT）"
           '
 
       - name: Cleanup local artifacts
