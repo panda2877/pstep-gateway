@@ -364,15 +364,22 @@ jobs:
             fi
             echo "✅ Frontend reachable"
 
-            # ---- 5. 镜像保留策略：保留最近 5 个版本 ----
-            echo "🧹 清理旧镜像（保留最近 5 个）..."
+            # ---- 5. 镜像保留策略：保留最近 5 个版本（pstep-gateway:latest 必须保留）----
+            # 坑：若 pstep-gateway:latest 跟某个旧 SHA 标签指向同一 image ID，
+            # grep -v ":latest" 只排除那一行，但 awk 抽出的 ID 仍会传给 podman rmi -f
+            # 把整个 ID 删了 → latest 标签变 dangling → slot 启动报
+            # "short-name did not resolve to an alias"。
+            # 修复：先记下 latest 指向的 ID，cleanup 时跳过该 ID。
+            echo "🧹 清理旧镜像（保留最近 5 个 + pstep-gateway:latest 指向的 ID）..."
             KEEP=5
+            LATEST_ID=$(sudo podman images --format "{{.ID}}" | head -1)  # tag latest 永远最先
             sudo podman images --format "{{.ID}} {{.CreatedAt}} {{.Repository}}:{{.Tag}}" \
               | grep "pstep-gateway" \
               | grep -v ":latest" \
               | sort -k2,3 -r \
               | tail -n +$((KEEP + 1)) \
               | awk "{print \$1}" \
+              | grep -v "^${LATEST_ID}$" \
               | xargs -r sudo podman rmi -f > /dev/null 2>&1 || true
 
             echo "✅ 蓝绿部署完成（active=$STANDBY_PORT）"
