@@ -47,7 +47,9 @@ Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
 Restart=always
 RestartSec=5
 TimeoutStartSec=300
-TimeoutStopSec=30
+# 130s > reqwest 上游超时 120s + 5s 缓冲，让 SIGTERM drain 真正有时间
+# 等到 in-flight 请求走完。如果上游调 130s 还没回，systemd SIGKILL 兜底。
+TimeoutStopSec=130
 
 [Install]
 WantedBy=multi-user.target default.target

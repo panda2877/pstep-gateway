@@ -10,13 +10,131 @@ mod usage_db;
 
 use admin::apikeys::ApiKeyQuotaTracker;
 use admin::usage as admin_usage;
-use axum::Router;
-use std::sync::{Arc, Mutex};
+use axum::{
+    extract::Request,
+    response::Response,
+    Router,
+};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::time::{Duration, Instant};
+use tokio::signal::unix::{signal, SignalKind};
+use tower::{Layer, Service};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber;
 
 use crate::config::load_config;
 use crate::router::Router as GatewayRouter;
+
+// ============================================================================
+// InFlight 计数 — 用于优雅排空（graceful drain）
+//
+// tower middleware 包裹每个 HTTP 请求：进入时 +1，处理后 -1。
+// SIGTERM 触发的 drainer 轮询此计数器归 0 后才允许 axum::serve 的 future
+// resolve，使得 systemd 重启容器时不会掐断正在跑的 LLM 调用。
+//
+// 注意：axum/hyper 的"连接"和"逻辑请求"不等价（HTTP/1.1 keep-alive
+// 上一连接可能跑多个 request）。把计数加在 middleware 层是按"逻辑请求"
+// 计的，对应 Router::route() 的一次调用 —— 也就是真正需要等待的工作。
+// ============================================================================
+
+#[derive(Clone)]
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+    pub fn load(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+pub struct InFlightLayer {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InFlightLayer {
+    pub fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self { counter }
+    }
+}
+
+impl<S> Layer<S> for InFlightLayer {
+    type Service = InFlightService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        InFlightService {
+            inner,
+            counter: self.counter.clone(),
+        }
+    }
+}
+
+pub struct InFlightService<S> {
+    inner: S,
+    counter: Arc<AtomicUsize>,
+}
+
+// axum 0.8 的 `Router::layer` 要求 `Service<Request>: Clone`。
+// `inner: S` 已经是 `Clone + Send + 'static`（见 trait bound），加 derive 即可。
+impl<S: Clone> Clone for InFlightService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            counter: self.counter.clone(),
+        }
+    }
+}
+
+impl<S> Service<Request> for InFlightService<S>
+where
+    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S::Future: Send,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        // 计数 +1。健康检查的 GET 不计入（避免 nginx / 负载均衡的预检
+        // 把计数器卡住）。这跟 with_graceful_shutdown 的 stop-accepting
+        // 互补：后者拒绝新 TCP，前者只关心逻辑请求。
+        let is_health = req
+            .uri()
+            .path()
+            .chars()
+            .eq("/health".chars())
+            && req.method() == axum::http::Method::GET;
+        if !is_health {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let counter = self.counter.clone();
+
+        Box::pin(async move {
+            let result = inner.call(req).await;
+            // 成功/失败都 -1：失败也代表"这个请求结束了"。
+            if !is_health {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+            result
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,6 +143,8 @@ pub struct AppState {
     pub thaw_tracker: Option<Arc<thaw::ThawTracker>>,
     /// 运行期 quota tracker（不写盘）
     pub api_key_quota: Arc<Mutex<ApiKeyQuotaTracker>>,
+    /// 在飞请求计数（tower middleware 写入），供 SIGTERM drainer 轮询。
+    pub in_flight: InFlight,
 }
 
 #[tokio::main]
@@ -67,11 +187,14 @@ async fn main() {
     }
     let api_key_quota = Arc::new(Mutex::new(quota_tracker));
 
+    let in_flight = InFlight::new();
+
     let state = AppState {
         config: Arc::new(Mutex::new(config.clone())),
         router: Arc::new(gateway_router),
         thaw_tracker,
         api_key_quota,
+        in_flight: in_flight.clone(),
     };
 
     let cors = CorsLayer::new()
@@ -145,10 +268,16 @@ async fn main() {
             "/api/admin/fallback/policies/{id}",
             axum::routing::delete(admin::fallback::delete_policy),
         )
+        .layer(InFlightLayer::new(in_flight.0.clone()))
         .layer(cors)
         .with_state(state);
 
-    let port = config.port;
+    // GATEWAY_PORT 环境变量覆盖 config.port，便于 blue/green 双实例各
+    // 监听不同端口而共用同一份 config.yaml。
+    let port: u16 = std::env::var("GATEWAY_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(config.port);
     let addr = format!("0.0.0.0:{}", port);
 
     println!("✅ 网关已启动: http://{}:{}", "0.0.0.0", port);
@@ -165,5 +294,51 @@ async fn main() {
     );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // Graceful shutdown：等 SIGTERM / SIGINT 后，drain 至 in-flight=0 再退。
+    //
+    // 时序：
+    //  1. systemd 发送 SIGTERM（systemctl stop / restart）
+    //  2. with_graceful_shutdown 触发，axum 停止 accept 新 TCP 连接
+    //  3. drainer 轮询 in_flight 计数器：归 0 → 让 future resolve
+    //  4. axum::serve 的 future 退出，主进程返回
+    //
+    // 必须满足 TimeoutStopSec >= DRAIN_DEADLINE，否则 systemd 会 SIGKILL。
+    // 经验值：reqwest 上游超时 120s + 5s 缓冲 = 125s，quadlet 配 130s。
+    const DRAIN_DEADLINE_SECS: u64 = 120;
+    let counter_for_drain = in_flight.clone();
+    let shutdown = async move {
+        // 等 SIGTERM（或 SIGINT，方便本地 Ctrl-C 测试）。
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("收到 SIGTERM，开始 graceful drain..."),
+            _ = sigint.recv()  => tracing::info!("收到 SIGINT，开始 graceful drain..."),
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(DRAIN_DEADLINE_SECS);
+        loop {
+            let n = counter_for_drain.load();
+            if n == 0 {
+                tracing::info!("drain 完成（in-flight=0），进程退出");
+                break;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    in_flight = n,
+                    "drain 超时 {}s，强制退出（systemd 即将 SIGKILL）",
+                    DRAIN_DEADLINE_SECS
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .unwrap();
 }
