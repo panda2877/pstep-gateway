@@ -229,7 +229,7 @@ jobs:
           # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
           # 蓝绿流程：
           #  1. 加载新镜像
-          #  2. 找到当前 nginx upstream 指向哪个端口（3002=A / 3003=B）
+          #  2. 找到当前 nginx upstream 指向哪个端口（13004=A / 13005=B）
           #  3. 把 *新* systemd unit (slot 对调) enable + start
           #  4. 等备用 slot 跑起来
           #  5. sed 改 nginx upstream 指向新 slot，nginx -s reload
@@ -245,23 +245,23 @@ jobs:
             rm -f /tmp/pstep-gateway.tar
 
             NGINX_CONF=/etc/nginx/sites-enabled/pstep-gateway
-            # slot A 暴露 3002（公网），slot B 暴露 13003（仅 127.0.0.1）。
+            # slot A 暴露 127.0.0.1:13004，slot B 暴露 127.0.0.1:13005。
             # 解析 nginx upstream 当前指向哪个端口。
-            ACTIVE_PORT=$(sudo grep -oE "127.0.0.1:(3002|13003)" "$NGINX_CONF" | head -1 | cut -d: -f2)
+            ACTIVE_PORT=$(sudo grep -oE "127.0.0.1:(13004|13005)" "$NGINX_CONF" | head -1 | cut -d: -f2)
             if [ -z "$ACTIVE_PORT" ]; then
               echo "❌ 无法从 $NGINX_CONF 解析当前 active 端口，退出"
               exit 1
             fi
             echo "🔍 当前 active 端口: $ACTIVE_PORT"
 
-            if [ "$ACTIVE_PORT" = "3002" ]; then
-              STANDBY_PORT=13003
+            if [ "$ACTIVE_PORT" = "13004" ]; then
+              STANDBY_PORT=13005
               STANDBY_UNIT=pstep-gateway-b.service
               STANDBY_CONTAINER=pstep-gateway-b
               OLD_UNIT=pstep-gateway-a.service
               OLD_CONTAINER=pstep-gateway-a
             else
-              STANDBY_PORT=3002
+              STANDBY_PORT=13004
               STANDBY_UNIT=pstep-gateway-a.service
               STANDBY_CONTAINER=pstep-gateway-a
               OLD_UNIT=pstep-gateway-b.service
@@ -310,7 +310,7 @@ jobs:
 
             # ---- 4.3 切 nginx upstream ----
             echo "🔀 切 nginx upstream → $STANDBY_PORT..."
-            sudo sed -i "s/127.0.0.1:3002/127.0.0.1:$STANDBY_PORT/; s/127.0.0.1:13003/127.0.0.1:$STANDBY_PORT/" "$NGINX_CONF"
+            sudo sed -i "s/127.0.0.1:13004/127.0.0.1:$STANDBY_PORT/; s/127.0.0.1:13005/127.0.0.1:$STANDBY_PORT/" "$NGINX_CONF"
             sudo nginx -t
             sudo nginx -s reload
 
