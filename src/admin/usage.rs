@@ -31,7 +31,10 @@ fn get_period_hours(period: &str) -> u64 {
         "1d" => 24,
         "7d" => 24 * 7,
         "30d" => 24 * 30,
-        _ => 24 * 7, // default 7 days
+        // Unknown / typo'd values (e.g. "1h", "24h", "last_week") fall back to
+        // the smallest supported window rather than silently expanding to 7d —
+        // that way a misread chart is conservative, not a 7× overstatement.
+        _ => 24,
     }
 }
 
