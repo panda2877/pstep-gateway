@@ -139,17 +139,18 @@ jobs:
           SCP="scp -i ~/.ssh/deploy_key"
 
           # ---- 1. 部署前端（主机 nginx 静态服务）----
+          # 用 scp 替代 rsync：scp 不需要目的端目录预存在，行为更确定。
+          # 上传 /tmp/admin-dist.tgz 让远端在 sshd 块里一次性解压+rsync。
           echo "📦 部署前端 dist..."
-          rsync -az --delete \
-            -e "$SSHCMD" \
-            ./artifacts/admin-dist/ \
-            ${SERVER_USER}@${SERVER_HOST}:/tmp/admin-dist/
+          tar -C ./artifacts/admin-dist -czf /tmp/admin-dist.tgz .
+          $SCP /tmp/admin-dist.tgz ${SERVER_USER}@${SERVER_HOST}:/tmp/admin-dist.tgz
+          rm -f /tmp/admin-dist.tgz
 
           $SSHD '
             set -e
-            sudo mkdir -p /opt/pstep/admin
-            sudo rsync -a --delete /tmp/admin-dist/ /opt/pstep/admin/dist/
-            rm -rf /tmp/admin-dist
+            sudo mkdir -p /opt/pstep/admin/dist
+            sudo tar -xzf /tmp/admin-dist.tgz -C /opt/pstep/admin/dist/
+            sudo rm -f /tmp/admin-dist.tgz
             echo "✅ 前端 dist 已部署"
           '
 
