@@ -288,16 +288,27 @@ jobs:
             # 才有，没有可被误判的 fallback。同时也证明容器内 /health 真的
             # 起来了（响应里有 uptime/version/model list）。
             echo "🏥 等备用 slot healthy..."
+            # 用 jq 解析响应 JSON 的 .object 字段 === "list"。
+            # 之前用 grep -q '"object":"list"' 时双引号在 $SSHD 单引号 heredoc 里
+            # 被 shell eat 掉（变成 "object:list"），永远 match 不到。
             healthy=false
-            for i in $(seq 1 15); do
-              resp=$(curl -sf -m 3 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>/dev/null)
-              # 命中 gateway 容器时，resp 是 JSON 含 "object":"list"
-              if echo "$resp" | grep -q '"object":"list"'; then
+            for i in $(seq 1 20); do
+              # 先看端口是否在 listen（比 HTTP probe 快；publish 重启期端口瞬断）
+              if ! sudo ss -tln 2>/dev/null | grep -q "127.0.0.1:$STANDBY_PORT\b"; then
+                echo "⏳ attempt $i: port $STANDBY_PORT 暂未监听"
+                sleep 1
+                continue
+              fi
+              # 端口在；HTTP probe。-m 2 严格超时。
+              resp=$(curl -sf -m 2 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>&1)
+              rc=$?
+              echo "⏳ attempt $i: curl rc=$rc resp_len=${#resp}"
+              if [ $rc -eq 0 ] && echo "$resp" | jq -e '.object == "list"' >/dev/null 2>&1; then
                 echo "✅ Standby healthy (attempt $i, port $STANDBY_PORT, hit gateway container)"
                 healthy=true
                 break
               fi
-              sleep 2
+              sleep 1
             done
             if [ "$healthy" != "true" ]; then
               echo "❌ Standby slot $STANDBY_PORT 起来失败（健康检查被误判或容器未启动）"
