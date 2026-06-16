@@ -43,15 +43,17 @@ pub async fn usage_stats(
     let period = query.period.unwrap_or_else(|| "7d".to_string());
     let hours = get_period_hours(&period);
 
-    let cutoff = std::time::SystemTime::now()
+    // Records carry ts_ms (millis since epoch); cutoff must be in the same unit
+    // or the period filter degenerates to "always true" (ms > secs always).
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .saturating_sub(hours * 3600);
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cutoff = now_ms.saturating_sub(hours * 3600 * 1000);
 
     // Get stats from router's usage tracker
     let all_recent = state.router.get_usage_tracker().get_recent(10000);
-    let prev_cutoff = cutoff.saturating_sub(hours * 3600);
+    let prev_cutoff = cutoff.saturating_sub(hours * 3600 * 1000);
 
     // Filter by period
     let filtered: Vec<_> = all_recent
@@ -122,11 +124,12 @@ pub async fn usage_distribution(
     let period = query.period.unwrap_or_else(|| "7d".to_string());
     let hours = get_period_hours(&period);
 
-    let cutoff = std::time::SystemTime::now()
+    // Records carry ts_ms (millis since epoch); cutoff must be in the same unit.
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .saturating_sub(hours * 3600);
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cutoff = now_ms.saturating_sub(hours * 3600 * 1000);
 
     let recent = state.router.get_usage_tracker().get_recent(10000);
     let filtered: Vec<_> = recent
