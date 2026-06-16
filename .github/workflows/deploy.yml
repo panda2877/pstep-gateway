@@ -303,10 +303,14 @@ jobs:
               resp=$(curl -sf -m 2 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>&1)
               rc=$?
               echo "⏳ attempt $i: curl rc=$rc resp_len=${#resp}"
-              if [ $rc -eq 0 ] && echo "$resp" | jq -e '.object == "list"' >/dev/null 2>&1; then
+              if [ $rc -eq 0 ] && echo "$resp" | jq -e '.object == "list"' >/tmp/jq_out 2>&1; then
                 echo "✅ Standby healthy (attempt $i, port $STANDBY_PORT, hit gateway container)"
                 healthy=true
                 break
+              fi
+              if [ $rc -eq 0 ]; then
+                echo "    jq failed, output: $(cat /tmp/jq_out 2>/dev/null | head -c 200)"
+                echo "    resp: $(echo "$resp" | head -c 200)"
               fi
               sleep 1
             done
