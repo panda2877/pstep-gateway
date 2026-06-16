@@ -289,8 +289,17 @@ jobs:
             # 起来了（响应里有 uptime/version/model list）。
             echo "🏥 等备用 slot healthy..."
             # 用 jq 解析响应 JSON 的 .object 字段 === "list"。
-            # 之前用 grep -q '"object":"list"' 时双引号在 $SSHD 单引号 heredoc 里
-            # 被 shell eat 掉（变成 "object:list"），永远 match 不到。
+            #
+            # 关键陷阱：deploy.yml 用 $SSHD '\''...'\'' single-quoted 块把脚本传给
+            # 远端 bash。块里写 jq -e '\''...'\'' 含单引号会被截断。解法：
+            # 先把 jq filter 写入 server 上的 /tmp 文件，jq -f 读。
+            #
+            # 用法：scp filter 上来 → /tmp/jq_filter → server 用 jq -f 读。
+            # 但我们不 scp（避免改 deploy.yml 流程），改用 base64 注入：
+            JQ_B64="Lm9iamVjdCA9PSAibGlzdCI="   # base64('.object == "list"')
+            echo "$JQ_B64" | sudo tee /tmp/jq_filter.b64 >/dev/null
+            sudo base64 -d /tmp/jq_filter.b64 > /tmp/jq_filter
+            sudo cat /tmp/jq_filter
             healthy=false
             for i in $(seq 1 20); do
               # 先看端口是否在 listen（比 HTTP probe 快；publish 重启期端口瞬断）
@@ -303,7 +312,8 @@ jobs:
               resp=$(curl -sf -m 2 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>&1)
               rc=$?
               echo "⏳ attempt $i: curl rc=$rc resp_len=${#resp}"
-              if [ $rc -eq 0 ] && echo "$resp" | jq -e '.object == "list"' >/tmp/jq_out 2>&1; then
+              # 用 -f 读 filter 文件，避免命令行传 filter 时嵌套引号问题
+              if [ $rc -eq 0 ] && echo "$resp" | sudo jq -ef /tmp/jq_filter >/tmp/jq_out 2>&1; then
                 echo "✅ Standby healthy (attempt $i, port $STANDBY_PORT, hit gateway container)"
                 healthy=true
                 break
