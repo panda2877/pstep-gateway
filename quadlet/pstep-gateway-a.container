@@ -3,12 +3,18 @@
 #
 # 与 slot B 共享同一份 pstep-gateway:latest 镜像；区别仅在：
 #   - ContainerName: pstep-gateway-a
-#   - PublishPort:  3002:3002  (主端口，nginx 上游命中它)
+#   - PublishPort:  127.0.0.1:3002:3002  (仅本机；公网入口由 nginx pstep-gateway
+#                     站点 listen 0.0.0.0:3002 反代到此处)
 #   - Volume:       /var/lib/pstep-gateway-a (独立 SQLite)
 #   - GATEWAY_PORT: 3002       (覆盖 config.yaml 的 port)
 #
 # 部署时两个 unit 一起被 install 上去；nginx upstream 决定哪个 slot 接收流量。
 # 不接收流量的 slot 处于 "standby" 状态（仍在跑，但上游没有打到它）。
+#
+# 为什么 slot A 不再直接 listen 0.0.0.0:3002（之前 Network=host 的方案）：
+# 蓝绿切流需要 nginx 在 0.0.0.0:3002 上做"软切"，它必须独占这个端口。
+# 如果 slot A 自己也 bind 0.0.0.0:3002，nginx 起来会 "address in use"。
+# 让 nginx 独占 3002，slot A 只露 127.0.0.1，所有公网流量必经 nginx。
 #
 # 服务器部署位置: /etc/containers/systemd/pstep/pstep-gateway-a.container
 # Quadlet 会自动生成同名 systemd unit: pstep-gateway-a.service
@@ -23,12 +29,11 @@ Wants=network-online.target
 Image=pstep-gateway:latest
 ContainerName=pstep-gateway-a
 
-# netavark bridge 网络 + rootful：等价于 Docker 的 bridge 网络。
-# PublishPort=3002:3002 把容器内 3002 映射到宿主机 0.0.0.0:3002（公网可达）。
-# Slot A 改走 bridge（之前是 Network=host），换来"容器只露 3002"的能力。
+# netavark bridge 网络 + rootful。
+# 关键：PublishPort 显式绑 127.0.0.1，让 nginx 独占 0.0.0.0:3002。
 Network=bridge
 
-PublishPort=3002:3002
+PublishPort=127.0.0.1:3002:3002
 
 # Hardening
 ReadOnly=true

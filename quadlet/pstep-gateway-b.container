@@ -3,13 +3,14 @@
 #
 # 与 slot A 互为备份：同一份镜像、不同 ContainerName、不同 host volume、
 # 不同 PublishPort。每次 deploy 由 deploy 脚本切 nginx upstream 决定
-# active 端口 (3002 ↔ 3003)。
+# active 端口 (3002 ↔ 13003)。
 #
 # 关键差异（相对 slot A）：
 #   - ContainerName: pstep-gateway-b
-#   - PublishPort:  127.0.0.1:3003:3002  (仅本机可访问，nginx 走这里)
+#   - PublishPort:  127.0.0.1:13003:3002  (仅本机；避开 :3003 因为
+#                     134.175.163.213 上的 nginx pstep-admin 站点已占用 3003)
 #   - Volume:       /var/lib/pstep-gateway-b (独立 SQLite)
-#   - GATEWAY_PORT: 3002  (容器内仍跑 3002；通过 127.0.0.1:3003 暴露)
+#   - GATEWAY_PORT: 3002  (容器内仍跑 3002；通过 127.0.0.1:13003 暴露)
 #
 # 服务器部署位置: /etc/containers/systemd/pstep/pstep-gateway-b.container
 # =============================================================================
@@ -23,12 +24,13 @@ Wants=network-online.target
 Image=pstep-gateway:latest
 ContainerName=pstep-gateway-b
 
-# 与 slot A 同样的 netavark bridge。PublishPort 显式绑到 127.0.0.1，
-# 所以 slot B 的 3002 只在 127.0.0.1:3003 上可见，外部不可达 —— 这是关键：
-# 避免 slot B 在 standby 期间意外接收直连流量（绕过 nginx 的流量切换）。
+# 与 slot A 同样的 netavark bridge。PublishPort 显式绑到 127.0.0.1
+# 所以 slot B 仅本机可见，外部不可达 —— 避免 standby 时被直连绕过 nginx。
 Network=bridge
 
-PublishPort=127.0.0.1:3003:3002
+# 宿主机 127.0.0.1:13003 → 容器内 3002。
+# 不复用 3003：因为 134.175.163.213 上的 nginx pstep-admin 站点已占 3003。
+PublishPort=127.0.0.1:13003:3002
 
 # Hardening
 ReadOnly=true

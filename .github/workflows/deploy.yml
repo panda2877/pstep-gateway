@@ -245,7 +245,9 @@ jobs:
             rm -f /tmp/pstep-gateway.tar
 
             NGINX_CONF=/etc/nginx/sites-enabled/pstep-gateway
-            ACTIVE_PORT=$(sudo grep -oE "127.0.0.1:(3002|3003)" "$NGINX_CONF" | head -1 | cut -d: -f2)
+            # slot A 暴露 3002（公网），slot B 暴露 13003（仅 127.0.0.1）。
+            # 解析 nginx upstream 当前指向哪个端口。
+            ACTIVE_PORT=$(sudo grep -oE "127.0.0.1:(3002|13003)" "$NGINX_CONF" | head -1 | cut -d: -f2)
             if [ -z "$ACTIVE_PORT" ]; then
               echo "❌ 无法从 $NGINX_CONF 解析当前 active 端口，退出"
               exit 1
@@ -253,7 +255,7 @@ jobs:
             echo "🔍 当前 active 端口: $ACTIVE_PORT"
 
             if [ "$ACTIVE_PORT" = "3002" ]; then
-              STANDBY_PORT=3003
+              STANDBY_PORT=13003
               STANDBY_UNIT=pstep-gateway-b.service
               STANDBY_CONTAINER=pstep-gateway-b
               OLD_UNIT=pstep-gateway-a.service
@@ -268,31 +270,47 @@ jobs:
             echo "🎯 新 active 将切到 $STANDBY_PORT ($STANDBY_UNIT)"
 
             # ---- 4.1 启动备用 slot ----
-            # 镜像已 load 成 :latest，Quadlet 启动时直接用
+            # Quadlet 单元是 generated/transient，不能 enable，只能 start。
+            # 之前用 `enable --now || true` 掩盖了失败，这次不用 || true：
+            # 启动失败直接 exit 1，让 CI 红。
             echo "🚀 启动备用 slot $STANDBY_UNIT..."
-            sudo systemctl enable --now "$STANDBY_UNIT" || true
+            if ! sudo systemctl start "$STANDBY_UNIT"; then
+              echo "❌ systemctl start 失败"
+              sudo systemctl status "$STANDBY_UNIT" --no-pager -n 20 || true
+              sudo journalctl -u "$STANDBY_UNIT" --no-pager -n 40 || true
+              exit 1
+            fi
 
             # ---- 4.2 等备用 slot 起来（健康）----
+            # 用 /v1/models 而非 /health 作为 probe —— 134.175.163.213 上
+            # 3003 是 nginx pstep-admin 站点（serve 前端 dist），它对 /health
+            # 也会 200；但 /v1/models 是 OpenAI 兼容路径，只有 gateway 容器
+            # 才有，没有可被误判的 fallback。同时也证明容器内 /health 真的
+            # 起来了（响应里有 uptime/version/model list）。
             echo "🏥 等备用 slot healthy..."
             healthy=false
             for i in $(seq 1 15); do
-              if curl -sf "http://127.0.0.1:$STANDBY_PORT/health" > /dev/null; then
-                echo "✅ Standby healthy (attempt $i, port $STANDBY_PORT)"
+              resp=$(curl -sf -m 3 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>/dev/null)
+              # 命中 gateway 容器时，resp 是 JSON 含 "object":"list"
+              if echo "$resp" | grep -q '"object":"list"'; then
+                echo "✅ Standby healthy (attempt $i, port $STANDBY_PORT, hit gateway container)"
                 healthy=true
                 break
               fi
               sleep 2
             done
             if [ "$healthy" != "true" ]; then
-              echo "❌ Standby slot $STANDBY_PORT 起来失败"
+              echo "❌ Standby slot $STANDBY_PORT 起来失败（健康检查被误判或容器未启动）"
               echo "---- journalctl tail ($STANDBY_UNIT) ----"
               sudo journalctl -u "$STANDBY_UNIT" --no-pager -n 60 || true
+              echo "---- port $STANDBY_PORT 监听状态 ----"
+              sudo ss -tlnp | grep ":$STANDBY_PORT " || echo "无"
               exit 1
             fi
 
             # ---- 4.3 切 nginx upstream ----
             echo "🔀 切 nginx upstream → $STANDBY_PORT..."
-            sudo sed -i "s/127.0.0.1:300[23]/127.0.0.1:$STANDBY_PORT/g" "$NGINX_CONF"
+            sudo sed -i "s/127.0.0.1:3002/127.0.0.1:$STANDBY_PORT/; s/127.0.0.1:13003/127.0.0.1:$STANDBY_PORT/" "$NGINX_CONF"
             sudo nginx -t
             sudo nginx -s reload
 

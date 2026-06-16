@@ -2,15 +2,21 @@
 # Pstep Gateway — 前置 nginx (蓝绿软切)
 #
 # 监听 0.0.0.0:3002，反代到 pstep-gateway-a 或 pstep-gateway-b 容器。
-# 部署脚本会改写 upstream pstep_active 中的 server 行（3002 ↔ 3003），
+# 部署脚本会改写 upstream pstep_active 中的 server 行：
+#   slot A (active)   → 127.0.0.1:3002   (pstep-gateway-a, 公网可达)
+#   slot B (standby)  → 127.0.0.1:13003  (pstep-gateway-b, 仅 127.0.0.1)
 # 然后 `nginx -s reload` 切流。
+#
+# 为什么 slot B 用 13003 而不是 3003：
+# 134.175.163.213 上的 nginx pstep-admin 站点（前端 + /api/ 反代）
+# 已经占用 3003 公网端口 —— slot B 不再竞争。
 #
 # 服务器部署位置: /etc/nginx/sites-enabled/pstep-gateway
 # （sites-enabled 通常是 sites-available 的 symlink）
 # =============================================================================
 
 upstream pstep_active {
-    # 当前 active 容器。deploy 脚本会 sed 改这一行（3002 ↔ 3003），
+    # 当前 active 容器。deploy 脚本会 sed 改这一行（3002 ↔ 13003），
     # 然后 nginx -s reload 让新 worker 读新配置。
     # keepalive 32 让 nginx 与上游 gateway 之间复用 TCP 连接 —— 切流时
     # 旧连接的 in-flight 请求能走完才被新 worker 关掉。
