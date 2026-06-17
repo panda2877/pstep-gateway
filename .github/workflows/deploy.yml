@@ -300,7 +300,7 @@ jobs:
             JQ_B64="Lm9iamVjdCA9PSAibGlzdCI="   # base64('.object == "list"')
             echo "$JQ_B64" | sudo tee /tmp/jq_filter.b64 >/dev/null
             sudo base64 -d /tmp/jq_filter.b64 > /tmp/jq_filter
-            sudo cat /tmp/jq_filter
+            sudo cat /tmp/jq_filter || true
             healthy=false
             for i in $(seq 1 20); do
               # 先看端口是否在 listen（比 HTTP probe 快；publish 重启期端口瞬断）
@@ -310,7 +310,9 @@ jobs:
                 continue
               fi
               # 端口在；HTTP probe。-m 2 严格超时。
-              resp=$(curl -sf -m 2 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>&1)
+              # ⚠️ 不能用 `resp=$(curl ...)` 单独一行 —— curl 失败时 set -e 会
+              # 直接杀掉脚本（bypass `rc=$?`）。必须用 `|| true` 抑制。
+              resp=$(curl -sf -m 2 "http://127.0.0.1:$STANDBY_PORT/v1/models" 2>&1) || true
               rc=$?
               echo "⏳ attempt $i: curl rc=$rc resp_len=${#resp}"
               # 用 -f 读 filter 文件，避免命令行传 filter 时嵌套引号问题
