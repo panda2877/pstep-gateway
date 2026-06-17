@@ -388,7 +388,11 @@ fn convert_openai_chunk_to_anthropic(
             }
         });
         output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
-        return Some(());
+        // NB: do NOT return here. minimaxi M3 sends `role` and `content` (often
+        // containing  THINK tags) in the same delta. Returning early would skip
+        // the think-tag strip below and let raw thinking text leak into the
+        // Anthropic SSE stream, breaking Claude Code's compact. Fall through
+        // so the content path can process it.
     }
 
     // Handle tool_calls streaming: emit content_block_start (tool_use) and
