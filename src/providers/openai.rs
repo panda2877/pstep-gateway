@@ -453,26 +453,11 @@ fn convert_openai_chunk_to_anthropic(
         return Some(());
     }
 
-    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-        if !reasoning.is_empty() {
-            if !*sent_content_block_start {
-                *sent_content_block_start = true;
-                *thinking_started = true;
-                let start_event = json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                });
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-            }
-            let event = json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": reasoning}
-            });
-            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
-            return Some(());
-        }
+    // Skip reasoning_content from upstream — Claude Code client doesn't recognize
+    // Anthropic-style "thinking" content blocks, so emitting them breaks response
+    // parsing (e.g. compact fails after a few rounds). Just drop the field entirely.
+    if delta.get("reasoning_content").is_some() {
+        return Some(());
     }
 
     if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
@@ -531,53 +516,6 @@ fn convert_openai_chunk_to_anthropic(
     None
 }
 
-fn extract_thinking_from_text(text: &str) -> (Option<String>, String) {
-    let mut thinking_blocks: Vec<String> = Vec::new();
-    let mut remaining_text = String::new();
-    let mut in_thinking = false;
-    let mut current_block = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if !in_thinking && i + 7 <= chars.len() {
-            let opening: String = chars[i..i+7].iter().collect();
-            if opening == "<think>" {
-                i += 7;
-                in_thinking = true;
-                continue;
-            }
-        }
-        if in_thinking && i + 8 <= chars.len() {
-            let closing: String = chars[i..i+8].iter().collect();
-            if closing.starts_with("</think>") {
-                let actual_closing_len = closing.find('>').map(|p| p + 1).unwrap_or(8);
-                i += actual_closing_len;
-                in_thinking = false;
-                if !current_block.is_empty() {
-                    thinking_blocks.push(current_block.trim().to_string());
-                    current_block = String::new();
-                }
-                while i < chars.len() && (chars[i] == '\n' || chars[i] == '\r') {
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        if in_thinking {
-            current_block.push(chars[i]);
-        } else {
-            remaining_text.push(chars[i]);
-        }
-        i += 1;
-    }
-    if in_thinking && !current_block.is_empty() {
-        thinking_blocks.push(current_block.trim().to_string());
-    }
-    let thinking = if thinking_blocks.is_empty() { None } else { Some(thinking_blocks.join("\n")) };
-    (thinking, remaining_text.trim().to_string())
-}
-
 pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, String> {
     let id = openai_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     let model = openai_resp.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -586,22 +524,19 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
     let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let choice = openai_resp.get("choices").and_then(|v| v.as_array()).and_then(|arr| arr.first());
     let message = choice.and_then(|v| v.get("message"));
-    let reasoning_from_field = message.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()).map(String::from);
+    // Skip reasoning_content / thinking blocks from upstream — Claude Code client
+    // doesn't recognize Anthropic-style "thinking" content blocks, so emitting
+    // them breaks response parsing (e.g. compact fails after a few rounds).
     let tool_calls = message.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()).map(|arr| arr.clone()).unwrap_or_default();
 
     let mut content_blocks = Vec::new();
-    let mut thinking_content: Option<String> = reasoning_from_field;
 
     let message_content = message.and_then(|m| m.get("content"));
     if let Some(content_val) = message_content {
         if content_val.is_string() {
             if let Some(text) = content_val.as_str() {
-                let (extracted_thinking, clean_text) = extract_thinking_from_text(text);
-                if let Some(extracted) = extracted_thinking {
-                    thinking_content = Some(thinking_content.map(|h| h + "\n" + &extracted).unwrap_or(extracted));
-                }
-                if !clean_text.is_empty() {
-                    content_blocks.push(json!({"type": "text", "text": clean_text}));
+                if !text.is_empty() {
+                    content_blocks.push(json!({"type": "text", "text": text}));
                 }
             }
         } else if let Some(arr) = content_val.as_array() {
@@ -610,22 +545,14 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
                 match block_type {
                     "text" => {
                         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                            let (extracted_thinking, clean_text) = extract_thinking_from_text(text);
-                            if let Some(extracted) = extracted_thinking {
-                                thinking_content = Some(thinking_content.map(|h| h + "\n" + &extracted).unwrap_or(extracted));
-                            }
-                            if !clean_text.is_empty() {
-                                content_blocks.push(json!({"type": "text", "text": clean_text}));
-                            }
-                        }
-                    }
-                    "thinking" => {
-                        if let Some(text) = block.get("thinking").and_then(|v| v.as_str()) {
                             if !text.is_empty() {
-                                thinking_content = Some(thinking_content.map(|h| h + "\n" + text).unwrap_or_else(|| text.to_string()));
+                                content_blocks.push(json!({"type": "text", "text": text}));
                             }
                         }
                     }
+                    // "thinking" / "reasoning" blocks from upstream are dropped
+                    // entirely (see comment above).
+                    "thinking" | "reasoning" => {}
                     _ => {
                         if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
                             if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
@@ -636,12 +563,6 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
                     }
                 }
             }
-        }
-    }
-
-    if let Some(ref reasoning) = thinking_content {
-        if !reasoning.is_empty() {
-            content_blocks.insert(0, json!({"type": "thinking", "thinking": reasoning, "signature": ""}));
         }
     }
 
