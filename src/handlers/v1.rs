@@ -322,43 +322,79 @@ async fn chat_completions(
     };
 
     let model_name = body.model.clone();
+    let is_stream = body.stream;
     let body_str = serde_json::to_string(&body).unwrap();
 
-    let result = state
-        .router
-        .route(
-            &model_name,
-            &body_str,
-            format,
-            auth.fallback_policy.as_deref(),
-            Some(&auth.key_id),
-            &state.api_key_quota,
-        )
-        .await;
+    if is_stream {
+        let result = state
+            .router
+            .route(
+                &model_name,
+                &body_str,
+                format,
+                auth.fallback_policy.as_deref(),
+                Some(&auth.key_id),
+                &state.api_key_quota,
+            )
+            .await;
 
-    match result {
-        Ok(stream) => {
-            let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
-            resp.headers_mut()
-                .insert("Content-Type", "text/event-stream".parse().unwrap());
-            resp.headers_mut()
-                .insert("Cache-Control", "no-cache".parse().unwrap());
-            resp.headers_mut()
-                .insert("X-Accel-Buffering", "no".parse().unwrap());
-            if state.router.did_failover().await {
+        match result {
+            Ok(stream) => {
+                let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
                 resp.headers_mut()
-                    .insert("X-Pstep-Failover", "true".parse().unwrap());
+                    .insert("Content-Type", "text/event-stream".parse().unwrap());
+                resp.headers_mut()
+                    .insert("Cache-Control", "no-cache".parse().unwrap());
+                resp.headers_mut()
+                    .insert("X-Accel-Buffering", "no".parse().unwrap());
+                if state.router.did_failover().await {
+                    resp.headers_mut()
+                        .insert("X-Pstep-Failover", "true".parse().unwrap());
+                }
+                resp
             }
-            resp
+            Err(e) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "bad_gateway",
+                    "message": e.to_string()
+                })),
+            )
+                .into_response(),
         }
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "bad_gateway",
-                "message": e.to_string()
-            })),
-        )
-            .into_response(),
+    } else {
+        let result = state
+            .router
+            .route_non_stream(
+                &model_name,
+                &body_str,
+                format,
+                auth.fallback_policy.as_deref(),
+                Some(&auth.key_id),
+                &state.api_key_quota,
+            )
+            .await;
+
+        match result {
+            Ok(response) => {
+                let mut resp = axum::response::Response::new(axum::body::Body::from(response));
+                resp.headers_mut()
+                    .insert("Content-Type", "application/json".parse().unwrap());
+                if state.router.did_failover().await {
+                    resp.headers_mut()
+                        .insert("X-Pstep-Failover", "true".parse().unwrap());
+                }
+                resp
+            }
+            Err(e) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "bad_gateway",
+                    "message": e.to_string()
+                })),
+            )
+                .into_response(),
+        }
     }
 }
 
