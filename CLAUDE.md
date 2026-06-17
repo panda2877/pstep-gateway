@@ -17,7 +17,9 @@
 - **自动冻结/解冻**（thaw）：上游连续失败时自动暂停，恢复成功率达标后自动解冻
 - **管理后台**（React 前端）：可视化查看用量、配置 model、key、fallback 策略
 
-后端监听 `0.0.0.0:3002`；前端 dist 由主机 nginx 静态托管在 `:3003`，由反向代理统一对外。
+后端监听 `0.0.0.0:3002`（实际是 **nginx 前置 → 蓝绿 slot** 的 13004/13005 之一）；
+前端 dist 由主机 nginx 静态托管在 `:3003`，由反向代理统一对外。**部署零中断**：
+`nginx -s reload` 切流 + SIGTERM drain in-flight，外部 agent/SDK 不会感受到连接被拒绝。
 
 ---
 
@@ -219,52 +221,97 @@ npm run build      # 产物在 dist/
 
 ## 部署
 
-**完全由 GitHub Actions 自动化**（`.github/workflows/deploy.yml`）：
+**完全由 GitHub Actions 自动化**（`.github/workflows/deploy.yml`）。
+架构：**nginx 蓝绿前置 + 双 Quadlet slot**。每次 deploy 把不接收流量的 slot
+换上新镜像、起好、探针通过后 `nginx -s reload` 切 upstream，最后停掉旧 slot
+（Phase 1 的 SIGTERM drainer 接管 in-flight 请求）。**公网 3002 始终可访问**。
 
-1. push 到 `main` 触发（或手动 `workflow_dispatch`）
-2. `build-admin` job：npm ci + npm run build → 上传 dist artifact
-3. `deploy` job：cargo 编译 → `docker build` 镜像（BuildKit + GHA cache，**`load: true`** 加载到 runner）
-4. **双路分发**：
-   - **`docker save` + scp 直传** → 服务器 `podman load` → `systemctl restart`
-     （主路径；**国内拉 registry 慢**，所以走 scp）
-   - **`docker push` 到 GHCR**（`ghcr.io/panda2877/pstep-gateway`）
-     （**异地备份**；全量保留，不清理）
-5. 6 次重试健康检查 → 清理 5 个版本之前的本地旧镜像（GHCR 端不动）
+### 端口分配
 
-> 主路径用 **scp**（中国服务器拉 GHCR 慢，实测 ~10KB/s），所以服务器侧 `podman load` 而不是 `podman pull`。
-> 备份用 **GHCR**（`ghcr.io/panda2877/pstep-gateway`），全量保留历史版本；用于异地容灾 / 跨服务器分发。
-> 想要从 GHCR 恢复某版本：`podman pull ghcr.io/panda2877/pstep-gateway:<sha>` 然后 `podman tag ... pstep-gateway:latest && systemctl restart`。
+```
+0.0.0.0:3002    nginx pstep-gateway 站点（公网入口，upstream 切流）
+127.0.0.1:13004 pstep-gateway-a 容器（slot A，仅本机）
+127.0.0.1:13005 pstep-gateway-b 容器（slot B，仅本机）
+0.0.0.0:3003    nginx pstep-admin 站点（前端 + /api/ → 3002）
+```
 
-**服务器**：`134.175.163.213`（root，容器 systemd unit `pstep-gateway.service` 由 Quadlet 生成）。
+> 13002/13003 被 frps 占了，所以 slot 用 13004/13005。
+> slot 仅本机可见（`PublishPort=127.0.0.1:...`），外部只能走 nginx。
 
-**触发条件**（以下任一文件改动 push 到 main 即触发）：
+### 蓝绿切流流程（deploy job 在远端跑的脚本）
+
+1. **前端 dist**：`scp` 传 tgz → 远端 `tar -xzf` 到 `/opt/pstep/admin/dist/`。
+2. **Quadlet**：`scp` 两个 `.container` 单元 → `daemon-reload`。
+3. **加载镜像**：`gunzip` + `podman load -i` + `podman tag ...:latest`。
+4. **决定角色**：`grep -oE "127.0.0.1:1300[45]"` 当前 active slot → standby 反之。
+5. **启动备用 slot**：`systemctl start pstep-gateway-{a|b}.service`。
+6. **健康探针**：先看端口在 listen；再 `curl -sf -m 2 /v1/models`，
+   `jq -ef /tmp/jq_filter` 校验 `object == "list"`。
+7. **切 nginx upstream**：`sed` 改 `127.0.0.1:1300X` 行 → `nginx -t` → `nginx -s reload`。
+8. **3s keepalive 老化**（让 nginx 与旧 slot 的连接走完）。
+9. **停旧 slot**：`systemctl stop`（SIGTERM → Phase 1 drainer 排空 in-flight）。
+10. **公网端到端验证**：`curl 127.0.0.1:3002/health` + `:3003/`。
+11. **镜像清理**：保留最近 5 个版本 + `pstep-gateway:latest` 指向的 image ID（必须保护，否则 :latest 变 dangling，下一轮 deploy slot 启动报 "short-name did not resolve to an alias"）。
+
+### 双路镜像分发
+
+- **scp 直传**（主路径）：runner `docker save` → `scp` 到 server → `podman load`。
+  国内服务器拉 GHCR 慢（实测 ~10KB/s），所以走 scp；服务器侧 `podman load` 而非 `podman pull`。
+- **GHCR 推**（`ghcr.io/panda2877/pstep-gateway`，异地备份）：全量保留，不清理；用于跨服务器容灾分发。
+
+### 触发条件
+
+push 到 main 时，以下任一路径变化触发：
 
 ```
 src/**  frontend/**  Cargo.toml  Cargo.lock  Makefile
-Containerfile  .containerignore  quadlet/**  .github/workflows/deploy.yml
+Containerfile  .containerignore  quadlet/**  nginx/**  .github/workflows/deploy.yml
 ```
 
-**容器形态**（[quadlet/pstep-gateway.container](quadlet/pstep-gateway.container)）：
+也可手动 `gh workflow run deploy.yml`。
+
+### 容器形态
 
 - 基础镜像：`gcr.io/distroless/cc-debian12:nonroot`（无 shell，UID 65532）
-- `Image=pstep-gateway:latest`（**本地镜像**，由 deploy 脚本 load 后 tag 为 latest；不会自动 pull）
+- `Image=pstep-gateway:latest`（**本地镜像**，由 deploy 脚本 load 后 tag 为 latest）
 - 加固：`ReadOnly=true` / `NoNewPrivileges=true` / `DropCapability=ALL`
 - 挂载：
-  - `/etc/pstep-gateway:/etc/pstep-gateway:ro`（config；需 `chmod 644`，因为 distroless 无 /etc/passwd）
-  - `/var/lib/pstep-gateway:/var/lib/pstep-gateway:rw`（SQLite；需 `chown 65532:65532`）
-- `Network=host`（直接监听 3002，简化反代）
+  - `/etc/pstep-gateway:/etc/pstep-gateway:ro`（config；需 `chmod 644`，distroless 无 /etc/passwd）
+  - `/var/lib/pstep-gateway-{a,b}:/var/lib/pstep-gateway:rw`（SQLite；需 `chown 65532:65532`）
+- `Network=bridge` + `PublishPort=127.0.0.1:13004:3002`（A）或 `:13005:3002`（B）
+- `TimeoutStopSec=130`（必须 > 上游 reqwest 120s，否则慢请求会被 SIGKILL）
 - `Restart=always`，5 秒重试
 
-**手动滚动/回滚**（一般不需要）：
+Quadlet 单元文件：
+- [quadlet/pstep-gateway-a.container](quadlet/pstep-gateway-a.container)
+- [quadlet/pstep-gateway-b.container](quadlet/pstep-gateway-b.container)
+
+nginx 站点：[nginx/sites-available/pstep-gateway](nginx/sites-available/pstep-gateway)
+（部署到 `/etc/nginx/sites-enabled/pstep-gateway`；`keepalive 32` + `proxy_buffering off` SSE 友好）。
+
+### 手动切换 active slot
+
+```bash
+ssh root@134.175.163.213
+# 看当前指向
+sudo grep -E '127.0.0.1:1300[45]' /etc/nginx/sites-enabled/pstep-gateway
+# 手动切到 B（假设 A 当前是 active）
+sudo sed -i 's/127.0.0.1:13004/127.0.0.1:13005/' /etc/nginx/sites-enabled/pstep-gateway
+sudo nginx -t && sudo nginx -s reload
+```
+
+### 手动回滚（蓝绿只有 5 个本地版本）
 
 ```bash
 ssh root@134.175.163.213
 sudo podman images | grep pstep-gateway        # 本地最近 5 个版本
 sudo podman tag pstep-gateway:<旧sha> pstep-gateway:latest
-sudo systemctl restart pstep-gateway.service
+# 重启 standby slot（当前不在 nginx upstream 的那个）让它跑旧版本
+sudo systemctl restart pstep-gateway-b.service  # 或 -a
+# 等探针通过后切 upstream
 ```
 
-**从 GHCR 备份恢复**（新服务器 / 本地 5 个版本已全清的情况）：
+### 从 GHCR 备份恢复（新服务器 / 本地已全清）
 
 ```bash
 # 1. 服务器上登录 GHCR（PAT 需要 read:packages 权限）
@@ -273,9 +320,11 @@ sudo podman login ghcr.io -u <github-user>
 # 2. 拉指定版本
 sudo podman pull ghcr.io/panda2877/pstep-gateway:<sha>
 
-# 3. tag + restart
+# 3. tag + 触发蓝绿 deploy
 sudo podman tag ghcr.io/panda2877/pstep-gateway:<sha> pstep-gateway:latest
-sudo systemctl restart pstep-gateway.service
+# 走一次 deploy：scp 改过的 quadlet / nginx 文件 + 跑一次 workflow_dispatch，
+# 让 deploy 脚本去 systemctl start + nginx -s reload
+gh workflow run deploy.yml --ref main
 ```
 
 ---
@@ -286,5 +335,11 @@ sudo systemctl restart pstep-gateway.service
 - **改 `name` / `status` / `price_*` / `fallback_policy`**：热重载，下一次请求立即生效
 - **管理后台 `/api/admin/*` 目前无鉴权**：靠内网 + 反代保护；上线公网前必须加认证
 - **WAL 模式的 SQLite**：备份时建议用 `sqlite3 .backup` 或先停服（不要直接 `cp`）
-- **distroless 镜像调试**：`podman exec` 进不去（无 shell），看日志用 `journalctl -u pstep-gateway.service`
+- **distroless 镜像调试**：`podman exec` 进不去（无 shell），看日志用 `journalctl -u pstep-gateway-{a,b}.service`
 - **${ENV_VAR} 解析在启动时一次性完成**，运行中改环境变量需要重启
+- **蓝绿 deploy 调试**：deploy log 在 `##[error]Process completed with exit code 7` 这种
+  莫名其妙失败时，先看 `journalctl -u pstep-gateway-{a,b}` 是不是容器根本没起来
+  （image 没 tag 成 :latest 之类）。已知 trap 见 deploy.yml 注释。
+- **nginx 切流不会丢长连接**：`keepalive 32` + `proxy_buffering off`，
+  切流时旧连接走完再被新 worker 接管。已验证：ab -c 500 / 30M reqs 跨整个
+  cutover 窗口 0 失败。
