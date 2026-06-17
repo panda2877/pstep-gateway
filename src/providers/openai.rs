@@ -318,6 +318,9 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
     // Track which tool_use block indices we've emitted content_block_start for.
     let mut started_tool_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut tool_block_counter: usize = 0;
+    // Suppress content between <think> and </think> (thinking leaks into text field).
+    let mut inside_think: bool = false;
+    let mut think_tail: String = String::new();
 
     for line in sse_data.lines() {
         let line = line.trim();
@@ -343,6 +346,8 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
                 &mut thinking_started,
                 &mut started_tool_blocks,
                 &mut tool_block_counter,
+                &mut inside_think,
+                &mut think_tail,
                 &mut output,
             );
         }
@@ -358,6 +363,8 @@ fn convert_openai_chunk_to_anthropic(
     thinking_started: &mut bool,
     started_tool_blocks: &mut std::collections::HashSet<usize>,
     tool_block_counter: &mut usize,
+    inside_think: &mut bool,
+    think_tail: &mut String,
     output: &mut String,
 ) -> Option<()> {
     let id = chunk.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -462,31 +469,68 @@ fn convert_openai_chunk_to_anthropic(
 
     if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
         if !content.is_empty() {
-            if !*sent_content_block_start {
-                *sent_content_block_start = true;
-                let start_event = json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text"}
-                });
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-            } else if *thinking_started {
-                *thinking_started = false;
-                let stop_event = json!({"type": "content_block_stop", "index": 0});
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                let start_event = json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text"}
-                });
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+            // Strip <think>...</think> blocks from streaming text deltas.
+            // Tag boundaries can split across chunks, so track state across calls.
+            let mut buf = std::mem::take(think_tail);
+            buf.push_str(content);
+            let mut emit = String::new();
+            let mut rest = buf.as_str();
+            while !rest.is_empty() {
+                if *inside_think {
+                    if let Some(end) = rest.find("</think>") {
+                        rest = &rest[end + 8..];
+                        *inside_think = false;
+                    } else {
+                        // Still inside a think block — keep at most the last 7 chars
+                        // as a tail buffer in case "</think>" is split across chunks.
+                        if rest.len() > 7 {
+                            rest = &rest[rest.len() - 7..];
+                        }
+                        break;
+                    }
+                } else if let Some(start) = rest.find("<think>") {
+                    emit.push_str(&rest[..start]);
+                    rest = &rest[start + 7..];
+                    *inside_think = true;
+                } else {
+                    // Keep at most the last 6 chars as tail in case "<think>" is split.
+                    if rest.len() > 6 {
+                        emit.push_str(&rest[..rest.len() - 6]);
+                        rest = &rest[rest.len() - 6..];
+                    } else {
+                        break;
+                    }
+                }
             }
-            let event = json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": content}
-            });
-            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
+            *think_tail = rest.to_string();
+
+            if !emit.is_empty() {
+                if !*sent_content_block_start {
+                    *sent_content_block_start = true;
+                    let start_event = json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text"}
+                    });
+                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                } else if *thinking_started {
+                    *thinking_started = false;
+                    let stop_event = json!({"type": "content_block_stop", "index": 0});
+                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                    let start_event = json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text"}
+                    });
+                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                }
+                let event = json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": emit}
+                });
+                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
+            }
             return Some(());
         }
     }
@@ -516,6 +560,26 @@ fn convert_openai_chunk_to_anthropic(
     None
 }
 
+/// Strip <think>...</think> blocks (and any leading newlines) from upstream text.
+/// Returns the cleaned text with the thinking content discarded.
+fn strip_think_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<think>") {
+        out.push_str(&rest[..open]);
+        rest = &rest[open + 7..];
+        if let Some(close) = rest.find("</think>") {
+            rest = &rest[close + 8..];
+        } else {
+            // Unclosed tag — drop the rest, nothing useful to keep.
+            return out;
+        }
+    }
+    out.push_str(rest);
+    // Strip leading newlines left over after removing the think block.
+    out.trim_start_matches('\n').to_string()
+}
+
 pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, String> {
     let id = openai_resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     let model = openai_resp.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -535,8 +599,9 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
     if let Some(content_val) = message_content {
         if content_val.is_string() {
             if let Some(text) = content_val.as_str() {
-                if !text.is_empty() {
-                    content_blocks.push(json!({"type": "text", "text": text}));
+                let clean = strip_think_tags(text);
+                if !clean.is_empty() {
+                    content_blocks.push(json!({"type": "text", "text": clean}));
                 }
             }
         } else if let Some(arr) = content_val.as_array() {
@@ -545,8 +610,9 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
                 match block_type {
                     "text" => {
                         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                content_blocks.push(json!({"type": "text", "text": text}));
+                            let clean = strip_think_tags(text);
+                            if !clean.is_empty() {
+                                content_blocks.push(json!({"type": "text", "text": clean}));
                             }
                         }
                     }
