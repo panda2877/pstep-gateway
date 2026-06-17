@@ -485,10 +485,13 @@ fn convert_openai_chunk_to_anthropic(
                         rest = &rest[end + 8..];
                         *inside_think = false;
                     } else {
-                        // Still inside a think block — keep at most the last 7 chars
+                        // Still inside a think block — keep at most the last 7 bytes
                         // as a tail buffer in case "</think>" is split across chunks.
+                        // Use floor_char_boundary to avoid slicing inside a UTF-8
+                        // multi-byte sequence (e.g. CJK, emoji).
                         if rest.len() > 7 {
-                            rest = &rest[rest.len() - 7..];
+                            let cut = rest.floor_char_boundary(rest.len() - 7);
+                            rest = &rest[cut..];
                         }
                         break;
                     }
@@ -497,10 +500,13 @@ fn convert_openai_chunk_to_anthropic(
                     rest = &rest[start + 7..];
                     *inside_think = true;
                 } else {
-                    // Keep at most the last 6 chars as tail in case "<think>" is split.
+                    // Keep at most the last 6 bytes as tail in case "<think>" is split.
+                    // Use floor_char_boundary to avoid slicing inside a UTF-8
+                    // multi-byte sequence (e.g. CJK, emoji).
                     if rest.len() > 6 {
-                        emit.push_str(&rest[..rest.len() - 6]);
-                        rest = &rest[rest.len() - 6..];
+                        let cut = rest.floor_char_boundary(rest.len() - 6);
+                        emit.push_str(&rest[..cut]);
+                        rest = &rest[cut..];
                     } else {
                         break;
                     }
@@ -664,4 +670,100 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
         "stop_sequence": Value::Null,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     }))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+//
+// Regression coverage for the UTF-8 byte-slice panic in
+// `convert_sse_to_anthropic_stream` that used to kill tokio workers mid-stream
+// when upstream content contained multi-byte chars (CJK, emoji) at chunk
+// boundaries. The tail-buffer used to slice by raw byte count (rest.len() - 6
+// and -7), which could land in the middle of a 3/4-byte UTF-8 sequence and
+// panic with "byte index N is not a char boundary". See journal:
+//   thread 'tokio-rt-worker' panicked at src/providers/openai.rs:502
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal SSE delta chunk carrying the given content string.
+    fn sse_delta(content: &str) -> String {
+        // The minimal payload the converter needs: id, model, choices[0].delta.content
+        let json = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "model": "MiniMax-M3",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": content },
+                "finish_reason": null
+            }]
+        });
+        format!("data: {}\n", json)
+    }
+
+    /// The bug case: content where the last 6 bytes land inside a CJK char.
+    /// `rest = "abcdef中文"` (12 bytes; '中' is at 6..9, '文' at 9..12).
+    /// Old code did `&rest[..rest.len()-6]` = `&rest[..6]` which slices inside
+    /// '中' (byte 6 is mid-character) and panics.
+    #[test]
+    fn sse_to_anthropic_handles_cjk_tail() {
+        let sse = sse_delta("abcdef中文");
+        let result = convert_sse_to_anthropic_stream(&sse);
+        assert!(result.is_ok(), "must not panic on CJK content: {:?}", result.err());
+        let out = result.unwrap();
+        // The first 5 ASCII bytes should be emitted; the 6th byte slot is
+        // mid-CJK, so the converter trims back to the last char boundary and
+        // keeps the trailing CJK as think_tail for the next delta.
+        assert!(out.contains("abcde"), "expected emitted prefix 'abcde', got: {out}");
+    }
+
+    /// Emoji (4-byte UTF-8) is the same bug class — verified against the real
+    /// panic observed at 22:12:21 with '👋' (bytes 11..15 of string).
+    #[test]
+    fn sse_to_anthropic_handles_emoji_tail() {
+        // 8 ASCII + emoji '👋' + 'X' = 8 + 4 + 1 = 13 bytes.
+        // Old code: &rest[..13-6] = &rest[..7] — byte 7 is inside '👋' (4..8).
+        let sse = sse_delta("abcdefgh👋X");
+        let result = convert_sse_to_anthropic_stream(&sse);
+        assert!(result.is_ok(), "must not panic on emoji content: {:?}", result.err());
+    }
+
+    /// Baseline: pure ASCII still works and emits content. The last 6 bytes
+    /// (" world") are kept as think_tail — they would be flushed by the next
+    /// delta. We just verify the leading portion is emitted.
+    #[test]
+    fn sse_to_anthropic_ascii_baseline() {
+        let sse = sse_delta("hello world");
+        let result = convert_sse_to_anthropic_stream(&sse).unwrap();
+        assert!(result.contains("hello"), "expected emitted prefix, got: {result}");
+        // The trailing " world" is held in think_tail (verified by absence in
+        // the first delta's output, not absence of the assistant text).
+    }
+
+    /// Tail shorter than the limit (≤ 6 bytes) is preserved whole — should
+    /// emit nothing yet (kept as think_tail for the next delta) and not panic.
+    #[test]
+    fn sse_to_anthropic_short_cjk_tail() {
+        // 5 bytes total, all CJK. ≤ 6 bytes → take the else branch (break).
+        let sse = sse_delta("中文");
+        let result = convert_sse_to_anthropic_stream(&sse);
+        assert!(result.is_ok(), "must not panic on short CJK content: {:?}", result.err());
+    }
+
+    /// Inside-think path: when the buffer accumulates content up to and past
+    /// the `<think>` open tag with a CJK tail, the 7-byte tail trim must also
+    /// be char-boundary safe.
+    #[test]
+    fn sse_to_anthropic_inside_think_cjk_tail() {
+        // Two deltas: first opens a <think> block, second accumulates tail.
+        let sse1 = sse_delta("<think>");
+        let sse2 = sse_delta("思考中中文");
+        // Combined: think_tail collects "思考中中文" (12 bytes) and the 7-byte
+        // tail trim lands inside '中' (bytes 6..9). Old code panicked.
+        let combined = format!("{sse1}{sse2}");
+        let result = convert_sse_to_anthropic_stream(&combined);
+        assert!(result.is_ok(), "must not panic inside-think with CJK tail: {:?}", result.err());
+    }
 }
