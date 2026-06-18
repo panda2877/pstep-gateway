@@ -144,20 +144,16 @@ jobs:
           SCP="scp -i ~/.ssh/deploy_key"
 
           # ---- 1. 部署前端（主机 nginx 静态服务）----
-          # 用 scp 替代 rsync：scp 不需要目的端目录预存在，行为更确定。
-          # 上传 /tmp/admin-dist.tgz 让远端在 sshd 块里一次性解压+rsync。
+          # 直接 tar | ssh：避免 scp 在 GHA runner 上的隐式失败（无任何错误输出，
+          # 但远端就是收不到文件 —— 见 deploy run 27763581513 的 16 秒沉默 + 远端
+          # tar 找不到文件的诡异症状）。改成管道：tar 实时把数据通过 ssh 喂给
+          # 远端 sudo tar，少一个中间落地文件、少一次 scp handshake。
           echo "📦 部署前端 dist..."
-          tar -C ./artifacts/admin-dist -czf /tmp/admin-dist.tgz .
-          $SCP /tmp/admin-dist.tgz ${SERVER_USER}@${SERVER_HOST}:/tmp/admin-dist.tgz
-          rm -f /tmp/admin-dist.tgz
-
-          $SSHD '
-            set -e
-            sudo mkdir -p /opt/pstep/admin/dist
-            sudo tar -xzf /tmp/admin-dist.tgz -C /opt/pstep/admin/dist/
-            sudo rm -f /tmp/admin-dist.tgz
-            echo "✅ 前端 dist 已部署"
-          '
+          tar -C ./artifacts/admin-dist -czf - . | \
+            $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
+              'sudo mkdir -p /opt/pstep/admin/dist && \
+               sudo tar -xzf - -C /opt/pstep/admin/dist/ && \
+               echo "✅ 前端 dist 已部署"'
 
           # ---- 2. 推送 Quadlet 单元文件（双实例 a/b）----
           echo "📜 推送 Quadlet a/b..."
