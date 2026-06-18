@@ -139,7 +139,8 @@ jobs:
 
           SSHD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key ${SERVER_USER}@${SERVER_HOST}"
           SSHCMD="ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key"
-          SCP="scp -i ~/.ssh/deploy_key"
+          # 注：scp 在 GHA runner 上行为不可信（静默丢包 / CRC 错），下面所有上传
+          # 改用 cat | ssh 'cat > remote' 管道 + docker save | ssh 管道。
 
           # ---- 1. 部署前端（主机 nginx 静态服务）----
           # 直接 tar | ssh：避免 scp 在 GHA runner 上的隐式失败（无任何错误输出，
@@ -154,16 +155,19 @@ jobs:
                echo "✅ 前端 dist 已部署"'
 
           # ---- 2. 推送 Quadlet 单元文件（双实例 a/b）----
+          # 与 admin dist / image 同样的理由：GHA runner 上的 scp 会静默丢包
+          # （远端 install: cannot stat '/tmp/...': No such file or directory），
+          # 改成 cat | ssh 'cat > remote_path' 管道，set -o pipefail 任何字节错都立刻报。
           echo "📜 推送 Quadlet a/b..."
-          $SCP quadlet/pstep-gateway-a.container \
-            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway-a.container
-          $SCP quadlet/pstep-gateway-b.container \
-            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway-b.container
+          cat quadlet/pstep-gateway-a.container | \
+            $SSHCMD ${SERVER_USER}@${SERVER_HOST} 'cat > /tmp/pstep-gateway-a.container'
+          cat quadlet/pstep-gateway-b.container | \
+            $SSHCMD ${SERVER_USER}@${SERVER_HOST} 'cat > /tmp/pstep-gateway-b.container'
 
           # ---- 2.1 推送 nginx 蓝绿软切配置（首次部署才装）----
           echo "📜 推送 nginx pstep-gateway 站点配置..."
-          $SCP nginx/sites-available/pstep-gateway \
-            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.nginx
+          cat nginx/sites-available/pstep-gateway | \
+            $SSHCMD ${SERVER_USER}@${SERVER_HOST} 'cat > /tmp/pstep-gateway.nginx'
 
           # ---- 2.5 准备运行时目录（idempotent）----
           # config.yaml 需世界可读（distroless 以 UID 65532 运行，无 /etc/passwd 项）
