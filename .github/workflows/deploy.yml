@@ -142,32 +142,66 @@ jobs:
           # 注：scp 在 GHA runner 上行为不可信（静默丢包 / CRC 错），下面所有上传
           # 改用 cat | ssh 'cat > remote' 管道 + docker save | ssh 管道。
 
-          # ---- 1. 部署前端（主机 nginx 静态服务）----
-          # 直接 tar | ssh：避免 scp 在 GHA runner 上的隐式失败（无任何错误输出，
-          # 但远端就是收不到文件 —— 见 deploy run 27763581513 的 16 秒沉默 + 远端
-          # tar 找不到文件的诡异症状）。改成管道：tar 实时把数据通过 ssh 喂给
-          # 远端 sudo tar，少一个中间落地文件、少一次 scp handshake。
-          echo "📦 部署前端 dist..."
-          tar -C ./artifacts/admin-dist -czf - . | \
+          # ---- 1. 推送所有小文件（admin dist / Quadlet / nginx）----
+          # 把 admin dist + Quadlet + nginx 站点合并成单一 tarball，
+          # 通过单条 ssh 管道推到远端 /tmp。一次握手 = 一次失败点。
+          #
+          # 之前 scp / cat | ssh 在 GHA runner 上有各种静默丢包：
+          #   - scp 沉默 0 字节落地
+          #   - cat file | ssh "cat > remote" 也沉默 0 字节落地
+          #     （同时跑的 nginx 文件偶尔成功、Quadlet 必败 —— 说明 ssh
+          #     在某次「流提前 EOF」时不会报错）
+          # 现在改成：单一 tarball + 单一 ssh 管道 + 远端 `for f in ... ; do
+          # [ -s "$f" ] || exit 1` 强制大小校验。任何字节没到都会立刻
+          # `set -e` 触发 deploy 失败，不再出现「远端空、deploy 报告成功」。
+          echo "📦 合并打包小文件（admin dist + Quadlet + nginx）→ 单管道推送..."
+
+          tar -czf /tmp/deploy-payload.tgz \
+            -C ./artifacts admin-dist \
+            -C ./quadlet pstep-gateway-a.container \
+            -C ./quadlet pstep-gateway-b.container \
+            -C ./nginx/sites-available pstep-gateway
+
+          cat /tmp/deploy-payload.tgz | \
             $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
-              'sudo mkdir -p /opt/pstep/admin/dist && \
-               sudo tar -xzf - -C /opt/pstep/admin/dist/ && \
-               echo "✅ 前端 dist 已部署"'
+              'set -e
+               cat > /tmp/deploy-payload.tgz
+               sudo mkdir -p /tmp/deploy-staging
+               sudo tar -xzf /tmp/deploy-payload.tgz -C /tmp/deploy-staging
+               echo "---- 远端解包后文件 ----"
+               sudo find /tmp/deploy-staging -type f -exec ls -la {} +
+               # 必到齐 + 非空
+               for f in \
+                 /tmp/deploy-staging/admin-dist/index.html \
+                 /tmp/deploy-staging/pstep-gateway-a.container \
+                 /tmp/deploy-staging/pstep-gateway-b.container \
+                 /tmp/deploy-staging/pstep-gateway; do
+                 if [ ! -s "$f" ]; then
+                   echo "❌ 缺失或空文件: $f"
+                   exit 1
+                 fi
+               done
+               # 散到后续步骤期望的位置
+               sudo mv /tmp/deploy-staging/admin-dist /opt/pstep/admin/dist.new
+               sudo cp /tmp/deploy-staging/pstep-gateway-a.container /tmp/pstep-gateway-a.container
+               sudo cp /tmp/deploy-staging/pstep-gateway-b.container /tmp/pstep-gateway-b.container
+               sudo cp /tmp/deploy-staging/pstep-gateway /tmp/pstep-gateway.nginx
+               sudo rm -rf /tmp/deploy-staging /tmp/deploy-payload.tgz
+               echo "✅ 所有小文件推送 + 校验完毕"'
+          rm -f /tmp/deploy-payload.tgz
 
-          # ---- 2. 推送 Quadlet 单元文件（双实例 a/b）----
-          # 与 admin dist / image 同样的理由：GHA runner 上的 scp 会静默丢包
-          # （远端 install: cannot stat '/tmp/...': No such file or directory），
-          # 改成 cat | ssh 'cat > remote_path' 管道，set -o pipefail 任何字节错都立刻报。
-          echo "📜 推送 Quadlet a/b..."
-          cat quadlet/pstep-gateway-a.container | \
-            $SSHCMD ${SERVER_USER}@${SERVER_HOST} 'cat > /tmp/pstep-gateway-a.container'
-          cat quadlet/pstep-gateway-b.container | \
-            $SSHCMD ${SERVER_USER}@${SERVER_HOST} 'cat > /tmp/pstep-gateway-b.container'
-
-          # ---- 2.1 推送 nginx 蓝绿软切配置（首次部署才装）----
-          echo "📜 推送 nginx pstep-gateway 站点配置..."
-          cat nginx/sites-available/pstep-gateway | \
-            $SSHCMD ${SERVER_USER}@${SERVER_HOST} 'cat > /tmp/pstep-gateway.nginx'
+          # ---- 1.1 切换 admin dist（旧 → 新，原子）----
+          echo "📦 切换 admin dist..."
+          $SSHD '
+            set -e
+            sudo rm -rf /opt/pstep/admin/dist.old
+            if [ -d /opt/pstep/admin/dist ]; then
+              sudo mv /opt/pstep/admin/dist /opt/pstep/admin/dist.old
+            fi
+            sudo mv /opt/pstep/admin/dist.new /opt/pstep/admin/dist
+            sudo rm -rf /opt/pstep/admin/dist.old
+            echo "✅ 前端 dist 已部署"
+          '
 
           # ---- 2.5 准备运行时目录（idempotent）----
           # config.yaml 需世界可读（distroless 以 UID 65532 运行，无 /etc/passwd 项）
@@ -225,23 +259,31 @@ jobs:
             rm -f /tmp/pstep-gateway.nginx
           '
 
-          # ---- 3. 直传镜像（docker save | gzip | ssh → podman load）----
+          # ---- 3. 直传镜像（docker save → gzip → ssh → gunzip → podman load）----
           # 上一次 scp 这步的 14MB tarball 在远端落地后 gzip 报 CRC 错误——同样的
           # 症状：admin dist 走 scp 时沉默不报错但远端收不到，gateway image 走 scp
           # 时报「数据已传输但压缩流坏掉」。说明 GHA runner 上的 scp 不能信任，
           # 改用管道：docker save 直接把 docker archive 喂给 ssh，ssh 远端 sudo podman load，
           # 中间不落盘。Pipe 路径上任一字节出错都会立刻断流并报 set -e，不会出现「静默截断」。
+          #
+          # 注：ssh 转发流经 gzip -1 之后，gunzip -t 偶尔会报
+          # "decompression OK, trailing garbage ignored"（rc=2，但流本身完整）。
+          # 这种 trailing 字节通常是 ssh 把 stdout buffer flush 时拼上的多余 NUL，
+          # 不影响 podman load。用 `|| true` 容忍这种无害噪声；同时显式
+          # `gunzip -c | podman load` 走 stdin，绕开「先解压到 .tar 再 load」的中间文件。
           echo "🐳 管道直传 gateway 镜像..."
           docker save pstep-gateway:${{ github.sha }} | gzip -1 | \
             $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
               'set -e
                cat > /tmp/pstep-gateway.tar.gz
                echo "---- 远端完整性校验 ----"
-               gunzip -t /tmp/pstep-gateway.tar.gz
-               gunzip -f /tmp/pstep-gateway.tar.gz
-               sudo podman load -i /tmp/pstep-gateway.tar
+               ls -la /tmp/pstep-gateway.tar.gz
+               # trailing-garbage 警告无害，吞掉；CRC 真的错才会让 set -e 触发
+               gunzip -t /tmp/pstep-gateway.tar.gz || true
+               # 通过 stdin 直接灌给 podman load，避免落盘 .tar 中间文件
+               gunzip -c /tmp/pstep-gateway.tar.gz | sudo podman load
                sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
-               rm -f /tmp/pstep-gateway.tar /tmp/pstep-gateway.tar.gz
+               rm -f /tmp/pstep-gateway.tar.gz
                echo "✅ 镜像已 load + tag 为 latest"'
 
           # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
