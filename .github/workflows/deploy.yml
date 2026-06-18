@@ -144,17 +144,16 @@ jobs:
 
           # ---- 1. 推送所有小文件（admin dist / Quadlet / nginx）----
           # 把 admin dist + Quadlet + nginx 站点合并成单一 tarball，
-          # 通过单条 ssh 管道推到远端 /tmp。一次握手 = 一次失败点。
+          # 通过单条 ssh 管道推到远端 /tmp。一次 ssh = 一次失败点。
           #
-          # 之前 scp / cat | ssh 在 GHA runner 上有各种静默丢包：
-          #   - scp 沉默 0 字节落地
-          #   - cat file | ssh "cat > remote" 也沉默 0 字节落地
-          #     （同时跑的 nginx 文件偶尔成功、Quadlet 必败 —— 说明 ssh
-          #     在某次「流提前 EOF」时不会报错）
-          # 现在改成：单一 tarball + 单一 ssh 管道 + 远端 `for f in ... ; do
-          # [ -s "$f" ] || exit 1` 强制大小校验。任何字节没到都会立刻
-          # `set -e` 触发 deploy 失败，不再出现「远端空、deploy 报告成功」。
-          echo "📦 合并打包小文件（admin dist + Quadlet + nginx）→ 单管道推送..."
+          # 之前分两步走「bundle 推送 → 切换 dist → setup dirs」踩坑了：
+          # 第一个 ssh session 把 staging 里的文件 cp 到 /tmp/ 后，第二个
+          # ssh session 看不到这些 cp 出来的文件 —— 不是权限问题，
+          # 看着像某些情况下 GHA runner 上的 sudo cp 会沉默丢文件。
+          # 现在把全部事情（收 tarball、extract、校验、切换 dist、
+          # install Quadlet/install nginx/setup dirs/daemon-reload）
+          # 全塞进一个 ssh session。一次推到位，无中间 cp 落地。
+          echo "📦 合并打包 + 推送 + 一次性部署（admin dist + Quadlet + nginx）..."
 
           tar -czf /tmp/deploy-payload.tgz \
             -C "$GITHUB_WORKSPACE/artifacts" admin-dist \
@@ -163,101 +162,85 @@ jobs:
             -C "$GITHUB_WORKSPACE/nginx/sites-available" pstep-gateway
 
           cat /tmp/deploy-payload.tgz | \
-            $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
-              'set -e
-               cat > /tmp/deploy-payload.tgz
-               sudo mkdir -p /tmp/deploy-staging
-               sudo tar -xzf /tmp/deploy-payload.tgz -C /tmp/deploy-staging
-               echo "---- 远端解包后文件 ----"
-               sudo find /tmp/deploy-staging -type f -exec ls -la {} +
-               # 必到齐 + 非空
-               for f in \
-                 /tmp/deploy-staging/admin-dist/index.html \
-                 /tmp/deploy-staging/pstep-gateway-a.container \
-                 /tmp/deploy-staging/pstep-gateway-b.container \
-                 /tmp/deploy-staging/pstep-gateway; do
-                 if [ ! -s "$f" ]; then
-                   echo "❌ 缺失或空文件: $f"
-                   exit 1
-                 fi
-               done
-               # 散到后续步骤期望的位置
-               sudo mv /tmp/deploy-staging/admin-dist /opt/pstep/admin/dist.new
-               sudo cp /tmp/deploy-staging/pstep-gateway-a.container /tmp/pstep-gateway-a.container
-               sudo cp /tmp/deploy-staging/pstep-gateway-b.container /tmp/pstep-gateway-b.container
-               sudo cp /tmp/deploy-staging/pstep-gateway /tmp/pstep-gateway.nginx
-               sudo rm -rf /tmp/deploy-staging /tmp/deploy-payload.tgz
-               echo "✅ 所有小文件推送 + 校验完毕"'
+            $SSHCMD ${SERVER_USER}@${SERVER_HOST} '
+              set -e
+
+              # ---- 1.1 收 tarball + 解到 staging ----
+              cat > /tmp/deploy-payload.tgz
+              sudo rm -rf /tmp/deploy-staging
+              sudo mkdir -p /tmp/deploy-staging
+              sudo tar -xzf /tmp/deploy-payload.tgz -C /tmp/deploy-staging
+              echo "---- 远端解包后文件 ----"
+              sudo find /tmp/deploy-staging -type f -exec ls -la {} +
+
+              # 必到齐 + 非空（任何缺失立刻 set -e 触发失败）
+              for f in \
+                /tmp/deploy-staging/admin-dist/index.html \
+                /tmp/deploy-staging/pstep-gateway-a.container \
+                /tmp/deploy-staging/pstep-gateway-b.container \
+                /tmp/deploy-staging/pstep-gateway; do
+                if [ ! -s "$f" ]; then
+                  echo "❌ 缺失或空文件: $f"
+                  exit 1
+                fi
+              done
+
+              # ---- 1.2 切换 admin dist（旧 → new，原子）----
+              sudo rm -rf /opt/pstep/admin/dist.old
+              if [ -d /opt/pstep/admin/dist ]; then
+                sudo mv /opt/pstep/admin/dist /opt/pstep/admin/dist.old
+              fi
+              sudo mv /tmp/deploy-staging/admin-dist /opt/pstep/admin/dist
+              sudo rm -rf /opt/pstep/admin/dist.old
+
+              # ---- 1.3 install Quadlet 单元 ----
+              sudo mkdir -p /etc/containers/systemd/pstep
+              sudo install -m 0644 /tmp/deploy-staging/pstep-gateway-a.container \
+                /etc/containers/systemd/pstep/pstep-gateway-a.container
+              sudo install -m 0644 /tmp/deploy-staging/pstep-gateway-b.container \
+                /etc/containers/systemd/pstep/pstep-gateway-b.container
+              sudo systemctl daemon-reload
+
+              # ---- 1.4 install nginx 站点（首次启用 + 后续覆盖源文件）----
+              sudo install -m 0644 /tmp/deploy-staging/pstep-gateway \
+                /etc/nginx/sites-available/pstep-gateway
+              if [ ! -e /etc/nginx/sites-enabled/pstep-gateway ]; then
+                sudo ln -sf /etc/nginx/sites-available/pstep-gateway \
+                            /etc/nginx/sites-enabled/pstep-gateway
+                # 首次启用：nginx -t 预检，reload 切流
+                sudo nginx -t
+                sudo systemctl reload nginx
+                echo "✅ nginx pstep-gateway 站点首次启用"
+              fi
+
+              # ---- 1.5 准备运行时目录 ----
+              # config.yaml 需世界可读（distroless 以 UID 65532 运行，无 /etc/passwd 项）
+              # /var/lib/pstep-gateway-{a,b} 需 chown 65532 让 usage_db 能写
+              if [ -f /etc/pstep-gateway/config.yaml ]; then
+                sudo chmod 644 /etc/pstep-gateway/config.yaml
+              fi
+              sudo mkdir -p /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
+              sudo chown 65532:65532 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
+              sudo chmod 755 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
+
+              # ---- 1.6 迁移期：停掉老的单实例 pstep-gateway.service ----
+              if sudo systemctl is-active --quiet pstep-gateway.service 2>/dev/null; then
+                echo "🔁 检测到旧 pstep-gateway.service 在跑，迁移到蓝绿..."
+                sudo systemctl stop pstep-gateway.service || true
+                sudo systemctl disable pstep-gateway.service 2>/dev/null || true
+                sudo podman rm -f pstep-gateway 2>/dev/null || true
+                echo "✅ 旧单实例已停"
+              fi
+
+              # ---- 1.7 清 staging ----
+              sudo rm -rf /tmp/deploy-staging /tmp/deploy-payload.tgz
+              echo "✅ 小文件部署 + Quadlet install + nginx install + dirs setup 全部完成"
+            '
           rm -f /tmp/deploy-payload.tgz
 
-          # ---- 1.1 切换 admin dist（旧 → 新，原子）----
-          echo "📦 切换 admin dist..."
-          $SSHD '
-            set -e
-            sudo rm -rf /opt/pstep/admin/dist.old
-            if [ -d /opt/pstep/admin/dist ]; then
-              sudo mv /opt/pstep/admin/dist /opt/pstep/admin/dist.old
-            fi
-            sudo mv /opt/pstep/admin/dist.new /opt/pstep/admin/dist
-            sudo rm -rf /opt/pstep/admin/dist.old
-            echo "✅ 前端 dist 已部署"
-          '
-
-          # ---- 2.5 准备运行时目录（idempotent）----
-          # config.yaml 需世界可读（distroless 以 UID 65532 运行，无 /etc/passwd 项）
-          # /var/lib/pstep-gateway-{a,b} 需 chown 65532 让 usage_db 能写
-          echo "🔧 准备运行时目录..."
-          $SSHD '
-            set -e
-            if [ -f /etc/pstep-gateway/config.yaml ]; then
-              sudo chmod 644 /etc/pstep-gateway/config.yaml
-            fi
-            # 蓝绿双 slot 各自的 SQLite 目录
-            sudo mkdir -p /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
-            sudo chown 65532:65532 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
-            sudo chmod 755 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
-
-            # Quadlet
-            sudo mkdir -p /etc/containers/systemd/pstep
-            sudo install -m 0644 /tmp/pstep-gateway-a.container \
-              /etc/containers/systemd/pstep/pstep-gateway-a.container
-            sudo install -m 0644 /tmp/pstep-gateway-b.container \
-              /etc/containers/systemd/pstep/pstep-gateway-b.container
-            rm -f /tmp/pstep-gateway-a.container /tmp/pstep-gateway-b.container
-            sudo systemctl daemon-reload
-
-            # ---- 迁移期：停掉老的单实例 pstep-gateway.service ----
-            # 第一次部署蓝绿版时：旧 .container 文件已不存在（被新的 a/b 替代），
-            # 但 daemon-reload 不会自动停掉已 active 的旧 service。
-            # 这里主动停，避免它继续占着 3002 与新 nginx 站点冲突。
-            if sudo systemctl is-active --quiet pstep-gateway.service 2>/dev/null; then
-              echo "🔁 检测到旧 pstep-gateway.service 在跑，迁移到蓝绿..."
-              sudo systemctl stop pstep-gateway.service || true
-              sudo systemctl disable pstep-gateway.service 2>/dev/null || true
-              sudo podman rm -f pstep-gateway 2>/dev/null || true
-              echo "✅ 旧单实例已停"
-            fi
-
-            # nginx 站点（仅首次或文件不存在时启用）
-            if [ ! -e /etc/nginx/sites-enabled/pstep-gateway ]; then
-              sudo install -m 0644 /tmp/pstep-gateway.nginx \
-                /etc/nginx/sites-available/pstep-gateway
-              sudo ln -sf /etc/nginx/sites-available/pstep-gateway \
-                          /etc/nginx/sites-enabled/pstep-gateway
-              # 首次安装：移除可能冲突的旧 :3002 监听（pstep-admin 的
-              # 0.0.0.0:3003 server_name_* 不会冲突，但 134.175.163.213 上
-              # 3002 之前是 gateway 直连，nginx 第一次切上去会冲突 0.0.0.0:3002）
-              # 用 nginx -t 预检，发现冲突就 fail 让人介入。
-              sudo nginx -t
-              sudo systemctl reload nginx
-              echo "✅ nginx pstep-gateway 站点已启用"
-            else
-              # 后续 deploy：仅同步源文件，不动 enable
-              sudo install -m 0644 /tmp/pstep-gateway.nginx \
-                /etc/nginx/sites-available/pstep-gateway
-            fi
-            rm -f /tmp/pstep-gateway.nginx
-          '
+          # ---- 2.5 (旧) 准备运行时目录 ----
+          # 上面的 ssh session 已经做完这件事；保留这段只是占位，不再发 ssh。
+          echo "🔧 准备运行时目录（已在上一步完成，跳过）"
 
           # ---- 3. 直传镜像（docker save → gzip → ssh → gunzip → podman load）----
           # 上一次 scp 这步的 14MB tarball 在远端落地后 gzip 报 CRC 错误——同样的
