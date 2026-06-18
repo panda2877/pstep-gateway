@@ -101,8 +101,13 @@ jobs:
           push: false       # 不直推；通过本地 load → save + push 两路分发
           load: true        # 加载到 runner 的 docker daemon，供下面 save / push 用
           tags: pstep-gateway:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Explicit per-commit cache key. Without a key, GHA auto-generates one
+          # and reuses the same cache across commits, which caused a serious
+          # regression: a previous build's binary (b346c535cb5f) was shipped
+          # tagged with a later commit's SHA. The per-commit key ensures
+          # cargo's build layer can never be reused across commits.
+          cache-from: type=gha,key=buildx-${{ github.sha }}
+          cache-to: type=gha,mode=max,key=buildx-${{ github.sha }}
 
       - name: Save image to tar.gz (for scp)
         run: |
@@ -247,10 +252,11 @@ jobs:
 
             NGINX_CONF=/etc/nginx/sites-enabled/pstep-gateway
             # slot A 暴露 127.0.0.1:13004，slot B 暴露 127.0.0.1:13005。
-            # 解析 nginx upstream 当前指向哪个端口。
-            ACTIVE_PORT=$(sudo grep -oE "127.0.0.1:(13004|13005)" "$NGINX_CONF" | head -1 | cut -d: -f2)
+            # 解析 nginx upstream 当前指向哪个端口（匹配带 "# ACTIVE" 标记的那一行；
+            # 双 upstream 设计下两行 server 同时存在，必须靠注释定位 active）。
+            ACTIVE_PORT=$(sudo grep -E "127\.0\.0\.1:(13004|13005).*# ACTIVE" "$NGINX_CONF" | head -1 | grep -oE "127\.0\.0\.1:(13004|13005)" | cut -d: -f2)
             if [ -z "$ACTIVE_PORT" ]; then
-              echo "❌ 无法从 $NGINX_CONF 解析当前 active 端口，退出"
+              echo "❌ 无法从 $NGINX_CONF 解析当前 active 端口（找不到带 # ACTIVE 标记的行），退出"
               exit 1
             fi
             echo "🔍 当前 active 端口: $ACTIVE_PORT"
@@ -337,8 +343,18 @@ jobs:
             fi
 
             # ---- 4.3 切 nginx upstream ----
-            echo "🔀 切 nginx upstream → $STANDBY_PORT..."
-            sudo sed -i "s/127.0.0.1:13004/127.0.0.1:$STANDBY_PORT/; s/127.0.0.1:13005/127.0.0.1:$STANDBY_PORT/" "$NGINX_CONF"
+            # 双 upstream 设计：两行 server 同时存在（互备 failover 用），每次切流
+            # 是 **ACTIVE 和 STANDBY 角色互换** —— 不是只把 ACTIVE 行改成 standby port。
+            # 否则切流一次后两行 server 都指向同一 port，退化回单 slot。
+            #
+            # 用 python 做行级 swap。脚本通过 base64 注入 /tmp（避免 heredoc 在
+            # $SSHD single-quoted 块里被 YAML 块字符串规则误判）。
+            echo "🔀 切 nginx upstream：ACTIVE $ACTIVE_PORT ↔ STANDBY $STANDBY_PORT..."
+            SWAP_B64="IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwppbXBvcnQgc3lzLCBwYXRobGliYgoKaWYgbGVuKHN5cy5hcmd2KSAhPSA0OgogICAgcHJpbnQoInVzYWdlOiBzd2FwLXVwc3RyZWFtLnB5IDxuZ2lueF9jb25mPiA8YWN0aXZlX3BvcnQ+IDxzdGFuZGJ5X3BvcnQ+IiwgZmlsZT1zeXMuc3RkZXJyKQogICAgc3lzLmV4aXQoMikKCmNvbmZfcGF0aCwgYWN0aXZlX3BvcnQsIHN0YW5kYnlfcG9ydCA9IHN5cy5hcmd2WzFdLCBzeXMuYXJndlsyXSwgc3lzLmFyZ3ZbM10KcCA9IHBhdGhsaWIuUGF0aChjb25mX3BhdGgpCnNyYyA9IHAucmVhZF90ZXh0KCkKb3V0ID0gW10KZm9yIGxpbmUgaW4gc3JjLnNwbGl0bGluZXMoa2VlcGVuZHM9VHJ1ZSk6CiAgICBpZiBmIjEyNy4wLjAuMTp7YWN0aXZlX3BvcnR9IiBpbiBsaW5lIGFuZCAiIyBBQ1RJVkUiIGluIGxpbmU6CiAgICAgICAgb3V0LmFwcGVuZChsaW5lLnJlcGxhY2UoZiIxMjcuMC4wLjE6e2FjdGl2ZV9wb3J0fSIsIGYiMTI3LjAuMC4xOntzdGFuZGJ5X3BvcnR9IikpCiAgICBlbGlmIGYiMTI3LjAuMC4xOntzdGFuZGJ5X3BvcnR9IiBpbiBsaW5lIGFuZCAiIyBTVEFOREJZIiBpbiBsaW5lOgogICAgICAgIG91dC5hcHBlbmQobGluZS5yZXBsYWNlKGYiMTI3LjAuMC4xOntzdGFuZGJ5X3BvcnR9IiwgZiIxMjcuMC4wLjE6e2FjdGl2ZV9wb3J0fSIpKQogICAgZWxzZToKICAgICAgICBvdXQuYXBwZW5kKGxpbmUpCnAud3JpdGVfdGV4dCgiIi5qb2luKG91dCkpCnByaW50KGYic3dhcCBkb25lOiBBQ1RJVkUge2FjdGl2ZV9wb3J0fSDihpQgU1RBTkRCWSB7c3RhbmRieV9wb3J0fSIp"
+            echo "$SWAP_B64" | sudo tee /tmp/swap-upstream.py.b64 >/dev/null
+            sudo base64 -d /tmp/swap-upstream.py.b64 > /tmp/swap-upstream.py
+            sudo chmod +x /tmp/swap-upstream.py
+            sudo /tmp/swap-upstream.py "$NGINX_CONF" "$ACTIVE_PORT" "$STANDBY_PORT"
             sudo nginx -t
             sudo nginx -s reload
 
@@ -346,10 +362,24 @@ jobs:
             echo "⏳ 等 3s 让旧连接走完..."
             sleep 3
 
-            # ---- 4.5 停掉旧 slot（SIGTERM，drainer 等 in-flight 走完）----
-            echo "🛑 停掉旧 slot $OLD_UNIT (Phase 1 drainer 接管)..."
-            sudo systemctl stop "$OLD_UNIT" || true
-            sudo podman rm -f "$OLD_CONTAINER" 2>/dev/null || true
+            # ---- 4.5 restart 旧 active slot，让它升到 :latest（双 slot 互备必须保留两边）----
+            # 不能 stop：双 upstream 设计下 nginx 仍指向另一 slot，但旧 slot 占着 1300X 端口、
+            # 万一另一 slot 死了就没有 failover 兜底。改成 restart：SIGTERM drain in-flight，
+            # 再 systemctl start 起来跑 :latest。restart 完确认端口重新 listen 才继续。
+            echo "🔄 restart 旧 active slot $OLD_UNIT，让它升到 :latest（双 slot 互备保留两边）..."
+            sudo systemctl restart "$OLD_UNIT"
+            for i in $(seq 1 15); do
+              if sudo ss -tln 2>/dev/null | grep -q "127.0.0.1:$ACTIVE_PORT\b"; then
+                echo "✅ 旧 active slot $OLD_UNIT 已重新起来（attempt $i）"
+                break
+              fi
+              sleep 1
+            done
+            if ! sudo ss -tln 2>/dev/null | grep -q "127.0.0.1:$ACTIVE_PORT\b"; then
+              echo "❌ 旧 active slot $OLD_UNIT restart 后端口 $ACTIVE_PORT 仍未监听"
+              sudo journalctl -u "$OLD_UNIT" --no-pager -n 40 || true
+              exit 1
+            fi
 
             # ---- 4.6 公网端到端验证 ----
             echo "🌐 公网健康检查..."
@@ -360,6 +390,18 @@ jobs:
               exit 1
             fi
             echo "✅ Gateway 公网 3002 OK"
+
+            # 双 slot 互备：必须两个端口都健康，否则下一次 deploy 之前没有 failover 兜底
+            if ! curl -sf -m 2 http://127.0.0.1:13004/health > /dev/null; then
+              echo "❌ Slot A (13004) 健康检查失败（双 slot 互备要求两边都活）"
+              exit 1
+            fi
+            echo "✅ Slot A (13004) OK"
+            if ! curl -sf -m 2 http://127.0.0.1:13005/health > /dev/null; then
+              echo "❌ Slot B (13005) 健康检查失败（双 slot 互备要求两边都活）"
+              exit 1
+            fi
+            echo "✅ Slot B (13005) OK"
 
             if ! curl -sf http://127.0.0.1:3003/ > /dev/null; then
               echo "❌ Frontend check failed"
@@ -385,7 +427,7 @@ jobs:
               | grep -v "^${LATEST_ID}$" \
               | xargs -r sudo podman rmi -f > /dev/null 2>&1 || true
 
-            echo "✅ 蓝绿部署完成（active=$STANDBY_PORT）"
+            echo "✅ 蓝绿部署完成（active=$STANDBY_PORT，standby=$ACTIVE_PORT 都跑 :latest）"
           '
 
       - name: Cleanup local artifacts
