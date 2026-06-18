@@ -157,10 +157,10 @@ jobs:
           echo "📦 合并打包小文件（admin dist + Quadlet + nginx）→ 单管道推送..."
 
           tar -czf /tmp/deploy-payload.tgz \
-            -C ./artifacts admin-dist \
-            -C ./quadlet pstep-gateway-a.container \
-            -C ./quadlet pstep-gateway-b.container \
-            -C ./nginx/sites-available pstep-gateway
+            -C "$GITHUB_WORKSPACE/artifacts" admin-dist \
+            -C "$GITHUB_WORKSPACE/quadlet" pstep-gateway-a.container \
+            -C "$GITHUB_WORKSPACE/quadlet" pstep-gateway-b.container \
+            -C "$GITHUB_WORKSPACE/nginx/sites-available" pstep-gateway
 
           cat /tmp/deploy-payload.tgz | \
             $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
