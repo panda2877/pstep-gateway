@@ -109,11 +109,9 @@ jobs:
           cache-from: type=gha,key=buildx-${{ github.sha }}
           cache-to: type=gha,mode=max,key=buildx-${{ github.sha }}
 
-      - name: Save image to tar.gz (for scp)
+      - name: Verify image built
         run: |
-          docker save pstep-gateway:${{ github.sha }} > /tmp/pstep-gateway.tar
-          gzip -1 /tmp/pstep-gateway.tar
-          ls -lh /tmp/pstep-gateway.tar.gz
+          docker images pstep-gateway:${{ github.sha }} --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.ID}}"
 
       - name: Push image to GHCR (off-site backup, full retention)
         run: |
@@ -223,10 +221,24 @@ jobs:
             rm -f /tmp/pstep-gateway.nginx
           '
 
-          # ---- 3. 直传镜像 ----
-          echo "🐳 直传 gateway 镜像..."
-          $SCP /tmp/pstep-gateway.tar.gz \
-            ${SERVER_USER}@${SERVER_HOST}:/tmp/pstep-gateway.tar.gz
+          # ---- 3. 直传镜像（docker save | gzip | ssh → podman load）----
+          # 上一次 scp 这步的 14MB tarball 在远端落地后 gzip 报 CRC 错误——同样的
+          # 症状：admin dist 走 scp 时沉默不报错但远端收不到，gateway image 走 scp
+          # 时报「数据已传输但压缩流坏掉」。说明 GHA runner 上的 scp 不能信任，
+          # 改用管道：docker save 直接把 docker archive 喂给 ssh，ssh 远端 sudo podman load，
+          # 中间不落盘。Pipe 路径上任一字节出错都会立刻断流并报 set -e，不会出现「静默截断」。
+          echo "🐳 管道直传 gateway 镜像..."
+          docker save pstep-gateway:${{ github.sha }} | gzip -1 | \
+            $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
+              'set -e
+               cat > /tmp/pstep-gateway.tar.gz
+               echo "---- 远端完整性校验 ----"
+               gunzip -t /tmp/pstep-gateway.tar.gz
+               gunzip -f /tmp/pstep-gateway.tar.gz
+               sudo podman load -i /tmp/pstep-gateway.tar
+               sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
+               rm -f /tmp/pstep-gateway.tar /tmp/pstep-gateway.tar.gz
+               echo "✅ 镜像已 load + tag 为 latest"'
 
           # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
           # 蓝绿流程：
@@ -240,11 +252,8 @@ jobs:
           $SSHD '
             set -e
 
-            echo "📥 load 新镜像..."
-            gunzip -f /tmp/pstep-gateway.tar.gz
-            sudo podman load -i /tmp/pstep-gateway.tar
-            sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
-            rm -f /tmp/pstep-gateway.tar
+            # 镜像已由上面 docker save | gzip | ssh 管道 load + tag 完毕。
+            # 这里直接进入蓝绿切流流程。
 
             NGINX_CONF=/etc/nginx/sites-enabled/pstep-gateway
             # slot A 暴露 127.0.0.1:13004，slot B 暴露 127.0.0.1:13005。
