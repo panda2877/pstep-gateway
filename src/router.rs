@@ -149,7 +149,26 @@ impl Router {
             }
 
             let upstream = target_route.as_upstream();
-            match providers::proxy(&upstream, &target_route.model, body, format).await {
+            // SSE 转换（convert_sse_*_stream）是纯 CPU 用户态循环，跑多久占 worker 多久。
+            // v7 之前 4 worker 同时撞上 → 全进 R/wchan=0 → timer wheel 不转 → 永久 wedge。
+            // v8：把转换塞 spawn_blocking，释放 tokio worker 让 reqwest timeout 等定时器跑。
+            let proxy_upstream = upstream.clone();
+            let proxy_target_model = target_route.model.clone();
+            let proxy_body = body.to_string();
+            let proxy_format = format;
+            let proxy_result = tokio::task::spawn_blocking(move || {
+                // providers::proxy 内部已经是阻塞 + .await 混合，但 SSE 转换这一段
+                // 是纯 CPU，跑在 blocking pool 里不会占 tokio worker 槽。
+                tokio::runtime::Handle::current().block_on(providers::proxy(
+                    &proxy_upstream,
+                    &proxy_target_model,
+                    &proxy_body,
+                    proxy_format,
+                ))
+            })
+            .await
+            .map_err(|e| format!("blocking task join 失败: {}", e))?;
+            match proxy_result {
                 Ok((response, usage)) => {
                     *self.last_failover.write().await = i > 0;
 
@@ -257,9 +276,22 @@ impl Router {
             }
 
             let upstream = target_route.as_upstream();
-            match providers::proxy_non_stream(&upstream, &target_route.model, body, format)
-                .await
-            {
+            // 同 stream 路径：转换 SSE 这段 CPU work 跑在 blocking pool，详见上注释。
+            let proxy_upstream = upstream.clone();
+            let proxy_target_model = target_route.model.clone();
+            let proxy_body = body.to_string();
+            let proxy_format = format;
+            let proxy_result = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(providers::proxy_non_stream(
+                    &proxy_upstream,
+                    &proxy_target_model,
+                    &proxy_body,
+                    proxy_format,
+                ))
+            })
+            .await
+            .map_err(|e| format!("blocking task join 失败: {}", e))?;
+            match proxy_result {
                 Ok((response, usage)) => {
                     *self.last_failover.write().await = i > 0;
 

@@ -236,7 +236,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn build_client() -> Result<Client, String> {
     Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(70))
         .build()
         .map_err(|e| e.to_string())
 }

@@ -153,17 +153,33 @@ pub struct AppState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // 抓 panic 到 stderr + backtrace。否则 deadlock 复发时只能看到 "futex_wait"
-    // 看不到是哪个 .unwrap() 触发的（参见 memory `tokio-worker-futex-wedge`）。
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!(
-            "\n🔥 PANIC at {}",
+    // 抓 panic 到 stderr + backtrace + 文件。否则 deadlock 复发时只能看到
+    // "futex_wait" 看不到是哪个 .unwrap() 触发的（参见 memory
+    // `tokio-worker-futex-wedge`）。distroless 容器 journald 不一定抓到 stderr
+    // （v7 已经踩过），写文件 SIGKILL 也还在，事后能 `cat panic.log` 看到。
+    let panic_log_path = std::path::PathBuf::from("/var/lib/pstep-gateway/panic.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let line = format!(
+            "\n🔥 PANIC at {}\n   payload: {:?}\n   backtrace:\n{:?}\n   ts_ms: {}\n",
             info.location()
                 .map(|l| l.to_string())
-                .unwrap_or_else(|| "unknown".into())
+                .unwrap_or_else(|| "unknown".into()),
+            info.payload(),
+            std::backtrace::Backtrace::force_capture(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
         );
-        eprintln!("   payload: {:?}", info.payload());
-        eprintln!("   backtrace:\n{:?}", std::backtrace::Backtrace::force_capture());
+        eprintln!("{}", line);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log_path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
     }));
 
     println!("╔══════════════════════════════════════╗");
@@ -319,8 +335,9 @@ async fn main() {
     //  4. axum::serve 的 future 退出，主进程返回
     //
     // 必须满足 TimeoutStopSec >= DRAIN_DEADLINE，否则 systemd 会 SIGKILL。
-    // 经验值：reqwest 上游超时 120s + 5s 缓冲 = 125s，quadlet 配 130s。
-    const DRAIN_DEADLINE_SECS: u64 = 120;
+    // 经验值：上游超时 70s + fallback 70s = 140s，handler 硬超时 150s 兜底。
+    // quadlet 配 TimeoutStopSec=160s 留 10s 余量给 SQLite 等。
+    const DRAIN_DEADLINE_SECS: u64 = 150;
     let counter_for_drain = in_flight.clone();
     let shutdown = async move {
         // 等 SIGTERM（或 SIGINT，方便本地 Ctrl-C 测试）。
@@ -352,8 +369,49 @@ async fn main() {
         }
     };
 
+    // 心跳日志：每 30s 写一条 in_flight / RSS / FD count 到 stderr。
+    // 下次 wedge 起来时，journald 里能看到"上一次心跳是 X 秒前"，精确知道
+    // wedge 起点，而不只是看 systemd SIGKILL 时间。
+    let started_at = std::time::Instant::now();
+    let hb_counter = in_flight.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.tick().await; // skip immediate first tick
+        loop {
+            ticker.tick().await;
+            let rss_mb = read_rss_mb().unwrap_or(0);
+            let fd_count = read_fd_count().unwrap_or(0);
+            tracing::info!(
+                target: "heartbeat",
+                in_flight = hb_counter.load(),
+                rss_mb,
+                fd_count,
+                uptime_s = started_at.elapsed().as_secs(),
+                "💓 heartbeat"
+            );
+        }
+    });
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
         .unwrap();
+}
+
+/// 读 /proc/self/statm 第二列（resident pages） × page_size，返回 MB。
+/// 失败返回 None，让调用方记 0。
+fn read_rss_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    if page_size == 0 {
+        return None;
+    }
+    Some((pages * page_size) / (1024 * 1024))
+}
+
+/// 读 /proc/self/fd 目录项数，作为 fd_count 近似值。
+fn read_fd_count() -> Option<u64> {
+    let c = std::fs::read_dir("/proc/self/fd").ok()?.count();
+    Some(c as u64)
 }

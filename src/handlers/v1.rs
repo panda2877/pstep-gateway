@@ -161,7 +161,7 @@ async fn provider_proxy(
     println!("🔄 [{}] -> {}", provider, target_url);
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(70))
         .build()
     {
         Ok(c) => c,
@@ -328,21 +328,27 @@ async fn chat_completions(
     let is_stream = body.stream;
     let body_str = serde_json::to_string(&body).unwrap();
 
+    // 硬超时兜底：就算 spawn_blocking + reqwest 70s 双双失败，handler 一定在
+    // 150s 内返回（worker 必然释放）。nginx proxy_read_timeout 是 300s，150s 留
+    // 一倍余量给客户端收 partial response。
+    const HANDLER_TIMEOUT: Duration = Duration::from_secs(150);
+
     if is_stream {
-        let result = state
-            .router
-            .route(
+        let result = tokio::time::timeout(
+            HANDLER_TIMEOUT,
+            state.router.route(
                 &model_name,
                 &body_str,
                 format,
                 auth.fallback_policy.as_deref(),
                 Some(&auth.key_id),
                 &state.api_key_quota,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         match result {
-            Ok(stream) => {
+            Ok(Ok(stream)) => {
                 let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
                 resp.headers_mut()
                     .insert("Content-Type", "text/event-stream".parse().unwrap());
@@ -356,7 +362,7 @@ async fn chat_completions(
                 }
                 resp
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": "bad_gateway",
@@ -364,22 +370,31 @@ async fn chat_completions(
                 })),
             )
                 .into_response(),
+            Err(_elapsed) => (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "gateway_timeout",
+                    "message": "handler exceeded 150s — upstream likely wedged"
+                })),
+            )
+                .into_response(),
         }
     } else {
-        let result = state
-            .router
-            .route_non_stream(
+        let result = tokio::time::timeout(
+            HANDLER_TIMEOUT,
+            state.router.route_non_stream(
                 &model_name,
                 &body_str,
                 format,
                 auth.fallback_policy.as_deref(),
                 Some(&auth.key_id),
                 &state.api_key_quota,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         match result {
-            Ok(response) => {
+            Ok(Ok(response)) => {
                 let mut resp = axum::response::Response::new(axum::body::Body::from(response));
                 resp.headers_mut()
                     .insert("Content-Type", "application/json".parse().unwrap());
@@ -389,11 +404,19 @@ async fn chat_completions(
                 }
                 resp
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": "bad_gateway",
                     "message": e.to_string()
+                })),
+            )
+                .into_response(),
+            Err(_elapsed) => (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "gateway_timeout",
+                    "message": "handler exceeded 150s — upstream likely wedged"
                 })),
             )
                 .into_response(),
@@ -415,21 +438,25 @@ async fn chat_completions_anthropic(
     let is_stream = body.stream == Some(true);
     let body_str = serde_json::to_string(&body).unwrap();
 
+    // 硬超时兜底，详见 chat_completions handler 同位置注释。
+    const HANDLER_TIMEOUT: Duration = Duration::from_secs(150);
+
     if is_stream {
-        let result = state
-            .router
-            .route(
+        let result = tokio::time::timeout(
+            HANDLER_TIMEOUT,
+            state.router.route(
                 &model_name,
                 &body_str,
                 OutputFormat::Anthropic,
                 auth.fallback_policy.as_deref(),
                 Some(&auth.key_id),
                 &state.api_key_quota,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         match result {
-            Ok(stream) => {
+            Ok(Ok(stream)) => {
                 let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
                 resp.headers_mut()
                     .insert("Content-Type", "text/event-stream".parse().unwrap());
@@ -443,7 +470,7 @@ async fn chat_completions_anthropic(
                 }
                 resp
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": "bad_gateway",
@@ -451,22 +478,31 @@ async fn chat_completions_anthropic(
                 })),
             )
                 .into_response(),
+            Err(_elapsed) => (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "gateway_timeout",
+                    "message": "handler exceeded 150s — upstream likely wedged"
+                })),
+            )
+                .into_response(),
         }
     } else {
-        let result = state
-            .router
-            .route_non_stream(
+        let result = tokio::time::timeout(
+            HANDLER_TIMEOUT,
+            state.router.route_non_stream(
                 &model_name,
                 &body_str,
                 OutputFormat::Anthropic,
                 auth.fallback_policy.as_deref(),
                 Some(&auth.key_id),
                 &state.api_key_quota,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         match result {
-            Ok(response) => {
+            Ok(Ok(response)) => {
                 let mut resp = axum::response::Response::new(axum::body::Body::from(response));
                 resp.headers_mut()
                     .insert("Content-Type", "application/json".parse().unwrap());
@@ -476,11 +512,19 @@ async fn chat_completions_anthropic(
                 }
                 resp
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": "bad_gateway",
                     "message": e.to_string()
+                })),
+            )
+                .into_response(),
+            Err(_elapsed) => (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "gateway_timeout",
+                    "message": "handler exceeded 150s — upstream likely wedged"
                 })),
             )
                 .into_response(),
