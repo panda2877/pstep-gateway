@@ -101,14 +101,15 @@ jobs:
           push: false       # 不直推；通过本地 load → save + push 两路分发
           load: true        # 加载到 runner 的 docker daemon，供下面 save / push 用
           tags: pstep-gateway:${{ github.sha }}
-          # Per-commit cache key, versioned with a "v2" prefix to invalidate
-          # the old poisoned cache. Previous run produced image c39180294c38
-          # repeatedly across 5+ commits and the binary lacked floor_char_boundary
-          # even though src/ contained the fix — the cached COPY src layer was
-          # from a much earlier build. Bumping the key prefix forces a clean
-          # rebuild from current source.
-          cache-from: type=gha,key=buildx-v2-${{ github.sha }}
-          cache-to: type=gha,mode=max,key=buildx-v2-${{ github.sha }}
+          # Per-commit cache key, versioned with a "v3" prefix to invalidate
+          # the old poisoned cache. The previous v2 key still hit cache because
+          # buildx's content-addressed layers matched the poisoned copy — the
+          # key is just a namespace, not a content hash. We force a fully
+          # clean build (no-cache: true) once to bootstrap a correct base;
+          # subsequent builds can use the v3 cache for incremental speedups.
+          cache-from: type=gha,key=buildx-v3-${{ github.sha }}
+          cache-to: type=gha,mode=max,key=buildx-v3-${{ github.sha }}
+          no-cache: true
 
       - name: Verify image built
         run: |
