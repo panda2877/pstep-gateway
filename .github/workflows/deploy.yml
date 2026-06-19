@@ -312,13 +312,16 @@ jobs:
             fi
             echo "🎯 新 active 将切到 $STANDBY_PORT ($STANDBY_UNIT)"
 
-            # ---- 4.1 启动备用 slot ----
-            # Quadlet 单元是 generated/transient，不能 enable，只能 start。
-            # 之前用 `enable --now || true` 掩盖了失败，这次不用 || true：
-            # 启动失败直接 exit 1，让 CI 红。
-            echo "🚀 启动备用 slot $STANDBY_UNIT..."
-            if ! sudo systemctl start "$STANDBY_UNIT"; then
-              echo "❌ systemctl start 失败"
+            # ---- 4.1 启动/重启备用 slot，强制升到 :latest ----
+            # Quadlet 单元是 generated/transient，不能 enable，只能 start/restart。
+            # ⚠️ 用 `restart` 而不是 `start`：start 在已运行的 slot 上是 no-op，容器
+            # 不会拉新镜像；只有 restart 才强制 stop+start。换新 deploy 时 STANDBY
+            # 通常还在跑（上一轮 deploy 留下来的），start 的话会留着老 image 继续 serve
+            # → 双 slot 版本错乱（A=v7 + B=v8）。restart 的等待时间 130s TimeoutStopSec
+            # 之内，OLD active 仍在线 serve 流量，nginx round-robin 不受影响。
+            echo "🚀 restart 备用 slot $STANDBY_UNIT 强制升 :latest..."
+            if ! sudo systemctl restart "$STANDBY_UNIT"; then
+              echo "❌ systemctl restart 失败"
               sudo systemctl status "$STANDBY_UNIT" --no-pager -n 20 || true
               sudo journalctl -u "$STANDBY_UNIT" --no-pager -n 40 || true
               exit 1
@@ -401,19 +404,35 @@ jobs:
             # ---- 4.5 restart 旧 active slot，让它升到 :latest（双 slot 互备必须保留两边）----
             # 不能 stop：双 upstream 设计下 nginx 仍指向另一 slot，但旧 slot 占着 1300X 端口、
             # 万一另一 slot 死了就没有 failover 兜底。改成 restart：SIGTERM drain in-flight，
-            # 再 systemctl start 起来跑 :latest。restart 完确认端口重新 listen 才继续。
+            # 再 systemctl start 起来跑 :latest。
+            # ⚠️ 不要只看 port listen（conmon 撑 socket 的 halfdead 陷阱）：必须等
+            # /v1/models 真的 200 + JSON.object==list 才算 healthy，否则 deploy 报告
+            # "成功"但 slot 实际不响应流量。
             echo "🔄 restart 旧 active slot $OLD_UNIT，让它升到 :latest（双 slot 互备保留两边）..."
             sudo systemctl restart "$OLD_UNIT"
-            for i in $(seq 1 15); do
-              if sudo ss -tln 2>/dev/null | grep -q "127.0.0.1:$ACTIVE_PORT\b"; then
-                echo "✅ 旧 active slot $OLD_UNIT 已重新起来（attempt $i）"
+            old_healthy=false
+            for i in $(seq 1 30); do
+              if ! sudo ss -tln 2>/dev/null | grep -q "127.0.0.1:$ACTIVE_PORT\b"; then
+                echo "⏳ attempt $i: 旧 slot 端口 $ACTIVE_PORT 暂未监听"
+                sleep 1
+                continue
+              fi
+              resp=$(curl -sf -m 2 "http://127.0.0.1:$ACTIVE_PORT/v1/models" 2>&1) || true
+              rc=$?
+              echo "⏳ attempt $i: 旧 slot curl rc=$rc resp_len=${#resp}"
+              if [ $rc -eq 0 ] && echo "$resp" | sudo jq -ef /tmp/jq_filter >/tmp/jq_out 2>&1; then
+                echo "✅ 旧 active slot $OLD_UNIT 已重新起来 + 真实响应（attempt $i）"
+                old_healthy=true
                 break
               fi
               sleep 1
             done
-            if ! sudo ss -tln 2>/dev/null | grep -q "127.0.0.1:$ACTIVE_PORT\b"; then
-              echo "❌ 旧 active slot $OLD_UNIT restart 后端口 $ACTIVE_PORT 仍未监听"
+            if [ "$old_healthy" != "true" ]; then
+              echo "❌ 旧 active slot $OLD_UNIT restart 后 /v1/models 仍未正常响应（port listen 但可能 halfdead）"
               sudo journalctl -u "$OLD_UNIT" --no-pager -n 40 || true
+              echo "尝试 podman rm -f + systemctl start 恢复（halfdead 兜底）..."
+              sudo podman rm -f "$OLD_CONTAINER" 2>/dev/null || true
+              sudo systemctl start "$OLD_UNIT" 2>/dev/null || true
               exit 1
             fi
 
