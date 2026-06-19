@@ -80,7 +80,7 @@ fn policies_referencing_model(
 
 /// GET /api/admin/models
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     let models: Vec<ModelConfig> = config
         .models
         .iter()
@@ -98,7 +98,7 @@ pub async fn get_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     match config.models.get(&id) {
         Some(route) => {
             let refs = policies_referencing_model(&config, &id);
@@ -181,7 +181,7 @@ pub async fn update_model(
         None => None,
     };
 
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
 
     if !config.models.contains_key(&id) {
         return (
@@ -323,7 +323,7 @@ pub async fn update_model(
 pub async fn list_fallback_policies_mini(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     let policies: Vec<serde_json::Value> = config
         .fallback_policies
         .keys()

@@ -68,7 +68,10 @@ pub async fn usage_stats(
     let token_output: u64 = filtered.iter().map(|r| r.completion_tokens as u64).sum();
     let token_total = token_input + token_output;
 
-    // Calculate cost using model-specific pricing from config
+    // Calculate cost using model-specific pricing from config.
+    // 重要：把 config 读锁提到 loop 外。原写法每条记录 lock 一次，
+    // 10000 条记录就抢 10000 次 std::sync::Mutex，会阻塞 tokio worker。
+    let config = state.config.read().await;
     let mut total_cost = 0.0;
     for r in &filtered {
         let mut price_input = 0.0;
@@ -76,7 +79,7 @@ pub async fn usage_stats(
         let record_model_lower = r.model.to_lowercase();
 
         // Match by config.model field (e.g., "MiniMax-M2.7") or config key (e.g., "minimax")
-        for (_, model_config) in state.config.lock().unwrap().models.iter() {
+        for (_, model_config) in config.models.iter() {
             let config_model_lower = model_config.model.to_lowercase();
             // Exact match on model field, or match on config key
             if config_model_lower == record_model_lower ||

@@ -109,7 +109,7 @@ impl Router {
         format: OutputFormat,
         key_fallback_policy: Option<&str>,
         key_id: Option<&str>,
-        quota_tracker: &Arc<std::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
+        quota_tracker: &Arc<tokio::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
     ) -> Result<String, String> {
         let chain = self.build_chain(model_name, key_fallback_policy)?;
         let route = self.config.models.get(model_name).unwrap();
@@ -177,8 +177,9 @@ impl Router {
                     if let Some(kid) = key_id {
                         quota_tracker
                             .lock()
-                            .unwrap()
-                            .record(kid, (usage.prompt_tokens + usage.completion_tokens) as u64);
+                            .await
+                            .record(kid, (usage.prompt_tokens + usage.completion_tokens) as u64)
+                            .await;
                     }
 
                     return Ok(response);
@@ -216,7 +217,7 @@ impl Router {
         format: OutputFormat,
         key_fallback_policy: Option<&str>,
         key_id: Option<&str>,
-        quota_tracker: &Arc<std::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
+        quota_tracker: &Arc<tokio::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
     ) -> Result<String, String> {
         let chain = self.build_chain(model_name, key_fallback_policy)?;
         let route = self.config.models.get(model_name).unwrap();
@@ -286,8 +287,9 @@ impl Router {
                     if let Some(kid) = key_id {
                         quota_tracker
                             .lock()
-                            .unwrap()
-                            .record(kid, (usage.prompt_tokens + usage.completion_tokens) as u64);
+                            .await
+                            .record(kid, (usage.prompt_tokens + usage.completion_tokens) as u64)
+                            .await;
                     }
 
                     return Ok(response);

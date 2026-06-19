@@ -20,7 +20,10 @@ pub struct AuthContext {
 }
 
 /// 鉴权：从 `config.client_api_keys` 查询 bearer key。
-fn require_auth(
+///
+/// 改为 async：原 sync 版本在 handler 里调 `state.config.lock()` 是 std::sync::Mutex
+/// 同步锁，阻塞 tokio worker。async + tokio RwLock 才能跟其它 handler 共存。
+async fn require_auth(
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<AuthContext, Response> {
@@ -34,7 +37,7 @@ fn require_auth(
         return Err(unauthorized("Missing bearer token"));
     }
 
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     for (id, key) in config.client_api_keys.iter() {
         if key.key == token {
             return Ok(AuthContext {
@@ -87,7 +90,7 @@ async fn provider_proxy(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    if let Err(resp) = require_auth(&headers, &state) {
+    if let Err(resp) = require_auth(&headers, &state).await {
         return resp;
     }
 
@@ -99,7 +102,7 @@ async fn provider_proxy(
     // 兼容 v0.1：/provider/{name}/... 仍走 upstreams。新结构里没有顶层 upstreams，
     // 这里改为：在 models 里查同 id 的 model，用其 4 字段；如果没有就走硬编码默认。
     let (base_url, api_key, auth) = {
-        let config = state.config.lock().unwrap();
+        let config = state.config.read().await;
         if let Some(route) = config.models.get(&provider) {
             let auth = route.upstream_type.auth_header();
             (
@@ -285,8 +288,8 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
     let models: Vec<_> = state
         .config
-        .lock()
-        .unwrap()
+        .read()
+        .await
         .models
         .iter()
         .map(|(id, route)| {
@@ -311,7 +314,7 @@ async fn chat_completions(
     headers: axum::http::HeaderMap,
     Json(body): Json<ChatCompletionsRequest>,
 ) -> Response {
-    let auth = match require_auth(&headers, &state) {
+    let auth = match require_auth(&headers, &state).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
@@ -403,7 +406,7 @@ async fn chat_completions_anthropic(
     headers: axum::http::HeaderMap,
     Json(body): Json<AnthropicMessagesRequest>,
 ) -> Response {
-    let auth = match require_auth(&headers, &state) {
+    let auth = match require_auth(&headers, &state).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };

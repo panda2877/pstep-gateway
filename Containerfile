@@ -47,6 +47,25 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     # the next stage can COPY --from=builder it.
     cp target/release/pstep-gateway /build/bin/pstep-gateway
 
+# 装 gdb + 必需的 .so 到 /build/bin-deps/，下一阶段 COPY 进 distroless runtime。
+# 目的：deadlock 复发时能用 sidecar 模式 attach pstep-gateway 进程抓栈。
+# 用法：
+#   podman run --rm -it --pid=container:pstep-gateway-a \
+#     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+#     --network=none pstep-gateway:latest \
+#     /usr/bin/gdb -p 1 /usr/local/bin/pstep-gateway
+# 仍保持 cc-debian12:nonroot（无 shell）；gdb 不需要 shell 也能跑。
+# ⚠️  gdb 进 distroless runtime 的尝试：当前 builder `rust:1-slim` 已升 trixie
+# （glibc 2.40+），runtime `distroless/cc-debian12` 是 bookworm（glibc 2.36）。
+# trixie gdb 需要 GLIBC_2.38，跑不起来。fix 见 future-todo。
+#
+# 当前做法：只把 gdb + gdbserver 二进制装进 builder，**不拷** .so deps，
+# 不写进 runtime。等下面 todo 解决了（pin builder 到 bookworm 或 dpkg-deb
+# 抽 bookworm gdb）再启 COPY。binary 留 builder 里只为完整保留 build 路径。
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gdb gdbserver libreadline8 && \
+    rm -rf /var/lib/apt/lists/*
+
 # =============================================================================
 # Stage 2: Runtime
 # =============================================================================
@@ -55,6 +74,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /build/bin/pstep-gateway /usr/local/bin/pstep-gateway
+
+# gdb + gdbserver + deps 暂不进 runtime（见 builder 阶段注释：GLIBC mismatch）。
+# 待 future-todo 解决（pin builder 到 bookworm 或 dpkg-deb 抽 bookworm gdb）后
+# 再恢复下面 3 行 COPY。
+# COPY --from=builder /build/bin-deps/usr/bin/gdb        /usr/bin/gdb
+# COPY --from=builder /build/bin-deps/usr/bin/gdbserver  /usr/bin/gdbserver
+# COPY --from=builder /build/bin-deps/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 
 # Embed default config from template (real config.yaml is excluded by
 # .containerignore; bind-mounted /etc/pstep-gateway/config.yaml at runtime

@@ -17,7 +17,7 @@ fn now_secs() -> u64 {
 
 /// GET /api/admin/fallback/policies
 pub async fn list_policies(State(state): State<AppState>) -> impl IntoResponse {
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     let policies: Vec<FallbackPolicy> = config
         .fallback_policies
         .iter()
@@ -38,7 +38,7 @@ pub async fn create_policy(
     State(state): State<AppState>,
     Json(req): Json<CreateFallbackPolicyRequest>,
 ) -> Response {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
 
     if config.fallback_policies.contains_key(&req.id) {
         return (
@@ -107,7 +107,7 @@ pub async fn get_policy(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     match config.fallback_policies.get(&id) {
         Some(p) => {
             let resp = FallbackPolicy {
@@ -137,7 +137,7 @@ pub async fn update_policy(
     Path(id): Path<String>,
     Json(req): Json<UpdateFallbackPolicyRequest>,
 ) -> Response {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
 
     let Some(policy) = config.fallback_policies.get_mut(&id) else {
         return (
@@ -195,7 +195,7 @@ pub async fn delete_policy(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
 
     // v0.3: model 不再引用 fallback_policy；引用关系由 policy.chain 反向表达。
     // 删除前只需检查：1) 有没有 client_api_key 引用；2) 这个 policy 自身。

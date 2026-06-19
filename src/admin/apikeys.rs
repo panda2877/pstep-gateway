@@ -9,14 +9,18 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 运行期 quota_used：key_id → 累计 token。
 /// 启动时若 `usage_db` 已配置则从 DB 还原；`record()` 时同步写库。
+///
+/// 内部用 `tokio::sync::Mutex` 而非 `std::sync::Mutex`：方法都在 async 上下文里调用
+/// （Router::route / admin handler），用 std::sync 会阻塞 tokio worker thread，
+/// 慢盘 / 慢 DB 时会饿死整个 runtime。详见 memory `tokio-worker-futex-wedge`。
 #[derive(Default)]
 pub struct ApiKeyQuotaTracker {
-    used: Mutex<std::collections::HashMap<String, u64>>,
+    used: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
     db: Option<Arc<UsageDb>>,
 }
 
@@ -26,11 +30,11 @@ impl ApiKeyQuotaTracker {
     }
 
     /// 启动时调用：用 DB 中的累计值还原内存映射。
-    pub fn seed_from_db(&self) {
+    pub async fn seed_from_db(&self) {
         let Some(db) = &self.db else { return };
         match db.load_all_quotas() {
             Ok(map) => {
-                let mut m = self.used.lock().unwrap();
+                let mut m = self.used.lock().await;
                 for (k, v) in map {
                     m.insert(k, v);
                 }
@@ -45,9 +49,9 @@ impl ApiKeyQuotaTracker {
         }
     }
 
-    pub fn record(&self, key_id: &str, tokens: u64) {
+    pub async fn record(&self, key_id: &str, tokens: u64) {
         let new_total = {
-            let mut m = self.used.lock().unwrap();
+            let mut m = self.used.lock().await;
             let entry = m.entry(key_id.to_string()).or_insert(0);
             *entry += tokens;
             *entry
@@ -64,8 +68,8 @@ impl ApiKeyQuotaTracker {
         }
     }
 
-    pub fn get(&self, key_id: &str) -> u64 {
-        self.used.lock().unwrap().get(key_id).copied().unwrap_or(0)
+    pub async fn get(&self, key_id: &str) -> u64 {
+        self.used.lock().await.get(key_id).copied().unwrap_or(0)
     }
 }
 
@@ -125,13 +129,13 @@ fn build_api_key(
 
 /// GET /api/admin/keys
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
-    let config = state.config.lock().unwrap();
-    let quota = state.api_key_quota.lock().unwrap();
-    let keys: Vec<ApiKey> = config
-        .client_api_keys
-        .iter()
-        .map(|(id, cfg)| build_api_key(id, cfg, quota.get(id)))
-        .collect();
+    let config = state.config.read().await;
+    let mut keys: Vec<ApiKey> = Vec::with_capacity(config.client_api_keys.len());
+    for (id, cfg) in &config.client_api_keys {
+        // 每个 key 单独拿 quota（async），不让 config 读锁跨越 async 边界
+        let used = state.api_key_quota.lock().await.get(id).await;
+        keys.push(build_api_key(id, cfg, used));
+    }
     Json(serde_json::json!({ "keys": keys }))
 }
 
@@ -140,7 +144,7 @@ pub async fn create_key(
     State(state): State<AppState>,
     Json(req): Json<CreateApiKeyRequest>,
 ) -> Response {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
 
     // 生成 id：用 name 简单 slug 化 + 后缀，避免冲突
     let base_id = req
@@ -199,7 +203,7 @@ pub async fn update_key(
     Path(id): Path<String>,
     Json(req): Json<UpdateApiKeyRequest>,
 ) -> Response {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
 
     let Some(cfg) = config.client_api_keys.get_mut(&id) else {
         return (
@@ -240,8 +244,8 @@ pub async fn update_key(
             .into_response();
     }
 
-    let quota = state.api_key_quota.lock().unwrap();
-    let updated = build_api_key(&id, &saved_cfg, quota.get(&id));
+    let used = state.api_key_quota.lock().await.get(&id).await;
+    let updated = build_api_key(&id, &saved_cfg, used);
     (
         axum::http::StatusCode::OK,
         Json(serde_json::json!({
@@ -257,7 +261,7 @@ pub async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config.write().await;
     if config.client_api_keys.remove(&id).is_none() {
         return (
             axum::http::StatusCode::NOT_FOUND,

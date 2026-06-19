@@ -15,7 +15,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let models: Vec<_> = state.config.lock().unwrap().models.keys().cloned().collect();
+    let models: Vec<_> = state.config.read().await.models.keys().cloned().collect();
 
     Json(serde_json::json!({
         "status": "ok",
@@ -36,7 +36,7 @@ pub async fn stats_recent(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn api_models(State(state): State<AppState>) -> impl IntoResponse {
-    let config = state.config.lock().unwrap();
+    let config = state.config.read().await;
     let base_url = config.public_url.clone()
         .unwrap_or_else(|| format!("http://localhost:{}/v1", config.port));
 

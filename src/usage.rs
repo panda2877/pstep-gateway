@@ -3,6 +3,14 @@ use crate::usage_db::UsageDb;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
+/// 内部用 `std::sync::RwLock`：
+/// - 所有方法都是 sync `&self`，调用点（handler/router）不会跨 await。
+/// - 改 tokio::sync::RwLock 会让 record/get_stats/get_recent 都变 async，
+///   牵动调用面太广；当前实现下 hot-path 是 RwLock 抢锁 + 内存操作（<100ns），
+///   比一次 upstream HTTP 调用小几个数量级。
+/// - 把 `.unwrap()` 换 `.expect()` 是为了 mutex poison 时打出明确 location
+///   （参见 memory `tokio-worker-futex-wedge`）。
+
 const RECENT_CAP: usize = 10_000;
 
 pub struct UsageTracker {
@@ -88,11 +96,11 @@ impl UsageTracker {
 
         // Update in-memory mirror first (cheap, lock-held)
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().expect("usage stats mutex poisoned");
             accumulate(&mut stats, &record);
         }
         {
-            let mut recent = self.recent.write().unwrap();
+            let mut recent = self.recent.write().expect("usage recent deque mutex poisoned");
             recent.push_back(record.clone());
             while recent.len() > RECENT_CAP {
                 recent.pop_front();
@@ -114,12 +122,12 @@ impl UsageTracker {
 
     pub fn get_stats(&self) -> UsageStats {
         self.cleanup();
-        self.stats.read().unwrap().clone()
+        self.stats.read().expect("usage stats mutex poisoned").clone()
     }
 
     pub fn get_recent(&self, n: usize) -> Vec<UsageRecord> {
         self.cleanup();
-        let recent = self.recent.read().unwrap();
+        let recent = self.recent.read().expect("usage recent deque mutex poisoned");
         recent.iter().rev().take(n).cloned().collect()
     }
 
@@ -131,7 +139,7 @@ impl UsageTracker {
             .unwrap_or(0)
             .saturating_sub(self.retention_ms);
 
-        let mut recent = self.recent.write().unwrap();
+        let mut recent = self.recent.write().expect("usage recent deque mutex poisoned");
         recent.retain(|r| r.timestamp > cutoff);
     }
 }

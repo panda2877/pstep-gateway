@@ -17,6 +17,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// 内部用 `std::sync::Mutex<Connection>`（rusqlite::Connection 本身是 sync，
+/// 不能跨 await 持锁）。这是合理的：所有方法都是 sync `&self`，调用点
+/// 不会跨 .await。锁区短（一次 SQLite execute），不会明显阻塞 tokio worker。
+/// 把 .unwrap() 换成 .expect() 是为了：mutex poison 时打印出明确的 location，
+/// 而不是直接 panic 丢 backtrace（参见 memory `tokio-worker-futex-wedge`）。
 pub struct UsageDb {
     conn: Mutex<Connection>,
 }
@@ -50,7 +55,7 @@ impl UsageDb {
 
     /// Create tables and indexes (idempotent). Sets WAL mode.
     pub fn migrate(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS usage_records (
@@ -77,7 +82,7 @@ impl UsageDb {
 
     /// Append a usage record.
     pub fn insert_record(&self, r: &UsageRecord) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
         conn.execute(
             "INSERT INTO usage_records
                 (ts_ms, model, upstream, prompt_tokens, completion_tokens,
@@ -100,7 +105,7 @@ impl UsageDb {
 
     /// Set the cumulative quota for a key. Replaces the prior value.
     pub fn upsert_quota(&self, key_id: &str, tokens: u64) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -119,7 +124,7 @@ impl UsageDb {
 
     /// Load records with `ts_ms > since_ms`, newest first, capped at `limit`.
     pub fn load_recent(&self, since_ms: u64, limit: usize) -> Result<Vec<UsageRecord>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
         let mut stmt = conn
             .prepare(
                 "SELECT ts_ms, model, upstream, prompt_tokens, completion_tokens,
@@ -153,7 +158,7 @@ impl UsageDb {
 
     /// Load all persisted quota totals (key_id → tokens).
     pub fn load_all_quotas(&self) -> Result<HashMap<String, u64>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
         let mut stmt = conn
             .prepare("SELECT key_id, tokens FROM quota_usage")
             .map_err(|e| format!("查询 quota_usage 失败: {}", e))?;

@@ -17,10 +17,11 @@ use axum::{
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{Mutex, RwLock};
 use tower::{Layer, Service};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber;
@@ -138,10 +139,11 @@ where
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Mutex<types::GatewayConfig>>,
+    /// 全局 config（tokio RwLock：handler 读、admin 写；写不频繁但要求不阻塞读）
+    pub config: Arc<RwLock<types::GatewayConfig>>,
     pub router: Arc<GatewayRouter>,
     pub thaw_tracker: Option<Arc<thaw::ThawTracker>>,
-    /// 运行期 quota tracker（不写盘）
+    /// 运行期 quota tracker（不写盘）。tokio Mutex：hot-path 频繁增减
     pub api_key_quota: Arc<Mutex<ApiKeyQuotaTracker>>,
     /// 在飞请求计数（tower middleware 写入），供 SIGTERM drainer 轮询。
     pub in_flight: InFlight,
@@ -150,6 +152,19 @@ pub struct AppState {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // 抓 panic 到 stderr + backtrace。否则 deadlock 复发时只能看到 "futex_wait"
+    // 看不到是哪个 .unwrap() 触发的（参见 memory `tokio-worker-futex-wedge`）。
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!(
+            "\n🔥 PANIC at {}",
+            info.location()
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        eprintln!("   payload: {:?}", info.payload());
+        eprintln!("   backtrace:\n{:?}", std::backtrace::Backtrace::force_capture());
+    }));
 
     println!("╔══════════════════════════════════════╗");
     println!("║         Pstep Gateway v{}         ║", env!("CARGO_PKG_VERSION"));
@@ -183,14 +198,14 @@ async fn main() {
     let mut quota_tracker = ApiKeyQuotaTracker::default();
     if let Some(db) = &usage_db {
         quota_tracker.set_db(db.clone());
-        quota_tracker.seed_from_db();
+        quota_tracker.seed_from_db().await;
     }
     let api_key_quota = Arc::new(Mutex::new(quota_tracker));
 
     let in_flight = InFlight::new();
 
     let state = AppState {
-        config: Arc::new(Mutex::new(config.clone())),
+        config: Arc::new(RwLock::new(config.clone())),
         router: Arc::new(gateway_router),
         thaw_tracker,
         api_key_quota,
