@@ -370,14 +370,25 @@ async fn chat_completions(
                 })),
             )
                 .into_response(),
-            Err(_elapsed) => (
-                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "gateway_timeout",
-                    "message": "handler exceeded 150s — upstream likely wedged"
-                })),
-            )
-                .into_response(),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "handler_timeout",
+                    handler = "chat_completions",
+                    format = ?format,
+                    model = %model_name,
+                    key_id = %auth.key_id,
+                    is_stream = true,
+                    "handler exceeded 150s — upstream likely wedged or DNS-broken fallback"
+                );
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": "gateway_timeout",
+                        "message": "handler exceeded 150s — upstream likely wedged"
+                    })),
+                )
+                    .into_response()
+            }
         }
     } else {
         let result = tokio::time::timeout(
@@ -412,14 +423,25 @@ async fn chat_completions(
                 })),
             )
                 .into_response(),
-            Err(_elapsed) => (
-                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "gateway_timeout",
-                    "message": "handler exceeded 150s — upstream likely wedged"
-                })),
-            )
-                .into_response(),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "handler_timeout",
+                    handler = "chat_completions",
+                    format = ?format,
+                    model = %model_name,
+                    key_id = %auth.key_id,
+                    is_stream = false,
+                    "handler exceeded 150s — upstream likely wedged or DNS-broken fallback"
+                );
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": "gateway_timeout",
+                        "message": "handler exceeded 150s — upstream likely wedged"
+                    })),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -478,14 +500,24 @@ async fn chat_completions_anthropic(
                 })),
             )
                 .into_response(),
-            Err(_elapsed) => (
-                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "gateway_timeout",
-                    "message": "handler exceeded 150s — upstream likely wedged"
-                })),
-            )
-                .into_response(),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "handler_timeout",
+                    handler = "chat_completions_anthropic",
+                    model = %model_name,
+                    key_id = %auth.key_id,
+                    is_stream = true,
+                    "handler exceeded 150s — upstream likely wedged or DNS-broken fallback"
+                );
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": "gateway_timeout",
+                        "message": "handler exceeded 150s — upstream likely wedged"
+                    })),
+                )
+                    .into_response()
+            }
         }
     } else {
         let result = tokio::time::timeout(
@@ -520,14 +552,24 @@ async fn chat_completions_anthropic(
                 })),
             )
                 .into_response(),
-            Err(_elapsed) => (
-                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "gateway_timeout",
-                    "message": "handler exceeded 150s — upstream likely wedged"
-                })),
-            )
-                .into_response(),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "handler_timeout",
+                    handler = "chat_completions_anthropic",
+                    model = %model_name,
+                    key_id = %auth.key_id,
+                    is_stream = false,
+                    "handler exceeded 150s — upstream likely wedged or DNS-broken fallback"
+                );
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": "gateway_timeout",
+                        "message": "handler exceeded 150s — upstream likely wedged"
+                    })),
+                )
+                    .into_response()
+            }
         }
     }
 }
