@@ -101,13 +101,14 @@ jobs:
           push: false       # 不直推；通过本地 load → save + push 两路分发
           load: true        # 加载到 runner 的 docker daemon，供下面 save / push 用
           tags: pstep-gateway:${{ github.sha }}
-          # Explicit per-commit cache key. Without a key, GHA auto-generates one
-          # and reuses the same cache across commits, which caused a serious
-          # regression: a previous build's binary (b346c535cb5f) was shipped
-          # tagged with a later commit's SHA. The per-commit key ensures
-          # cargo's build layer can never be reused across commits.
-          cache-from: type=gha,key=buildx-${{ github.sha }}
-          cache-to: type=gha,mode=max,key=buildx-${{ github.sha }}
+          # Per-commit cache key, versioned with a "v2" prefix to invalidate
+          # the old poisoned cache. Previous run produced image c39180294c38
+          # repeatedly across 5+ commits and the binary lacked floor_char_boundary
+          # even though src/ contained the fix — the cached COPY src layer was
+          # from a much earlier build. Bumping the key prefix forces a clean
+          # rebuild from current source.
+          cache-from: type=gha,key=buildx-v2-${{ github.sha }}
+          cache-to: type=gha,mode=max,key=buildx-v2-${{ github.sha }}
 
       - name: Verify image built
         run: |
