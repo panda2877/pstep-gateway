@@ -242,32 +242,32 @@ jobs:
           # 上面的 ssh session 已经做完这件事；保留这段只是占位，不再发 ssh。
           echo "🔧 准备运行时目录（已在上一步完成，跳过）"
 
-          # ---- 3. 直传镜像（docker save → gzip → ssh → gunzip → podman load）----
-          # 上一次 scp 这步的 14MB tarball 在远端落地后 gzip 报 CRC 错误——同样的
-          # 症状：admin dist 走 scp 时沉默不报错但远端收不到，gateway image 走 scp
-          # 时报「数据已传输但压缩流坏掉」。说明 GHA runner 上的 scp 不能信任，
-          # 改用管道：docker save 直接把 docker archive 喂给 ssh，ssh 远端 sudo podman load，
-          # 中间不落盘。Pipe 路径上任一字节出错都会立刻断流并报 set -e，不会出现「静默截断」。
+          # ---- 3. 远端从 GHCR 拉镜像 ----
+          # 不再用 docker save | gzip | ssh 管道直传 gateway 镜像了。
+          # 这个 GHA runner 类型下的 ssh/scp/管道直传有系统性不可靠（管
+          # 道半路丢字节 / scp CRC 错 / scp 沉默 0 字节）—— 连续 6 次
+          # deploy 都挂在「镜像从 runner 传到远端」这一步。
           #
-          # 注：ssh 转发流经 gzip -1 之后，gunzip -t 偶尔会报
-          # "decompression OK, trailing garbage ignored"（rc=2，但流本身完整）。
-          # 这种 trailing 字节通常是 ssh 把 stdout buffer flush 时拼上的多余 NUL，
-          # 不影响 podman load。用 `|| true` 容忍这种无害噪声；同时显式
-          # `gunzip -c | podman load` 走 stdin，绕开「先解压到 .tar 再 load」的中间文件。
-          echo "🐳 管道直传 gateway 镜像..."
-          docker save pstep-gateway:${{ github.sha }} | gzip -1 | \
-            $SSHCMD ${SERVER_USER}@${SERVER_HOST} \
-              'set -e
-               cat > /tmp/pstep-gateway.tar.gz
-               echo "---- 远端完整性校验 ----"
-               ls -la /tmp/pstep-gateway.tar.gz
-               # trailing-garbage 警告无害，吞掉；CRC 真的错才会让 set -e 触发
-               gunzip -t /tmp/pstep-gateway.tar.gz || true
-               # 通过 stdin 直接灌给 podman load，避免落盘 .tar 中间文件
-               gunzip -c /tmp/pstep-gateway.tar.gz | sudo podman load
-               sudo podman tag pstep-gateway:${{ github.sha }} pstep-gateway:latest
-               rm -f /tmp/pstep-gateway.tar.gz
-               echo "✅ 镜像已 load + tag 为 latest"'
+          # 既然构建步骤已经 `docker push` 到 ghcr.io/panda2877/pstep-gateway
+          # （公开仓库），远端直接 `podman pull` 即可：
+          #   - 走 HTTPS，由 container registry 内置的 layer checksum 校验
+          #   - 失败有明确 HTTP 状态码，不会出现「沉默丢字节」
+          #   - 镜像一次性到位，不需要先 load 再 tag（pull 自动用 :SHA tag）
+          #   - 走完后我们再 tag 成 :latest 覆盖悬空 ID
+          IMAGE="ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}"
+          echo "🐳 远端从 GHCR 拉镜像: $IMAGE..."
+          $SSHD "
+            set -e
+            echo '---- pull 前 registry 已有镜像 ----'
+            sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}' \\
+              | grep 'pstep-gateway' || echo '(none)'
+            sudo podman pull '$IMAGE'
+            sudo podman tag '$IMAGE' pstep-gateway:latest
+            echo '---- pull 后 ----'
+            sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' \\
+              | grep 'pstep-gateway'
+            echo '✅ 镜像已 load + tag 为 latest'
+          "
 
           # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
           # 蓝绿流程：
