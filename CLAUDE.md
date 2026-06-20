@@ -143,6 +143,25 @@ src/
 
 非流式响应（`stream: false`）直接透传上游 JSON，不做格式转换。
 
+### 思考内容（thinking / reasoning）处理
+
+上游 OpenAI 兼容服务（[MiniMax-M3](https://api.minimaxi.com) 等）把 chain-of-thought 用两种方式塞进响应：
+
+1. 把思考内容**内联**在 `content` 字段里，用 `<think>...</think>` 标签包起来
+2. 用独立的 `reasoning_content` 字段（OpenAI o1 / DeepSeek-R1 风格）
+
+网关按**下游客户端**走不同策略（实现见 [src/providers/openai.rs](src/providers/openai.rs) `convert_sse_to_anthropic_stream` / `convert_to_anthropic_response`）：
+
+| 下游 | 上游 thinking 处理 |
+|---|---|
+| `POST /v1/chat/completions`（OpenAI passthrough） | **原样透传**。`<think>...</think>` 字面量保留在 `content` 里，多数 OpenAI 兼容 SDK / agent 能渲染 |
+| `POST /v1/chat/completions?format=anthropic` | 转成 `content_block_start {type: thinking}` + `thinking_delta` × N + `content_block_stop`；外层 `text` 块放最终答案 |
+| `POST /v1/messages`（Claude Code 用的 Anthropic 直连） | 同上，Claude Code 能拿到完整 chain-of-thought |
+
+`reasoning_content` 字段在这两条 Anthropic 路径上也按 thinking content block 转发（不再丢弃）。
+
+> ⚠️ **不要回到全删路线**（commit `1a0b95d` / `c9f3547` / `c47afa6` / `09b14a2`）。那 4 个 fix 当时是为了让 Claude Code 不被 `` 字面量炸掉，但代价是 Claude Code 自己也看不到思考了，且 OpenAI 直连用户得手动从 `` 标签里抠。现在的实现两边体验都保住。
+
 ---
 
 ## 配置（`config.yaml`）
