@@ -280,6 +280,10 @@ async fn main() {
             axum::routing::delete(admin::apikeys::delete_key),
         )
         .route(
+            "/api/admin/keys/{id}/reveal",
+            axum::routing::post(admin::apikeys::reveal_key),
+        )
+        .route(
             "/api/admin/fallback/policies",
             axum::routing::get(admin::fallback::list_policies),
         )

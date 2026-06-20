@@ -10,6 +10,7 @@ import {
   createApiKey,
   updateApiKey,
   deleteApiKey,
+  revealApiKey,
   getModels,
   getFallbackPoliciesMini,
 } from '../services/api';
@@ -156,6 +157,26 @@ export const APIKeysPage: React.FC = () => {
     }
   };
 
+  // List rows can't show the full key (backend only sends the 15-char prefix
+  // + masked form for security). When the operator clicks "复制" we call the
+  // /reveal endpoint, which returns the plaintext, then put it on the
+  // clipboard. Confirm the action so a stray click doesn't leak the key into
+  // the clipboard unobserved.
+  const copyListedKey = async (key: ApiKey) => {
+    if (!window.confirm(`复制「${key.name}」的明文密钥？\n\n此操作会把完整 key 写入剪贴板。`)) {
+      return;
+    }
+    try {
+      const plaintext = await revealApiKey(key.id);
+      await navigator.clipboard.writeText(plaintext);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      console.error('Failed to reveal key:', err);
+      window.alert('复制失败：' + (err instanceof Error ? err.message : String(err)));
+    }
+  };
+
   return (
     <div className="section" id="section-apikeys">
       <div className="section-header">
@@ -212,7 +233,7 @@ export const APIKeysPage: React.FC = () => {
                         <span className="key-masked">{key.key_masked}</span>
                         <button
                           className="copy-btn"
-                          onClick={() => copyToClipboard(key.key_prefix)}
+                          onClick={() => copyListedKey(key)}
                         >
                           复制
                         </button>

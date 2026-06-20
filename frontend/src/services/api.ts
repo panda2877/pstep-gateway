@@ -92,6 +92,13 @@ export const deleteApiKey = async (id: string): Promise<void> => {
   await api.delete(`/api/admin/keys/${id}`);
 };
 
+export const revealApiKey = async (id: string): Promise<string> => {
+  const response = await api.post<{ id: string; name: string; key: string }>(
+    `/api/admin/keys/${id}/reveal`
+  );
+  return response.data.key;
+};
+
 // Fallback Policy APIs
 export const getFallbackPolicies = async (): Promise<FallbackPolicy[]> => {
   const response = await api.get<PoliciesResponse>('/api/admin/fallback/policies');

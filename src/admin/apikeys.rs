@@ -288,3 +288,32 @@ pub async fn delete_key(
     )
         .into_response()
 }
+
+/// POST /api/admin/keys/:id/reveal
+/// 返回明文 key。`/api/admin/*` 当前未加鉴权，靠内网+反代保护；
+/// 见 CLAUDE.md 「管理后台」与「开发注意」。
+pub async fn reveal_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let config = state.config.read().await;
+    let Some(cfg) = config.client_api_keys.get(&id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("Key '{}' not found", id)
+            })),
+        )
+            .into_response();
+    };
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "name": cfg.name,
+            "key": cfg.key,
+        })),
+    )
+        .into_response()
+}
