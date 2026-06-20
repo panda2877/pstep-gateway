@@ -313,7 +313,40 @@ Quadlet 单元文件：
 nginx 站点：[nginx/sites-available/pstep-gateway](nginx/sites-available/pstep-gateway)
 （部署到 `/etc/nginx/sites-enabled/pstep-gateway`；`keepalive 32` + `proxy_buffering off` SSE 友好）。
 
-### 手动切换 active slot
+### 手动 deploy / 切流
+
+服务器上有 `pstep-deploy-fallback`（`/usr/local/bin/`）脚本，封装"pull + 蓝绿切流"全流程。CI deploy 卡 GHCR pull（见下节）时直接用：
+
+```bash
+ssh root@134.175.163.213
+# 拉指定 commit 并切流（pull 带 25min timeout，挂死会报错而非静等 SSH timeout）
+sudo pstep-deploy-fallback <commit-sha>
+# 镜像已在本机、只想切流
+sudo pstep-deploy-fallback --skip-pull <commit-sha>
+# 不切流，只看当前 slot / :latest 状态
+sudo pstep-deploy-fallback --probe
+```
+
+脚本幂等可重跑，失败会精确报停在哪步（pull / probe / nginx / drain）。
+
+### CI deploy 卡 GHCR pull 时的恢复（CN 服务器已知问题）
+
+**症状**：GHA `Deploy via SSH` 步骤在 `sudo podman pull ghcr.io/.../pstep-gateway:<sha>` 卡在 `Copying blob` 17/20 之后，30+ min 后 SSH session 被打断，`##[error]Process completed with exit code 255`。:latest 标签**不会**被更新——如果 CI fail 后没人救火，新代码永远到不了 3002。
+
+**根因**：CN 服务器到 ghcr.io 慢/挂（commit `60c0958` 改用 GHCR pull 后的回归，之前是 `docker save | ssh` 管道 silent drop）。runner 侧的 ssh/scp/管道传 14MB 镜像也多次失败，所以这条路不回退。
+
+**恢复**：
+
+```bash
+ssh root@134.175.163.213
+# 1. 直接在服务器上 podman pull（同样会卡，但脚本 25min 超时，不会让脚本挂死）
+sudo pstep-deploy-fallback <commit-sha>
+# 2. 如果 pull 也挂了，看 [memory/deploy-ghcr-pull-hangs-from-cn-server.md](file_path) 末尾的"长期修法"
+```
+
+**长期修法**（按 memory 里的判断，不要在没确认前动）：服务器上挂一个反代缓存 / 切到阿里云 ACR 个人版中专（CN 内网拉取，~5MB/s）。这个改动会动 deploy.yml，需要先和你确认。
+
+### 手动切 active slot（不部署新版本，只换流量）
 
 ```bash
 ssh root@134.175.163.213
@@ -323,6 +356,8 @@ sudo grep -E '127.0.0.1:1300[45]' /etc/nginx/sites-enabled/pstep-gateway
 sudo sed -i 's/127.0.0.1:13004/127.0.0.1:13005/' /etc/nginx/sites-enabled/pstep-gateway
 sudo nginx -t && sudo nginx -s reload
 ```
+
+或者直接用脚本的 `--skip-pull` 模式（不拉新镜像、只重切流，让两个 slot 重启成一样的版本）。
 
 ### 手动回滚（蓝绿只有 5 个本地版本）
 
