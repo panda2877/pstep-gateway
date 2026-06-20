@@ -68,7 +68,7 @@ models:
 
   mimo:
     type: anthropic
-    base_url: "https://token-plan-cn.xiaomimino.com/anthropic/v1"
+    base_url: "https://token-plan-cn.xiaomimimo.com/anthropic/v1"
     api_key: "${MIMO_API_KEY}"
     model: "mimo-v2.5"
     metadata:

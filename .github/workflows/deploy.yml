@@ -225,6 +225,25 @@ jobs:
               sudo chown 65532:65532 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
               sudo chmod 755 /var/lib/pstep-gateway-a /var/lib/pstep-gateway-b
 
+              # ---- 1.5b 确保 /etc/pstep-gateway/env 存在（inject 到容器里做 secret）----
+              # Quadlet EnvironmentFile= 需要这个文件存在；chmod 600 + root:root。
+              # 这个文件**不能**进 git（里面是 secret），也不被 scp 上传；
+              # deploy 只保证它存在 + 权限正确。缺失时打印醒目警告，避免
+              # ${MIMO_API_KEY} 这类占位符在容器里解析成空串 → 上游 401。
+              if [ ! -e /etc/pstep-gateway/env ]; then
+                echo "⚠️  /etc/pstep-gateway/env 不存在 — 容器内 ${VAR} 占位符将解析为"
+                echo "    空串，所有引用 secret 的上游都会 401/403。请手动创建："
+                echo "      sudo install -m 0600 -o root -g root /dev/null /etc/pstep-gateway/env"
+                echo "      sudo tee -a /etc/pstep-gateway/env >/dev/null <<'EOF'"
+                echo "      MIMO_API_KEY=<your-mimo-key>"
+                echo "      # ... 其它 ${VAR} 引用的 key"
+                echo "      EOF"
+              else
+                sudo chmod 600 /etc/pstep-gateway/env
+                sudo chown root:root /etc/pstep-gateway/env
+                echo "✅ /etc/pstep-gateway/env present (mode 600, root:root)"
+              fi
+
               # ---- 1.6 迁移期：停掉老的单实例 pstep-gateway.service ----
               if sudo systemctl is-active --quiet pstep-gateway.service 2>/dev/null; then
                 echo "🔁 检测到旧 pstep-gateway.service 在跑，迁移到蓝绿..."

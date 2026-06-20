@@ -41,6 +41,7 @@ SecurityLabelDisable=true
 Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
 Volume=/var/lib/pstep-gateway-b:/var/lib/pstep-gateway:rw
 
+EnvironmentFile=/etc/pstep-gateway/env
 Environment=RUST_LOG=info
 Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
 Environment=GATEWAY_PORT=3002

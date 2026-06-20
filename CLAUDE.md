@@ -161,6 +161,11 @@ src/
 
 **变量插值**：`api_key: "${ANTHROPIC_API_KEY}"` 在加载时从环境变量解析。
 
+**Secret 注入**：所有上游 API key 必须放 `/etc/pstep-gateway/env`（mode 600, root:root），
+通过 quadlet `EnvironmentFile=` 注入容器。**该文件不进 git，也不被 deploy.yml scp 上传**——
+deploy 脚本只在缺失时打印醒目警告，避免 `${VAR}` 在容器里解析成空串导致上游 401。
+手动迁移：`sudo install -m 0600 /dev/null /etc/pstep-gateway/env` 后写入 `KEY=value` 行。
+
 **配置搜索顺序**：`CONFIG_PATH` 环境变量 → `./config.yaml` → `/etc/pstep-gateway/config.yaml`。
 
 **模型状态**：`active` | `rate_limited` | `disabled`（`disabled` 直接拒绝；`rate_limited` 不再触发新请求）。

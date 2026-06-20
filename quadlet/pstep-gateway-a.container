@@ -51,6 +51,10 @@ Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
 # Slot A 用独立目录避免与 slot B 共享 SQLite WAL 文件。
 Volume=/var/lib/pstep-gateway-a:/var/lib/pstep-gateway:rw
 
+# Secrets injected via EnvironmentFile (chmod 600, host-managed).
+# Required keys: MIMO_API_KEY (and any other upstream API keys referenced by ${VAR}
+# in config.yaml). Missing entries resolve to empty string, which surfaces as 401/403.
+EnvironmentFile=/etc/pstep-gateway/env
 Environment=RUST_LOG=info
 Environment=CONFIG_PATH=/etc/pstep-gateway/config.yaml
 Environment=GATEWAY_PORT=3002
