@@ -390,9 +390,9 @@ fn convert_openai_chunk_to_anthropic(
         output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
         // NB: do NOT return here. minimaxi M3 sends `role` and `content` (often
         // containing  THINK tags) in the same delta. Returning early would skip
-        // the think-tag strip below and let raw thinking text leak into the
-        // Anthropic SSE stream, breaking Claude Code's compact. Fall through
-        // so the content path can process it.
+        // the think-tag → thinking content block conversion below, leaving
+        // thinking as raw text in the text block (which Claude Code can't
+        // parse as thinking). Fall through so the content path can split it.
     }
 
     // Handle tool_calls streaming: emit content_block_start (tool_use) and
@@ -405,9 +405,10 @@ fn convert_openai_chunk_to_anthropic(
 
             // Close any open thinking/text block before opening tool_use.
             if *sent_content_block_start && (*thinking_started || oa_index == 0) {
-                let stop_event = json!({"type": "content_block_stop", "index": oa_index});
+                let stop_event = json!({"type": "content_block_stop", "index": 0});
                 output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
                 *thinking_started = false;
+                *sent_content_block_start = false;
             }
 
             // Emit content_block_start once per tool_use index.
@@ -432,7 +433,6 @@ fn convert_openai_chunk_to_anthropic(
                     }
                 });
                 output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                *sent_content_block_start = true;
 
                 // Emit any initial arguments if present.
                 if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
@@ -464,89 +464,247 @@ fn convert_openai_chunk_to_anthropic(
         return Some(());
     }
 
-    // Skip reasoning_content from upstream — Claude Code client doesn't recognize
-    // Anthropic-style "thinking" content blocks, so emitting them breaks response
-    // parsing (e.g. compact fails after a few rounds). Just drop the field entirely.
-    if delta.get("reasoning_content").is_some() {
+    // Upstream `reasoning_content` (e.g. DeepSeek-R1 / o1-style) — emit as
+    // a real Anthropic `thinking` content block. Claude Code consumes these
+    // and shows the chain-of-thought in its UI; dropping them hides it.
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            if !*thinking_started {
+                // Close any open text block first.
+                if *sent_content_block_start {
+                    let stop_event = json!({"type": "content_block_stop", "index": 0});
+                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                    *sent_content_block_start = false;
+                }
+                let start_event = json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                });
+                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                *thinking_started = true;
+            }
+            let delta_event = json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": reasoning}
+            });
+            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+        }
         return Some(());
     }
 
     if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
         if !content.is_empty() {
-            // Strip <think>...</think> blocks from streaming text deltas.
-            // Tag boundaries can split across chunks, so track state across calls.
+            // Split on <think>...</think> boundaries. Each segment is emitted
+            // as either thinking_delta (inside the tag) or text_delta (outside
+            // the tag). Tag boundaries can split across chunks, so keep a tail
+            // buffer (`think_tail`) of at most 7 bytes to detect the closing
+            // tag split mid-token.
             let mut buf = std::mem::take(think_tail);
             buf.push_str(content);
-            let mut emit = String::new();
             let mut rest = buf.as_str();
             while !rest.is_empty() {
                 if *inside_think {
                     if let Some(end) = rest.find("</think>") {
+                        // Emit everything up to </think> as thinking_delta.
+                        let think_segment = &rest[..end];
+                        if !think_segment.is_empty() {
+                            if !*thinking_started {
+                                // Close any open text block first.
+                                if *sent_content_block_start {
+                                    let stop_event = json!({"type": "content_block_stop", "index": 0});
+                                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                                    *sent_content_block_start = false;
+                                }
+                                let start_event = json!({
+                                    "type": "content_block_start",
+                                    "index": 0,
+                                    "content_block": {"type": "thinking", "thinking": ""}
+                                });
+                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                                *thinking_started = true;
+                            }
+                            let delta_event = json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "thinking_delta", "thinking": think_segment}
+                            });
+                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                        }
+                        // Close the thinking block.
+                        let stop_event = json!({"type": "content_block_stop", "index": 0});
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                        *thinking_started = false;
                         rest = &rest[end + 8..];
                         *inside_think = false;
                     } else {
-                        // Still inside a think block — keep at most the last 7 bytes
-                        // as a tail buffer in case "</think>" is split across chunks.
-                        // Use floor_char_boundary to avoid slicing inside a UTF-8
-                        // multi-byte sequence (e.g. CJK, emoji).
+                        // Still inside a think block — emit everything except
+                        // the last 7 bytes as thinking_delta, keep the trailing
+                        // window in case "</think>" is split across chunks.
+                        // Use floor_char_boundary to avoid slicing inside a
+                        // UTF-8 multi-byte sequence (CJK, emoji). Break out
+                        // when `cut == 0` (e.g. first char is 4-byte emoji
+                        // and `rest.len() - 7` lands inside it) — otherwise
+                        // `rest` doesn't shrink and we loop forever.
                         if rest.len() > 7 {
                             let cut = rest.floor_char_boundary(rest.len() - 7);
+                            if cut == 0 { break; }
+                            let think_segment = &rest[..cut];
                             rest = &rest[cut..];
+                            if !think_segment.is_empty() {
+                                if !*thinking_started {
+                                    if *sent_content_block_start {
+                                        let stop_event = json!({"type": "content_block_stop", "index": 0});
+                                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                                        *sent_content_block_start = false;
+                                    }
+                                    let start_event = json!({
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": {"type": "thinking", "thinking": ""}
+                                    });
+                                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                                    *thinking_started = true;
+                                }
+                                let delta_event = json!({
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "thinking_delta", "thinking": think_segment}
+                                });
+                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                            }
+                        } else {
+                            break;
                         }
-                        break;
                     }
                 } else if let Some(start) = rest.find("<think>") {
-                    emit.push_str(&rest[..start]);
+                    // Emit everything up to <think> as text_delta.
+                    let text_segment = &rest[..start];
+                    if !text_segment.is_empty() {
+                        // Close any open thinking block first.
+                        if *thinking_started {
+                            let stop_event = json!({"type": "content_block_stop", "index": 0});
+                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                            *thinking_started = false;
+                        }
+                        if !*sent_content_block_start {
+                            let start_event = json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {"type": "text"}
+                            });
+                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                            *sent_content_block_start = true;
+                        }
+                        let delta_event = json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": text_segment}
+                        });
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                    }
                     rest = &rest[start + 7..];
                     *inside_think = true;
                 } else {
-                    // Keep at most the last 6 bytes as tail in case "<think>" is split.
-                    // Use floor_char_boundary to avoid slicing inside a UTF-8
-                    // multi-byte sequence (e.g. CJK, emoji).
+                    // Plain text (no think tag) — emit everything except the
+                    // last 6 bytes as text_delta, keep trailing window in case
+                    // "<think>" is split across chunks. floor_char_boundary to
+                    // avoid slicing inside a UTF-8 multi-byte sequence. Break
+                    // out when `cut == 0` (e.g. first char is 4-byte emoji and
+                    // `rest.len() - 6` lands inside it) — otherwise `rest`
+                    // doesn't shrink and we loop forever.
                     if rest.len() > 6 {
                         let cut = rest.floor_char_boundary(rest.len() - 6);
-                        emit.push_str(&rest[..cut]);
+                        if cut == 0 { break; }
+                        let text_segment = &rest[..cut];
                         rest = &rest[cut..];
+                        if !text_segment.is_empty() {
+                            if *thinking_started {
+                                let stop_event = json!({"type": "content_block_stop", "index": 0});
+                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                                *thinking_started = false;
+                            }
+                            if !*sent_content_block_start {
+                                let start_event = json!({
+                                    "type": "content_block_start",
+                                    "index": 0,
+                                    "content_block": {"type": "text"}
+                                });
+                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                                *sent_content_block_start = true;
+                            }
+                            let delta_event = json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": text_segment}
+                            });
+                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                        }
                     } else {
                         break;
                     }
                 }
             }
             *think_tail = rest.to_string();
-
-            if !emit.is_empty() {
-                if !*sent_content_block_start {
-                    *sent_content_block_start = true;
-                    let start_event = json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text"}
-                    });
-                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                } else if *thinking_started {
-                    *thinking_started = false;
-                    let stop_event = json!({"type": "content_block_stop", "index": 0});
-                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                    let start_event = json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text"}
-                    });
-                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                }
-                let event = json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": emit}
-                });
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&event).unwrap_or_default()));
-            }
             return Some(());
         }
     }
 
     if let Some(reason) = finish_reason.and_then(|v| v.as_str()) {
         if reason == "stop" || reason == "length" {
+            // Flush any buffered tail content. The state machine holds back
+            // up to 6 (or 7) bytes to detect `<think>`/`</think>` splits across
+            // chunks. At finish there are no more chunks, so emit whatever
+            // was held back as the current block type, then close the block.
+            if !think_tail.is_empty() {
+                if *inside_think {
+                    if !*thinking_started {
+                        if *sent_content_block_start {
+                            let stop_event = json!({"type": "content_block_stop", "index": 0});
+                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                            *sent_content_block_start = false;
+                        }
+                        let start_event = json!({
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "thinking", "thinking": ""}
+                        });
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                        *thinking_started = true;
+                    }
+                    let delta_event = json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "thinking_delta", "thinking": think_tail.as_str()}
+                    });
+                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                } else {
+                    if *thinking_started {
+                        let stop_event = json!({"type": "content_block_stop", "index": 0});
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+                        *thinking_started = false;
+                    }
+                    if !*sent_content_block_start {
+                        let start_event = json!({
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text"}
+                        });
+                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+                        *sent_content_block_start = true;
+                    }
+                    let delta_event = json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": think_tail.as_str()}
+                    });
+                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
+                }
+                think_tail.clear();
+            }
+            // Close any open thinking block (e.g. upstream ended mid-think
+            // without sending </think>).
             if *thinking_started {
                 *thinking_started = false;
                 let stop_event = json!({"type": "content_block_stop", "index": 0});
@@ -570,24 +728,37 @@ fn convert_openai_chunk_to_anthropic(
     None
 }
 
-/// Strip <think>...</think> blocks (and any leading newlines) from upstream text.
-/// Returns the cleaned text with the thinking content discarded.
-fn strip_think_tags(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Split `text` into alternating (text, think) segments. `<think>` opens a
+/// think segment, `</think>` closes it. The first tuple element is a slice
+/// of the original text that should be emitted as a `text` block, the second
+/// is a slice that should be emitted as a `thinking` block. Returns
+/// (text_segments, think_segments) where each Vec contains the segments in
+/// order, plus a leading newlines bool to drop think-tag whitespace.
+fn split_think_tags(text: &str) -> (Vec<&str>, Vec<&str>) {
+    let mut texts = Vec::new();
+    let mut thinks = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find("<think>") {
-        out.push_str(&rest[..open]);
+        if open > 0 {
+            texts.push(&rest[..open]);
+        }
         rest = &rest[open + 7..];
-        if let Some(close) = rest.find("</think>") {
-            rest = &rest[close + 8..];
-        } else {
-            // Unclosed tag — drop the rest, nothing useful to keep.
-            return out;
+        match rest.find("</think>") {
+            Some(close) => {
+                thinks.push(&rest[..close]);
+                rest = &rest[close + 8..];
+            }
+            None => {
+                // Unclosed tag — keep the tail as thinking (best effort).
+                thinks.push(rest);
+                return (texts, thinks);
+            }
         }
     }
-    out.push_str(rest);
-    // Strip leading newlines left over after removing the think block.
-    out.trim_start_matches('\n').to_string()
+    if !rest.is_empty() {
+        texts.push(rest);
+    }
+    (texts, thinks)
 }
 
 pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, String> {
@@ -598,20 +769,32 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
     let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let choice = openai_resp.get("choices").and_then(|v| v.as_array()).and_then(|arr| arr.first());
     let message = choice.and_then(|v| v.get("message"));
-    // Skip reasoning_content / thinking blocks from upstream — Claude Code client
-    // doesn't recognize Anthropic-style "thinking" content blocks, so emitting
-    // them breaks response parsing (e.g. compact fails after a few rounds).
     let tool_calls = message.and_then(|m| m.get("tool_calls")).and_then(|v| v.as_array()).map(|arr| arr.clone()).unwrap_or_default();
 
     let mut content_blocks = Vec::new();
+
+    // Helper: emit a single text segment, trimming the leading newlines that
+    // often follow a `</think>` tag so the text block doesn't start with a
+    // blank line.
+    let push_text = |blocks: &mut Vec<Value>, segment: &str| {
+        let trimmed = segment.trim_start_matches('\n');
+        if !trimmed.is_empty() {
+            blocks.push(json!({"type": "text", "text": trimmed}));
+        }
+    };
 
     let message_content = message.and_then(|m| m.get("content"));
     if let Some(content_val) = message_content {
         if content_val.is_string() {
             if let Some(text) = content_val.as_str() {
-                let clean = strip_think_tags(text);
-                if !clean.is_empty() {
-                    content_blocks.push(json!({"type": "text", "text": clean}));
+                let (texts, thinks) = split_think_tags(text);
+                for t in thinks {
+                    if !t.is_empty() {
+                        content_blocks.push(json!({"type": "thinking", "thinking": t}));
+                    }
+                }
+                for t in texts {
+                    push_text(&mut content_blocks, t);
                 }
             }
         } else if let Some(arr) = content_val.as_array() {
@@ -620,15 +803,28 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
                 match block_type {
                     "text" => {
                         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                            let clean = strip_think_tags(text);
-                            if !clean.is_empty() {
-                                content_blocks.push(json!({"type": "text", "text": clean}));
+                            let (texts, thinks) = split_think_tags(text);
+                            for t in thinks {
+                                if !t.is_empty() {
+                                    content_blocks.push(json!({"type": "thinking", "thinking": t}));
+                                }
+                            }
+                            for t in texts {
+                                push_text(&mut content_blocks, t);
                             }
                         }
                     }
-                    // "thinking" / "reasoning" blocks from upstream are dropped
-                    // entirely (see comment above).
-                    "thinking" | "reasoning" => {}
+                    "thinking" | "reasoning" => {
+                        if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                            if !t.is_empty() {
+                                content_blocks.push(json!({"type": "thinking", "thinking": t}));
+                            }
+                        } else if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            if !t.is_empty() {
+                                content_blocks.push(json!({"type": "thinking", "thinking": t}));
+                            }
+                        }
+                    }
                     _ => {
                         if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
                             if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
@@ -639,6 +835,14 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
                     }
                 }
             }
+        }
+    }
+
+    // Upstream `reasoning_content` (OpenAI o1 / DeepSeek-R1 style) — emit as
+    // a real thinking content block so Claude Code can show it in the UI.
+    if let Some(reasoning) = message.and_then(|m| m.get("reasoning_content")).and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
         }
     }
 
@@ -765,5 +969,226 @@ mod tests {
         let combined = format!("{sse1}{sse2}");
         let result = convert_sse_to_anthropic_stream(&combined);
         assert!(result.is_ok(), "must not panic inside-think with CJK tail: {:?}", result.err());
+    }
+
+    // ----- thinking content block emission tests -----------------------------
+    //
+    // Regression coverage for the bug where M3's `<think>...</think>` text was
+    // silently dropped on the /v1/messages and ?format=anthropic paths, hiding
+    // chain-of-thought from Claude Code. After the fix, `<think>...</think>`
+    // content is emitted as a real Anthropic `thinking` content block.
+
+    /// Helper: parse an Anthropic SSE stream into a Vec of typed events.
+    fn parse_anthropic_sse_events(out: &str) -> Vec<Value> {
+        out.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("data: ") {
+                    serde_json::from_str::<Value>(rest).ok()
+                } else if let Some(rest) = line.strip_prefix("event: ") {
+                    // `event:` lines are not used by this converter (it always
+                    // emits `data: <json>` regardless of the source prefix),
+                    // so skip them.
+                    let _ = rest;
+                    None
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// M3's full pattern: a chunk with both role + content (per c47afa6), then
+    /// a <think> opening, then 3 chunks of think content, then </think>, then
+    /// the answer, then finish. After the fix the response should contain both
+    /// a `thinking` content block AND a `text` content block.
+    #[test]
+    fn sse_to_anthropic_emits_thinking_block() {
+        let mut sse = String::new();
+        // chunk 1: role + role-content (the c47afa6 case)
+        sse.push_str(&sse_delta(""));
+        sse.push_str(&sse_delta("<think>The user is asking about 1+1."));
+        sse.push_str(&sse_delta(" It is a simple question."));
+        sse.push_str(&sse_delta("</think>\n\n1+1=2。"));
+        sse.push_str(&format!(
+            "data: {}\n",
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+            })
+        ));
+
+        let out = convert_sse_to_anthropic_stream(&sse).expect("convert ok");
+
+        // We need to inject a message_start; the test chunk above has no
+        // `role` field, so no message_start was emitted. The fix still works
+        // for the content path; just verify the events we care about.
+        let events = parse_anthropic_sse_events(&out);
+        let types: Vec<&str> = events.iter()
+            .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+            .collect();
+
+        // We expect: content_block_start (thinking), content_block_delta
+        // (thinking_delta x N), content_block_stop (thinking),
+        // content_block_start (text), content_block_delta (text_delta),
+        // content_block_stop (text), message_delta, message_stop.
+        assert!(types.contains(&"content_block_start"), "no content_block_start: {types:?}");
+        assert!(types.contains(&"content_block_stop"), "no content_block_stop: {types:?}");
+        assert!(types.contains(&"message_stop"), "no message_stop: {types:?}");
+
+        // Find the thinking block and verify it carried the think content.
+        let mut thinking_text = String::new();
+        let mut text_text = String::new();
+        let mut current_type: Option<String> = None;
+        for ev in &events {
+            if ev.get("type").and_then(|t| t.as_str()) == Some("content_block_start") {
+                current_type = ev.get("content_block")
+                    .and_then(|cb| cb.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+            } else if ev.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+                let delta = ev.get("delta").cloned().unwrap_or(json!({}));
+                if delta.get("type").and_then(|t| t.as_str()) == Some("thinking_delta") {
+                    if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                        thinking_text.push_str(t);
+                    }
+                } else if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
+                    if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                        text_text.push_str(t);
+                    }
+                }
+            } else if ev.get("type").and_then(|t| t.as_str()) == Some("content_block_stop") {
+                current_type = None;
+            }
+        }
+        let _ = current_type;
+
+        assert!(
+            thinking_text.contains("simple question"),
+            "expected thinking content to be present, got: {thinking_text:?}"
+        );
+        assert!(
+            text_text.contains("1+1=2"),
+            "expected answer text to be present, got: {text_text:?}"
+        );
+        // Think tags must NOT appear in the text content.
+        assert!(
+            !text_text.contains("<think>") && !text_text.contains("</think>"),
+            "text content leaked think tags: {text_text:?}"
+        );
+    }
+
+    /// Upstream `reasoning_content` field (DeepSeek-R1 / o1 style) — emitted
+    /// as thinking_delta instead of being dropped.
+    #[test]
+    fn sse_to_anthropic_emits_reasoning_content() {
+        // Build a chunk with reasoning_content in delta.
+        let chunk = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": "Let me think..." },
+                "finish_reason": null
+            }]
+        });
+        let sse = format!("data: {chunk}\n");
+        let out = convert_sse_to_anthropic_stream(&sse).expect("convert ok");
+        let events = parse_anthropic_sse_events(&out);
+        let has_thinking_start = events.iter().any(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("content_block_start")
+                && e.get("content_block")
+                    .and_then(|cb| cb.get("type"))
+                    .and_then(|t| t.as_str()) == Some("thinking")
+        });
+        let has_thinking_delta = events.iter().any(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
+                && e.get("delta")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str()) == Some("thinking_delta")
+        });
+        assert!(has_thinking_start, "expected thinking content_block_start in: {out}");
+        assert!(has_thinking_delta, "expected thinking_delta event in: {out}");
+    }
+
+    /// Non-streaming: text content with embedded <think>...</think> gets
+    /// split into a `thinking` block and a `text` block, preserving the
+    /// actual think content (rather than dropping it).
+    #[test]
+    fn nonstream_extracts_thinking_block() {
+        let resp = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "MiniMax-M3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>The user asks 1+1. The answer is 2.</think>\n\n1+1=2。"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+        });
+        let v = convert_to_anthropic_response(&resp).expect("convert ok");
+        let blocks = v.get("content").and_then(|c| c.as_array()).expect("content array");
+        let types: Vec<&str> = blocks.iter()
+            .filter_map(|b| b.get("type").and_then(|t| t.as_str()))
+            .collect();
+        assert!(types.contains(&"thinking"), "expected a thinking block, got: {types:?}");
+        assert!(types.contains(&"text"), "expected a text block, got: {types:?}");
+
+        // Thinking block should contain the actual think text.
+        let thinking_text: String = blocks.iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+            .filter_map(|b| b.get("thinking").and_then(|t| t.as_str()))
+            .collect();
+        assert!(thinking_text.contains("The answer is 2"), "expected think content, got: {thinking_text:?}");
+
+        // Text block should contain only the answer, with no think tags.
+        let text_text: String = blocks.iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        assert!(text_text.contains("1+1=2"), "expected answer text, got: {text_text:?}");
+        assert!(!text_text.contains("<think>"), "text leaked think tags: {text_text:?}");
+    }
+
+    /// Non-streaming: an explicit `reasoning_content` field on the message is
+    /// emitted as a thinking content block (previously dropped).
+    #[test]
+    fn nonstream_emits_reasoning_content() {
+        let resp = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The answer is 42.",
+                    "reasoning_content": "Let me reason about this carefully."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+        });
+        let v = convert_to_anthropic_response(&resp).expect("convert ok");
+        let blocks = v.get("content").and_then(|c| c.as_array()).expect("content array");
+        let has_thinking = blocks.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("thinking")
+                && b.get("thinking").and_then(|t| t.as_str())
+                    .map(|t| t.contains("reason about this"))
+                    .unwrap_or(false)
+        });
+        assert!(has_thinking, "expected thinking block from reasoning_content, blocks: {blocks:?}");
     }
 }
