@@ -347,6 +347,12 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
     // Suppress content between <think> and </think> (thinking leaks into text field).
     let mut inside_think: bool = false;
     let mut think_tail: String = String::new();
+    // Set to true once message_delta + message_stop have been emitted (either
+    // inline at finish_reason, or as a fallback at end-of-stream). Downstream
+    // Anthropic clients (e.g. pi-ai) block until they see message_stop, so we
+    // must guarantee one is emitted even if the upstream never sent a
+    // finish_reason chunk (truncated stream, mid-think EOF, etc.).
+    let mut message_stop_emitted = false;
 
     for line in sse_data.lines() {
         let line = line.trim();
@@ -373,10 +379,39 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
                 &mut tool_block_indices,
                 &mut inside_think,
                 &mut think_tail,
+                &mut message_stop_emitted,
                 &mut output,
             );
         }
     }
+
+    // Fallback: if the upstream never sent a finish_reason chunk (truncated
+    // stream, EOF mid-think, etc.), we must still emit message_delta +
+    // message_stop — Anthropic clients like pi-ai block until they see
+    // message_stop, otherwise the connection hangs until idle timeout.
+    if !message_stop_emitted {
+        // Close any block left open at stream end (e.g. text block buffered
+        // via think_tail whose finish never arrived).
+        if let Some(block) = open_block.take() {
+            let idx = block.index();
+            let stop_event = json!({"type": "content_block_stop", "index": idx});
+            output.push_str(&format!("data: {}\n", serde_json::to_string(&stop_event).unwrap_or_default()));
+        }
+        // Best-effort stop_reason: a stream that never finished is treated
+        // as "end_turn" since we don't know if it was a length-cap hit.
+        let message_delta = json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn",
+                "stop_sequence": null
+            },
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        });
+        let message_stop = json!({"type": "message_stop"});
+        output.push_str(&format!("data: {}\n", serde_json::to_string(&message_delta).unwrap_or_default()));
+        output.push_str(&format!("data: {}\n", serde_json::to_string(&message_stop).unwrap_or_default()));
+    }
+
     Ok(output)
 }
 
@@ -389,6 +424,7 @@ fn convert_openai_chunk_to_anthropic(
     tool_block_indices: &mut std::collections::HashMap<usize, usize>,
     inside_think: &mut bool,
     think_tail: &mut String,
+    message_stop_emitted: &mut bool,
     output: &mut String,
 ) -> Option<()> {
     let id = chunk.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -721,12 +757,16 @@ fn convert_openai_chunk_to_anthropic(
 
             let message_delta = json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": if reason == "length" { "max_tokens" } else { "end_turn" }},
+                "delta": {
+                    "stop_reason": if reason == "length" { "max_tokens" } else { "end_turn" },
+                    "stop_sequence": null
+                },
                 "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
             });
             let message_stop = json!({"type": "message_stop"});
             output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&message_delta).unwrap_or_default()));
             output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&message_stop).unwrap_or_default()));
+            *message_stop_emitted = true;
             return Some(());
         }
     }
@@ -1398,5 +1438,80 @@ mod tests {
         let tool_delta = tool_delta.expect("expected an input_json_delta event");
         let tool_delta_index = tool_delta.get("index").and_then(|v| v.as_u64()).expect("index");
         assert_eq!(tool_delta_index, 2, "tool_use input_json_delta must carry index 2");
+    }
+
+    // ----- message_delta + message_stop guarantee tests -----------------------
+    //
+    // pi-ai's Anthropic provider blocks until it sees message_stop. The
+    // converter must always emit message_delta + message_stop, even when the
+    // upstream never sent a finish_reason chunk (truncated stream, EOF
+    // mid-think, etc.).
+
+    /// Truncated stream: upstream sends role + content but never a
+    /// finish_reason chunk. The converter must still emit message_delta +
+    /// message_stop so downstream clients don't hang waiting for EOS.
+    #[test]
+    fn sse_to_anthropic_emits_message_stop_on_truncated_stream() {
+        // Just an opening chunk + content, no finish_reason. EOF mid-stream.
+        let mut sse = String::new();
+        sse.push_str(&sse_delta(""));
+        sse.push_str(&sse_delta("partial answer"));
+        // deliberately no `data: {... "finish_reason": "stop" ...}` chunk
+
+        let out = convert_sse_to_anthropic_stream(&sse).expect("convert ok");
+        let events = parse_anthropic_sse_events(&out);
+
+        let last_two_types: Vec<&str> = events.iter()
+            .rev()
+            .take(2)
+            .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            last_two_types,
+            vec!["message_stop", "message_delta"],
+            "stream must end with message_delta then message_stop, got: {last_two_types:?}"
+        );
+
+        // message_delta payload must include stop_reason and stop_sequence
+        // inside `delta`, per the Anthropic SSE schema.
+        let md = events.iter().rev()
+            .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("message_delta"))
+            .expect("message_delta");
+        let delta = md.get("delta").expect("delta");
+        assert!(delta.get("stop_reason").is_some(), "missing stop_reason: {md}");
+        assert!(delta.get("stop_sequence").is_some(), "missing stop_sequence: {md}");
+    }
+
+    /// Baseline: the normal finish_reason path also emits message_delta +
+    /// message_stop (already covered by sse_to_anthropic_emits_thinking_block,
+    /// but pin the schema explicitly here).
+    #[test]
+    fn sse_to_anthropic_message_delta_has_stop_sequence() {
+        let mut sse = String::new();
+        sse.push_str(&sse_delta(""));
+        sse.push_str(&sse_delta("hello"));
+        sse.push_str(&format!(
+            "data: {}\n",
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+            })
+        ));
+
+        let out = convert_sse_to_anthropic_stream(&sse).expect("convert ok");
+        let events = parse_anthropic_sse_events(&out);
+        let md = events.iter()
+            .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("message_delta"))
+            .expect("message_delta");
+        let delta = md.get("delta").expect("delta");
+        assert_eq!(delta.get("stop_reason").and_then(|v| v.as_str()), Some("end_turn"));
+        assert!(delta.get("stop_sequence").is_some(), "stop_sequence must be present (null)");
     }
 }
