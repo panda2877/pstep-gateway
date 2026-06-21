@@ -206,9 +206,9 @@ export const APIKeysPage: React.FC = () => {
                 <th>密钥</th>
                 <th>模型权限</th>
                 <th>Fallback 链</th>
-                <th>剩余配额</th>
+                <th className="num-col">剩余配额</th>
                 <th>创建时间</th>
-                <th>操作</th>
+                <th className="actions">操作</th>
               </tr>
             </thead>
             <tbody>

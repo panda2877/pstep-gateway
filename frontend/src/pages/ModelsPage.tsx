@@ -111,9 +111,9 @@ export const ModelsPage: React.FC = () => {
                 <th>模型</th>
                 <th>状态</th>
                 <th>被引用策略</th>
-                <th>输入单价</th>
-                <th>输出单价</th>
-                <th>操作</th>
+                <th className="num-col">输入单价</th>
+                <th className="num-col">输出单价</th>
+                <th className="actions">操作</th>
               </tr>
             </thead>
             <tbody>
