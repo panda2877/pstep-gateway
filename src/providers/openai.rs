@@ -1,7 +1,11 @@
+use crate::providers::streaming::{BoxError, LineSplit};
 use crate::providers::OutputFormat;
 use crate::types::{TokenUsage, UpstreamConfig};
+use bytes::Bytes;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::pin::Pin;
 use std::time::Duration;
 
 // ============================================================================
@@ -314,7 +318,7 @@ fn prepare_openai_body(body_json: Value, target_model: &str) -> String {
 /// for that block uses the same index that opened it. Tool_use blocks do not
 /// use this slot — they track their own indices via `tool_block_indices`.
 #[derive(Clone, Copy)]
-enum OpenBlock {
+pub(crate) enum OpenBlock {
     Thinking { index: usize },
     Text { index: usize },
 }
@@ -329,37 +333,13 @@ impl OpenBlock {
 
 pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String> {
     let mut output = String::new();
-    let mut sent_message_start = false;
-    // Currently-open thinking/text block, if any. None means no block is
-    // currently open. The index stored here must be used for every
-    // content_block_delta and content_block_stop emitted for that block.
-    let mut open_block: Option<OpenBlock> = None;
-    let mut current_prefix = "data:";
-    // Index assigned to the next content_block_start (thinking, text, or
-    // tool_use). Monotonically increasing across all block types in the
-    // message — required by the Anthropic SSE spec so downstream clients can
-    // track each open block by index.
-    let mut next_block_index: usize = 0;
-    // openai tool_call index -> our assigned block_index. Tool_use blocks
-    // consume from `next_block_index` when they open, so they continue the
-    // same monotonic sequence as thinking/text blocks.
-    let mut tool_block_indices: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    // Suppress content between <think> and </think> (thinking leaks into text field).
-    let mut inside_think: bool = false;
-    let mut think_tail: String = String::new();
-    // Set to true once message_delta + message_stop have been emitted (either
-    // inline at finish_reason, or as a fallback at end-of-stream). Downstream
-    // Anthropic clients (e.g. pi-ai) block until they see message_stop, so we
-    // must guarantee one is emitted even if the upstream never sent a
-    // finish_reason chunk (truncated stream, mid-think EOF, etc.).
-    let mut message_stop_emitted = false;
-
+    let mut translator = OpenAIToAnthropicTranslator::new();
     for line in sse_data.lines() {
         let line = line.trim();
         if line.is_empty() || line == "[DONE]" { continue; }
         if line == "data: [DONE]" { continue; }
         if line.starts_with("event: ") {
-            current_prefix = "event:";
+            translator.current_prefix = "event:";
             continue;
         }
 
@@ -370,33 +350,101 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
         };
 
         if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-            convert_openai_chunk_to_anthropic(
-                &json,
-                current_prefix,
-                &mut sent_message_start,
-                &mut open_block,
-                &mut next_block_index,
-                &mut tool_block_indices,
-                &mut inside_think,
-                &mut think_tail,
-                &mut message_stop_emitted,
-                &mut output,
-            );
+            if let Some(extra) = translator.feed_chunk(&json) {
+                output.push_str(&extra);
+            }
         }
     }
 
-    // Fallback: if the upstream never sent a finish_reason chunk (truncated
-    // stream, EOF mid-think, etc.), we must still emit message_delta +
-    // message_stop — Anthropic clients like pi-ai block until they see
-    // message_stop, otherwise the connection hangs until idle timeout.
-    if !message_stop_emitted {
+    if let Some(extra) = translator.finish() {
+        output.push_str(&extra);
+    }
+
+    Ok(output)
+}
+
+/// Streaming variant of `convert_sse_to_anthropic_stream`. Holds the
+/// stateful per-line machine so a caller feeding one SSE line at a time
+/// (e.g. via `LineSplit`) gets back exactly the bytes that should be flushed
+/// downstream at each step, with no full-buffer intermediate.
+///
+/// The field shape matches the locals previously held inside the `&str`
+/// version of `convert_sse_to_anthropic_stream`; see that function for the
+/// semantics of each field. `feed_chunk` + `finish` together produce the
+/// exact same byte stream as the buffer-then-stringify version did before.
+pub struct OpenAIToAnthropicTranslator {
+    /// Either `"data:"` (default) or `"event:"` — set by an upstream
+    /// `event: ...` line. Used as the line prefix for any event emitted
+    /// while it's current.
+    pub current_prefix: &'static str,
+    pub sent_message_start: bool,
+    pub open_block: Option<OpenBlock>,
+    pub next_block_index: usize,
+    pub tool_block_indices: std::collections::HashMap<usize, usize>,
+    pub inside_think: bool,
+    pub think_tail: String,
+    pub message_stop_emitted: bool,
+}
+
+impl Default for OpenAIToAnthropicTranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenAIToAnthropicTranslator {
+    pub fn new() -> Self {
+        Self {
+            current_prefix: "data:",
+            sent_message_start: false,
+            open_block: None,
+            next_block_index: 0,
+            tool_block_indices: std::collections::HashMap::new(),
+            inside_think: false,
+            think_tail: String::new(),
+            message_stop_emitted: false,
+        }
+    }
+
+    /// Feed one parsed OpenAI chunk (JSON object from a `data: ...` line).
+    /// Returns `Some(out)` with any bytes to flush downstream as a result,
+    /// or `None` if the chunk produced no output (the most common case —
+    /// many OpenAI chunks are finish_reason-only and produce 0-1 events).
+    pub fn feed_chunk(&mut self, chunk: &Value) -> Option<String> {
+        let mut output = String::new();
+        convert_openai_chunk_to_anthropic(
+            chunk,
+            self.current_prefix,
+            &mut self.sent_message_start,
+            &mut self.open_block,
+            &mut self.next_block_index,
+            &mut self.tool_block_indices,
+            &mut self.inside_think,
+            &mut self.think_tail,
+            &mut self.message_stop_emitted,
+            &mut output,
+        );
+        if output.is_empty() { None } else { Some(output) }
+    }
+
+    /// Call after the input stream ends. Emits any trailing `message_delta` +
+    /// `message_stop` that the upstream never sent (truncated stream, EOF
+    /// mid-think, etc.). Anthropic clients like pi-ai block until they see
+    /// `message_stop`, so we must guarantee one even on abnormal close.
+    pub fn finish(&mut self) -> Option<String> {
+        if self.message_stop_emitted {
+            return None;
+        }
+        let mut output = String::new();
+
         // Close any block left open at stream end (e.g. text block buffered
         // via think_tail whose finish never arrived).
-        if let Some(block) = open_block.take() {
+        if let Some(block) = self.open_block.take() {
             let idx = block.index();
             let stop_event = json!({"type": "content_block_stop", "index": idx});
             output.push_str(&format!("data: {}\n", serde_json::to_string(&stop_event).unwrap_or_default()));
         }
+
         // Best-effort stop_reason: a stream that never finished is treated
         // as "end_turn" since we don't know if it was a length-cap hit.
         let message_delta = json!({
@@ -410,9 +458,9 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
         let message_stop = json!({"type": "message_stop"});
         output.push_str(&format!("data: {}\n", serde_json::to_string(&message_delta).unwrap_or_default()));
         output.push_str(&format!("data: {}\n", serde_json::to_string(&message_stop).unwrap_or_default()));
+        self.message_stop_emitted = true;
+        Some(output)
     }
-
-    Ok(output)
 }
 
 fn convert_openai_chunk_to_anthropic(
@@ -919,6 +967,275 @@ pub fn convert_to_anthropic_response(openai_resp: &Value) -> Result<Value, Strin
         "stop_sequence": Value::Null,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     }))
+}
+
+// ============================================================================
+// Streaming proxy variants
+// ============================================================================
+//
+// Architecture (replacing `resp.bytes().await` buffering):
+//
+//   upstream reqwest stream
+//     └─ tokio::spawn driver task:
+//          ├─ LineSplit the bytes into lines
+//          ├─ feed lines to OpenAIToAnthropicTranslator (or pass through)
+//          └─ for each output chunk:
+//               ├─ send to body_tx (consumed by axum Body::from_stream)
+//               └─ (raw line already sent to lines_tx in parallel for usage tail)
+//     └─ tokio::spawn_blocking usage tail:
+//          └─ drain lines_rx, run TokenUsage::from_openai_sse at EOF
+//
+// Both spawned tasks complete when upstream EOF is reached. The handler
+// returns `Body::from_stream(body_rx)` and attaches the usage JoinHandle
+// to a fire-and-forget task that records usage on completion.
+//
+// We intentionally do NOT use `async-stream` (no extra dep). All state
+// machines are pure Rust; the driver task is a `tokio::spawn(async fn ...)`
+// that loops reading from one channel and writing to another.
+
+// -------- shared helpers --------
+
+/// Convert a reqwest error into a `BoxError`.
+fn reqwest_err_to_box(e: reqwest::Error) -> BoxError {
+    Box::new(e) as BoxError
+}
+
+/// Read SSE lines from `upstream_bytes_stream`, optionally translate each
+/// line via `translator` (returning the translated bytes to forward), and
+/// publish both (a) output bytes for the client on `body_tx` and (b) raw
+/// upstream lines for the usage tail on `lines_tx`.
+///
+/// Returns when the upstream stream ends. Errors propagate to `body_tx`.
+async fn drive_openai_sse_to_body(
+    upstream: impl futures::stream::Stream<Item = Result<Bytes, BoxError>> + Unpin + Send + 'static,
+    body_tx: tokio::sync::mpsc::Sender<Result<Bytes, BoxError>>,
+    lines_tx: tokio::sync::mpsc::Sender<String>,
+    translate: bool,
+) {
+    let mut line_splitter = LineSplit::new(upstream);
+    let mut translator = OpenAIToAnthropicTranslator::new();
+
+    while let Some(line_res) = line_splitter.next().await {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = body_tx.send(Err(e)).await;
+                return;
+            }
+        };
+
+        // Always forward raw upstream line to usage tail (best-effort; tail
+        // being slow just means we drop, which is fine since the tail only
+        // needs the last ~32KB to find the usage chunk).
+        let _ = lines_tx.try_send(line.clone());
+
+        if translate {
+            // OpenAI → Anthropic. event: lines flip prefix (preserved);
+            // data: lines feed the translator.
+            if let Some(_) = line.strip_prefix("event: ") {
+                translator.current_prefix = "event:";
+                continue;
+            }
+            if line == "data: [DONE]" || line == "[DONE]" {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<Value>(rest) {
+                    if let Some(extra) = translator.feed_chunk(&json) {
+                        if body_tx.send(Ok(Bytes::from(extra))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            // OpenAI → OpenAI passthrough: forward the line + '\n'.
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    if translate {
+        if let Some(extra) = translator.finish() {
+            let _ = body_tx.send(Ok(Bytes::from(extra))).await;
+        }
+    }
+}
+
+/// Spawn the usage-tail extractor. Drains `lines_rx` until it closes (or
+/// `client_disconnected` flips true), accumulates the last ~32KB into a
+/// bounded buffer, then calls `TokenUsage::from_openai_sse`.
+fn spawn_openai_usage_tail(
+    mut lines_rx: tokio::sync::mpsc::Receiver<String>,
+) -> tokio::task::JoinHandle<TokenUsage> {
+    tokio::task::spawn_blocking(move || {
+        const TAIL_CAP: usize = 32 * 1024;
+        let mut buf = String::new();
+        while let Some(line) = lines_rx.blocking_recv() {
+            if buf.len() + line.len() + 1 > TAIL_CAP {
+                let overflow = (buf.len() + line.len() + 1) - TAIL_CAP;
+                let drop_n = buf
+                    .char_indices()
+                    .nth(overflow)
+                    .map(|(i, _)| i)
+                    .unwrap_or(buf.len());
+                buf.drain(..drop_n);
+            }
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        TokenUsage::from_openai_sse(&buf)
+    })
+}
+
+/// Wrap `rx` in a `Pin<Box<dyn Stream + Send>>` so we can return it as
+/// the body stream from a public function without naming the concrete
+/// channel type.
+fn mpsc_to_body_stream(
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, BoxError>>,
+) -> Pin<Box<dyn futures::stream::Stream<Item = Result<Bytes, BoxError>> + Send>> {
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+// -------- openai upstream variants --------
+
+/// Stream variant: openai upstream → openai downstream (passthrough) OR
+/// anthropic downstream (translator).
+pub async fn proxy_openai_to_openai_stream(
+    upstream: &UpstreamConfig,
+    target_model: &str,
+    body: &str,
+    downstream_format: OutputFormat,
+) -> Result<
+    (
+        Pin<Box<dyn futures::stream::Stream<Item = Result<Bytes, BoxError>> + Send>>,
+        tokio::task::JoinHandle<TokenUsage>,
+    ),
+    String,
+> {
+    let client = build_client()?;
+    let body_json: Value = serde_json::from_str(body)
+        .map_err(|e| format!("请求体解析失败: {}", e))?;
+    let modified_body = prepare_openai_body(body_json, target_model);
+
+    let resp = client
+        .post(format!("{}/chat/completions", upstream.base_url))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", upstream.api_key))
+        .body(modified_body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // Drain the (likely error) body for logging, then bail. We have not
+        // sent any bytes to the client yet at this point.
+        let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        tracing::error!(
+            target: "upstream",
+            upstream = "openai",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "openai upstream (stream) returned non-success"
+        );
+        return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
+    }
+
+    let upstream_stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(reqwest_err_to_box));
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(32);
+    let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    let translate = downstream_format == OutputFormat::Anthropic;
+    tokio::spawn(drive_openai_sse_to_body(
+        upstream_stream,
+        body_tx,
+        lines_tx,
+        translate,
+    ));
+
+    let usage_handle = spawn_openai_usage_tail(lines_rx);
+    let body_stream = mpsc_to_body_stream(body_rx);
+    Ok((body_stream, usage_handle))
+}
+
+/// Stream variant: anthropic-format request → openai upstream →
+/// anthropic-format response (translator).
+pub async fn proxy_anthropic_to_openai_stream(
+    upstream: &UpstreamConfig,
+    target_model: &str,
+    body: &str,
+) -> Result<
+    (
+        Pin<Box<dyn futures::stream::Stream<Item = Result<Bytes, BoxError>> + Send>>,
+        tokio::task::JoinHandle<TokenUsage>,
+    ),
+    String,
+> {
+    let openai_body_raw =
+        crate::providers::anthropic::anthropic_request_to_openai_json(body, target_model)?;
+    let openai_body = prepare_openai_body(
+        serde_json::from_str(&openai_body_raw).unwrap_or(json!({})),
+        target_model,
+    );
+
+    let client = build_client()?;
+    let resp = client
+        .post(format!("{}/chat/completions", upstream.base_url))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", upstream.api_key))
+        .body(openai_body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        tracing::error!(
+            target: "upstream",
+            upstream = "openai",
+            target_model,
+            base_url = %upstream.base_url,
+            downstream = "anthropic",
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "openai upstream (anthropic->openai stream) returned non-success"
+        );
+        return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
+    }
+
+    let upstream_stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(reqwest_err_to_box));
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(32);
+    let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    // Upstream is openai; downstream wants anthropic. Same as the openai
+    // downstream=anthropic path above.
+    tokio::spawn(drive_openai_sse_to_body(
+        upstream_stream,
+        body_tx,
+        lines_tx,
+        true, // translate
+    ));
+
+    let usage_handle = spawn_openai_usage_tail(lines_rx);
+    let body_stream = mpsc_to_body_stream(body_rx);
+    Ok((body_stream, usage_handle))
 }
 
 // ============================================================================
@@ -1513,5 +1830,196 @@ mod tests {
         let delta = md.get("delta").expect("delta");
         assert_eq!(delta.get("stop_reason").and_then(|v| v.as_str()), Some("end_turn"));
         assert!(delta.get("stop_sequence").is_some(), "stop_sequence must be present (null)");
+    }
+
+    // ----- streaming-path parity tests -------------------------------------
+    //
+    // The streaming pipeline (LineSplit → OpenAIToAnthropicTranslator →
+    // body stream) must produce exactly the same bytes that the buffered
+    // `convert_sse_to_anthropic_stream` produces on the same input, even when
+    // upstream chunks split SSE lines (or even the JSON inside a `data:`
+    // line) across byte-boundaries. These tests catch any divergence between
+    // the streaming state machine and the reference non-streaming converter.
+
+    use crate::providers::streaming::LineSplit;
+    use bytes::Bytes;
+    use futures::stream::{self, StreamExt};
+
+    /// Drive the streaming pipeline on the given input bytes: split into lines
+    /// (carrying over partial lines), feed each `data:` line to a fresh
+    /// translator, and concatenate all `Some(out)` outputs plus `finish()`.
+    /// Returns the full emitted byte stream as a `String`.
+    fn drive_streaming_openai_to_anthropic(input: &[u8]) -> String {
+        let chunks: Vec<Result<Bytes, _>> = input
+            .to_vec()
+            .chunks(1) // split into 1-byte chunks to maximally stress the carry buffer
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let mut ls = LineSplit::new(stream::iter(chunks));
+        let mut translator = OpenAIToAnthropicTranslator::new();
+        let mut out = String::new();
+        // Block on the stream's items synchronously by spinning a tiny runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            while let Some(line_res) = ls.next().await {
+                let line = line_res.expect("LineSplit error");
+                let line = line.trim();
+                if line.is_empty() || line == "[DONE]" || line == "data: [DONE]" {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("event: ") {
+                    translator.current_prefix = "event:";
+                    let _ = rest; // we don't act on the event name; same as the non-streaming path
+                    continue;
+                }
+                if let Some(json_str) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                        if let Some(extra) = translator.feed_chunk(&v) {
+                            out.push_str(&extra);
+                        }
+                    }
+                }
+            }
+            if let Some(extra) = translator.finish() {
+                out.push_str(&extra);
+            }
+        });
+        out
+    }
+
+    /// Parity baseline: a normal, non-pathological OpenAI SSE stream passes
+    /// through the streaming path byte-for-byte identical to the non-streaming
+    /// path. This is the most important test — it would fail loudly if
+    /// `feed_chunk` ever drops a yield point or `finish()` ever double-emits.
+    #[test]
+    fn streaming_openai_to_anthropic_matches_buffered_path() {
+        let mut sse = String::new();
+        sse.push_str(&sse_delta("")); // role chunk
+        sse.push_str(&sse_delta("<think>reasoning step 1. "));
+        sse.push_str(&sse_delta("more reasoning. "));
+        sse.push_str(&sse_delta("</think>\n\nthe answer is 42."));
+        sse.push_str(&format!(
+            "data: {}\n",
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+            })
+        ));
+
+        let non_stream = convert_sse_to_anthropic_stream(&sse).expect("non-stream convert ok");
+        let streamed = drive_streaming_openai_to_anthropic(sse.as_bytes());
+        assert_eq!(
+            streamed, non_stream,
+            "streaming path diverged from buffered path"
+        );
+    }
+
+    /// Same input as above, but with `data: ...` JSON objects deliberately
+    /// split across chunk boundaries. The carry buffer in `LineSplit` must
+    /// reassemble them; if it ever drops bytes mid-JSON, `serde_json` will
+    /// fail to parse the line and the test fails.
+    #[test]
+    fn streaming_openai_to_anthropic_handles_chunk_boundaries() {
+        let mut sse = String::new();
+        sse.push_str(&sse_delta(""));
+        sse.push_str(&sse_delta("hello world"));
+        sse.push_str(&format!(
+            "data: {}\n",
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+            })
+        ));
+
+        let non_stream = convert_sse_to_anthropic_stream(&sse).expect("non-stream convert ok");
+
+        // Build the input as raw `Bytes` chunks of varying sizes to exercise
+        // the carry buffer: 1 byte, then 2 bytes, then a partial line, then
+        // the rest, then a chunk that ends mid-JSON, etc.
+        let raw = sse.as_bytes();
+        // 7-byte chunks is small enough to land mid-JSON for any nontrivial
+        // payload, but large enough that the test runs quickly.
+        let mut chunked: Vec<Result<Bytes, _>> = Vec::new();
+        for slice in raw.chunks(7) {
+            chunked.push(Ok(Bytes::copy_from_slice(slice)));
+        }
+
+        let mut ls = LineSplit::new(stream::iter(chunked));
+        let mut translator = OpenAIToAnthropicTranslator::new();
+        let mut out = String::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            while let Some(line_res) = ls.next().await {
+                let line = line_res.expect("LineSplit error");
+                let line = line.trim();
+                if line.is_empty() || line == "[DONE]" || line == "data: [DONE]" {
+                    continue;
+                }
+                if line.starts_with("event: ") {
+                    translator.current_prefix = "event:";
+                    continue;
+                }
+                if let Some(json_str) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                        if let Some(extra) = translator.feed_chunk(&v) {
+                            out.push_str(&extra);
+                        }
+                    }
+                }
+            }
+            if let Some(extra) = translator.finish() {
+                out.push_str(&extra);
+            }
+        });
+
+        assert_eq!(
+            out, non_stream,
+            "streaming path with 7-byte chunks diverged from buffered path"
+        );
+    }
+
+    /// Truncated stream (no finish_reason chunk) — the streaming path must
+    /// still emit `message_delta` + `message_stop` via `finish()`, just like
+    /// the non-streaming path does. This is the pi-ai hang-prevention
+    /// guarantee re-exercised end-to-end through `LineSplit`.
+    #[test]
+    fn streaming_openai_to_anthropic_finishes_truncated_stream() {
+        let mut sse = String::new();
+        sse.push_str(&sse_delta(""));
+        sse.push_str(&sse_delta("partial answer"));
+        // deliberately no finish_reason chunk; input ends mid-stream
+
+        let non_stream = convert_sse_to_anthropic_stream(&sse).expect("non-stream convert ok");
+        let streamed = drive_streaming_openai_to_anthropic(sse.as_bytes());
+
+        assert_eq!(streamed, non_stream, "truncated stream diverged");
+
+        // And the messages we promised to emit must actually be present.
+        let events = parse_anthropic_sse_events(&streamed);
+        let types: Vec<&str> = events.iter()
+            .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+            .collect();
+        assert!(types.contains(&"message_stop"), "missing message_stop: {types:?}");
+        assert!(types.contains(&"message_delta"), "missing message_delta: {types:?}");
     }
 }

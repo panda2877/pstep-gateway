@@ -228,6 +228,158 @@ impl Router {
         Err(format!("所有上游都失败: {}", last_error))
     }
 
+    /// Route a streaming request. Returns a body stream that the handler
+    /// hands to axum's `Body::from_stream`.
+    ///
+    /// **Post-stream usage recording**: a background task spawned by this
+    /// method awaits the upstream `usage_handle` (a `JoinHandle<TokenUsage>`)
+    /// once the stream is fully consumed, then records usage / quota / thaw
+    /// success on the in-memory tracker and (via quota tracker) the SQLite
+    /// `quota_usage` table. The handler does NOT need to interact with the
+    /// usage handle — it's transparent.
+    ///
+    /// **Fallback semantics**: streaming requests do NOT failover — only the
+    /// primary upstream is used. Once the first byte is flushed to the
+    /// client we cannot swap to a different upstream (the client would see
+    /// a corrupt mix), so any upstream error before the first byte yields
+    /// an immediate 502.
+    pub async fn route_stream(
+        &self,
+        model_name: &str,
+        body: &str,
+        format: OutputFormat,
+        key_fallback_policy: Option<&str>,
+        key_id: Option<&str>,
+        quota_tracker: &Arc<tokio::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::stream::Stream<
+                        Item = Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send,
+            >,
+        >,
+        String,
+    > {
+        let chain = self.build_chain(model_name, key_fallback_policy)?;
+        // No failover for streams: take only the primary upstream.
+        let primary = chain
+            .first()
+            .ok_or_else(|| format!("未知模型: {}", model_name))?;
+        let target_route = self
+            .config
+            .models
+            .get(primary)
+            .ok_or_else(|| format!("fallback 模型 {} 不存在", primary))?;
+        let primary_upstream = target_route.upstream_type.as_str().to_string();
+        let start = std::time::Instant::now();
+
+        // Thaw check: if the primary upstream is currently frozen, fail
+        // immediately. Same behavior as the non-stream path.
+        if let Some(ref tracker) = self.thaw_tracker {
+            if tracker.is_frozen(&primary_upstream, &target_route.model).await {
+                return Err(format!(
+                    "primary upstream {} / model {} is frozen",
+                    primary_upstream, target_route.model
+                ));
+            }
+        }
+
+        // Streaming requests never failover, so last_failover stays false.
+        *self.last_failover.write().await = false;
+
+        // Dispatch to the matching `proxy_*_stream` variant.
+        let (body_stream, usage_handle) = match (target_route.upstream_type, format) {
+            (crate::types::UpstreamType::Openai, OutputFormat::OpenAI) => {
+                crate::providers::openai::proxy_openai_to_openai_stream(
+                    &target_route.as_upstream(),
+                    &target_route.model,
+                    body,
+                    OutputFormat::OpenAI,
+                )
+                .await?
+            }
+            (crate::types::UpstreamType::Openai, OutputFormat::Anthropic) => {
+                crate::providers::openai::proxy_anthropic_to_openai_stream(
+                    &target_route.as_upstream(),
+                    &target_route.model,
+                    body,
+                )
+                .await?
+            }
+            (crate::types::UpstreamType::Anthropic, OutputFormat::Anthropic) => {
+                crate::providers::anthropic::proxy_anthropic_to_anthropic_stream(
+                    &target_route.as_upstream(),
+                    &target_route.model,
+                    body,
+                )
+                .await?
+            }
+            (crate::types::UpstreamType::Anthropic, OutputFormat::OpenAI) => {
+                crate::providers::anthropic::proxy_openai_to_anthropic_stream(
+                    &target_route.as_upstream(),
+                    &target_route.model,
+                    body,
+                )
+                .await?
+            }
+        };
+
+        // Fire-and-forget: record usage / quota / thaw success once the
+        // stream is fully consumed. The handler doesn't need to hold onto
+        // the JoinHandle — the task is self-contained.
+        let model = target_route.model.clone();
+        let upstream = primary_upstream.clone();
+        let usage_tracker = self.usage_tracker.clone();
+        let thaw_tracker = self.thaw_tracker.clone();
+        let quota_tracker = quota_tracker.clone();
+        let key_id_owned = key_id.map(|s| s.to_string());
+        tokio::spawn(async move {
+            match usage_handle.await {
+                Ok(usage) => {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    usage_tracker
+                        .record(crate::types::UsageRecord {
+                            model: model.clone(),
+                            upstream: upstream.clone(),
+                            prompt_tokens: usage.prompt_tokens,
+                            completion_tokens: usage.completion_tokens,
+                            total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                            success: true,
+                            latency_ms,
+                        });
+                    if let Some(ref tracker) = thaw_tracker {
+                        tracker.record_success(&upstream, &model).await;
+                    }
+                    if let Some(kid) = key_id_owned {
+                        quota_tracker
+                            .lock()
+                            .await
+                            .record(
+                                &kid,
+                                (usage.prompt_tokens + usage.completion_tokens) as u64,
+                            )
+                            .await;
+                    }
+                }
+                Err(_) => {
+                    // Task panicked or was aborted — log and bail without
+                    // recording (better to undercount than miscount).
+                    tracing::warn!(
+                        target: "router",
+                        "stream usage extraction task failed; usage not recorded"
+                    );
+                }
+            }
+        });
+
+        Ok(body_stream)
+    }
+
     /// Route a non-streaming request through the fallback chain
     pub async fn route_non_stream(
         &self,

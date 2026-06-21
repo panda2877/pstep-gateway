@@ -1,3 +1,4 @@
+use crate::providers::streaming::{BoxError, LineSplit};
 use crate::providers::OutputFormat;
 use crate::types::{
     AnthropicRequest, AnthropicContent, AnthropicMessage, AnthropicContentBlock,
@@ -6,8 +7,11 @@ use crate::types::{
     AnthropicMessagesRequest, AnthropicSystem,
     Tool as OaiTool, ToolChoice, ContentPart, FunctionDef, ImageUrl,
 };
+use bytes::Bytes;
+use futures::stream::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::pin::Pin;
 use std::time::Duration;
 
 // ============================================================================
@@ -41,6 +45,106 @@ mod tests {
         let result2 = anthropic_request_to_openai_json(body2, "MiniMax-M2.7").unwrap();
         eprintln!("=== Case B: text + tool_result ===\n{}\n=== end ===", result2);
         panic!("intentional");
+    }
+
+    // ----- streaming-path parity test (Anthropic -> OpenAI) -----------------
+    //
+    // Mirror of the OpenAI->Anthropic parity test in providers/openai.rs.
+    // Drives a real Anthropic SSE stream through LineSplit + the
+    // AnthropicToOpenAITranslator and asserts the emitted byte stream is
+    // identical to the buffered `convert_anthropic_sse_to_openai` output.
+
+    use crate::providers::streaming::LineSplit;
+    use bytes::Bytes;
+    use futures::stream;
+
+    /// Drive a synthetic Anthropic SSE byte stream through the streaming
+    /// pipeline and return the concatenated output. Splits the input into
+    /// 1-byte chunks to maximally stress `LineSplit`'s carry buffer.
+    fn drive_streaming_anthropic_to_openai(input: &[u8]) -> String {
+        let chunks: Vec<Result<Bytes, _>> = input
+            .chunks(1)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let mut ls = LineSplit::new(stream::iter(chunks));
+        let mut translator = AnthropicToOpenAITranslator::new();
+        let mut out = String::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            while let Some(line_res) = ls.next().await {
+                let line = line_res.expect("LineSplit error");
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("event: ") {
+                    translator.current_event = rest.to_string();
+                    continue;
+                }
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        let evt = translator.current_event.clone();
+                        if let Some(extra) = translator.feed_event(&evt, &v) {
+                            out.push_str(&extra);
+                        }
+                    }
+                }
+            }
+        });
+        out
+    }
+
+    /// Realistic Anthropic→OpenAI translation: message_start carries the id
+    /// and model, then content_block_start/delta/stop produces a chat.completion.chunk
+    /// with delta.content, then a final message_delta updates stop_reason, then
+    /// message_stop emits the finish chunk + [DONE]. The streaming path must
+    /// produce the same bytes as the buffered path even with 1-byte chunking.
+    #[test]
+    fn streaming_anthropic_to_openai_matches_buffered_path() {
+        // Build a representative Anthropic SSE event sequence.
+        let sse = concat!(
+            // 1. message_start — carries id + model
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream_test\",\"model\":\"MiniMax-M3\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            // 2. content_block_start (text)
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            // 3. content_block_delta (text delta with hello)
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            // 4. content_block_delta (more text)
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            // 5. content_block_stop
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            // 6. message_delta — sets stop_reason
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}}\n\n",
+            // 7. message_stop — emits the finish chunk + [DONE]
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let non_stream = convert_anthropic_sse_to_openai(sse).expect("non-stream convert ok");
+        let streamed = drive_streaming_anthropic_to_openai(sse.as_bytes());
+        assert_eq!(
+            streamed, non_stream,
+            "streaming path diverged from buffered path"
+        );
+
+        // Sanity: the streamed text must appear across the chunk deltas, and
+        // the final [DONE] sentinel must close the stream. Note the
+        // translator emits one OpenAI chunk per Anthropic content_block_delta
+        // event — it does not concatenate them — so we look for the
+        // individual pieces rather than the joined "hello world" string.
+        assert!(streamed.contains("\"hello\""), "missing first text delta: {streamed}");
+        assert!(streamed.contains("\" world\""), "missing second text delta: {streamed}");
+        assert!(streamed.contains("\"finish_reason\":\"stop\""), "missing final stop: {streamed}");
+        assert!(streamed.contains("data: [DONE]"), "missing [DONE] sentinel: {streamed}");
     }
 }
 
@@ -757,47 +861,104 @@ fn convert_anthropic_json_to_openai(anthropic_resp: &Value) -> Result<Value, Str
 }
 
 fn convert_anthropic_sse_to_openai(sse: &str) -> Result<String, String> {
-    // Translate each anthropic SSE event to the equivalent openai chunk.
-    // Tracks tool_use blocks by index so we can emit delta.tool_calls with
-    // matching `index` values, matching OpenAI's streaming protocol.
     let mut out = String::new();
-    let mut id = String::from("chatcmpl-unknown");
-    let mut model = String::new();
-    // tool_use block metadata keyed by anthropic content_block index
-    let mut tool_blocks: std::collections::HashMap<u64, (String, String)> = std::collections::HashMap::new();
-    // ordered list of tool call indices seen, to assign openai tool_calls index
-    let mut tool_order: Vec<u64> = Vec::new();
-    let mut final_stop_reason: Option<String> = None;
-
-    let now = || std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+    let mut translator = AnthropicToOpenAITranslator::new();
     for line in sse.lines() {
         let line = line.trim();
         if line.is_empty() { continue; }
-        if line == "event: message_start" {
+        if let Some(rest) = line.strip_prefix("event: ") {
+            translator.current_event = rest.to_string();
             continue;
         }
-        if line == "event: content_block_stop" {
-            continue;
+        if line.starts_with("data: ") {
+            let data = &line[6..];
+            if let Ok(v) = serde_json::from_str::<Value>(data) {
+                if let Some(extra) = translator.feed_event(&translator.current_event.clone(), &v) {
+                    out.push_str(&extra);
+                }
+            }
         }
-        if line == "event: message_stop" {
-            let finish = if !tool_order.is_empty() {
+    }
+    Ok(out)
+}
+
+/// Streaming variant of `convert_anthropic_sse_to_openai`. Holds the
+/// per-line state machine (tool block tracking, stop_reason) so a caller
+/// feeding one SSE event (event-name + data JSON) at a time gets back
+/// exactly the bytes to flush downstream at each step.
+///
+/// Wire ordering: anthropic SSE interleaves `event:` and `data:` lines for
+/// the same logical event. Callers should call `feed_event(name, json)` for
+/// each `data:` line, passing the most recently seen `event:` token as
+/// `name`. The translator filters `event: message_start` and
+/// `event: content_block_stop` internally — they produce no openai output —
+/// and on `event: message_stop` emits the final finish chunk + `[DONE]`.
+pub struct AnthropicToOpenAITranslator {
+    pub id: String,
+    pub model: String,
+    /// tool_use block metadata keyed by anthropic content_block index
+    pub tool_blocks: std::collections::HashMap<u64, (String, String)>,
+    /// ordered list of tool call indices seen, to assign openai tool_calls index
+    pub tool_order: Vec<u64>,
+    pub final_stop_reason: Option<String>,
+    /// Most recently seen `event: <name>` token. Reset by callers on each
+    /// upstream event header; consumed by the next `data:` line.
+    pub current_event: String,
+    pub done_emitted: bool,
+}
+
+impl Default for AnthropicToOpenAITranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnthropicToOpenAITranslator {
+    pub fn new() -> Self {
+        Self {
+            id: "chatcmpl-unknown".to_string(),
+            model: String::new(),
+            tool_blocks: std::collections::HashMap::new(),
+            tool_order: Vec::new(),
+            final_stop_reason: None,
+            current_event: String::new(),
+            done_emitted: false,
+        }
+    }
+
+    /// Feed one Anthropic SSE event (already parsed from the `data:` line)
+    /// along with the event-name token that preceded it. Returns `Some(out)`
+    /// with bytes to flush downstream, or `None` if the event produced no
+    /// openai output.
+    pub fn feed_event(&mut self, event: &str, v: &Value) -> Option<String> {
+        if event == "message_start" || event == "content_block_stop" {
+            return None;
+        }
+
+        let mut out = String::new();
+
+        if event == "message_stop" {
+            if self.done_emitted {
+                return None;
+            }
+            let finish = if !self.tool_order.is_empty() {
                 "tool_calls"
             } else {
-                match final_stop_reason.as_deref() {
+                match self.final_stop_reason.as_deref() {
                     Some("max_tokens") => "length",
                     Some("tool_use") => "tool_calls",
                     _ => "stop",
                 }
             };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let chunk = json!({
-                "id": id,
+                "id": self.id,
                 "object": "chat.completion.chunk",
-                "created": now(),
-                "model": model,
+                "created": now,
+                "model": self.model,
                 "choices": [{
                     "index": 0,
                     "delta": {},
@@ -806,101 +967,381 @@ fn convert_anthropic_sse_to_openai(sse: &str) -> Result<String, String> {
             });
             out.push_str(&format!("data: {}\n\n", chunk));
             out.push_str("data: [DONE]\n\n");
+            self.done_emitted = true;
+            return Some(out);
+        }
+
+        // Pull id/model out of any payload that carries them (typically
+        // message_start; harmless to re-extract on later events).
+        if let Some(mid) = v.get("message").and_then(|m| m.get("id")).and_then(|x| x.as_str()) {
+            self.id = mid.to_string();
+        }
+        if let Some(m) = v.get("message").and_then(|m| m.get("model")).and_then(|x| x.as_str()) {
+            self.model = m.to_string();
+        }
+
+        let now = || std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        match v.get("type").and_then(|x| x.as_str()) {
+            Some("content_block_start") => {
+                let block = v.get("content_block");
+                let block_type = block.and_then(|b| b.get("type")).and_then(|x| x.as_str()).unwrap_or("");
+                if block_type == "tool_use" {
+                    let block_index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let tool_id = block.and_then(|b| b.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let tool_name = block.and_then(|b| b.get("name")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    self.tool_blocks.insert(block_index, (tool_id.clone(), tool_name.clone()));
+                    if !self.tool_order.contains(&block_index) {
+                        self.tool_order.push(block_index);
+                    }
+                    let oa_index = self.tool_order.iter().position(|i| *i == block_index).unwrap_or(0);
+                    let chunk = json!({
+                        "id": self.id,
+                        "object": "chat.completion.chunk",
+                        "created": now(),
+                        "model": self.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": oa_index,
+                                    "id": tool_id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": ""}
+                                }]
+                            },
+                            "finish_reason": null
+                        }]
+                    });
+                    out.push_str(&format!("data: {}\n\n", chunk));
+                }
+            }
+            Some("content_block_delta") => {
+                let block_index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+                if self.tool_blocks.contains_key(&block_index) {
+                    // tool_use argument delta
+                    if let Some(partial) = v.get("delta").and_then(|d| d.get("partial_json")).and_then(|x| x.as_str()) {
+                        let oa_index = self.tool_order.iter().position(|i| *i == block_index).unwrap_or(0);
+                        let chunk = json!({
+                            "id": self.id,
+                            "object": "chat.completion.chunk",
+                            "created": now(),
+                            "model": self.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": oa_index,
+                                        "function": {"arguments": partial}
+                                    }]
+                                },
+                                "finish_reason": null
+                            }]
+                        });
+                        out.push_str(&format!("data: {}\n\n", chunk));
+                    }
+                } else if let Some(text) = v.get("delta").and_then(|d| d.get("text")).and_then(|x| x.as_str()) {
+                    let chunk = json!({
+                        "id": self.id,
+                        "object": "chat.completion.chunk",
+                        "created": now(),
+                        "model": self.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": null
+                        }]
+                    });
+                    out.push_str(&format!("data: {}\n\n", chunk));
+                }
+            }
+            Some("message_delta") => {
+                if let Some(sr) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|x| x.as_str()) {
+                    self.final_stop_reason = Some(sr.to_string());
+                }
+            }
+            _ => {}
+        }
+
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// Call after the input stream ends. If the upstream truncated before
+    /// emitting `message_stop`, this synthesizes the final finish chunk +
+    /// `[DONE]` so openai clients don't hang waiting for `[DONE]`.
+    pub fn finish(&mut self) -> Option<String> {
+        if self.done_emitted {
+            return None;
+        }
+        let finish = if !self.tool_order.is_empty() {
+            "tool_calls"
+        } else {
+            match self.final_stop_reason.as_deref() {
+                Some("max_tokens") => "length",
+                Some("tool_use") => "tool_calls",
+                _ => "stop",
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut out = String::new();
+        let chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": now,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish
+            }]
+        });
+        out.push_str(&format!("data: {}\n\n", chunk));
+        out.push_str("data: [DONE]\n\n");
+        self.done_emitted = true;
+        Some(out)
+    }
+}
+
+// ============================================================================
+// Streaming proxy variants
+// ============================================================================
+//
+// Same architecture as the openai.rs streaming section:
+//   upstream reqwest stream
+//     └─ tokio::spawn driver task:
+//          ├─ LineSplit bytes into lines
+//          ├─ feed each line+event into AnthropicToOpenAITranslator
+//          │  (or pass through verbatim for anthropic passthrough)
+//          └─ forward output bytes to body_tx
+//     └─ tokio::spawn_blocking usage tail:
+//          └─ drain lines_rx, run TokenUsage::from_anthropic_sse at EOF
+
+fn reqwest_err_to_box(e: reqwest::Error) -> BoxError {
+    Box::new(e) as BoxError
+}
+
+fn mpsc_to_body_stream(
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, BoxError>>,
+) -> Pin<Box<dyn futures::stream::Stream<Item = Result<Bytes, BoxError>> + Send>> {
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+fn spawn_anthropic_usage_tail(
+    mut lines_rx: tokio::sync::mpsc::Receiver<String>,
+) -> tokio::task::JoinHandle<TokenUsage> {
+    tokio::task::spawn_blocking(move || {
+        const TAIL_CAP: usize = 32 * 1024;
+        let mut buf = String::new();
+        while let Some(line) = lines_rx.blocking_recv() {
+            if buf.len() + line.len() + 1 > TAIL_CAP {
+                let overflow = (buf.len() + line.len() + 1) - TAIL_CAP;
+                let drop_n = buf
+                    .char_indices()
+                    .nth(overflow)
+                    .map(|(i, _)| i)
+                    .unwrap_or(buf.len());
+                buf.drain(..drop_n);
+            }
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        TokenUsage::from_anthropic_sse(&buf)
+    })
+}
+
+/// Drive an anthropic-upstream stream: split into lines, feed each line
+/// into `translator` (which decides whether to emit output), and forward
+/// both the output bytes to `body_tx` and the raw upstream lines to
+/// `lines_tx` for usage extraction. For the passthrough case (`translate`
+/// is false) the upstream bytes are forwarded verbatim with `'\n'`
+/// separators reinserted.
+async fn drive_anthropic_sse_to_body(
+    upstream: impl futures::stream::Stream<Item = Result<Bytes, BoxError>> + Unpin + Send + 'static,
+    body_tx: tokio::sync::mpsc::Sender<Result<Bytes, BoxError>>,
+    lines_tx: tokio::sync::mpsc::Sender<String>,
+    translate: bool,
+) {
+    let mut line_splitter = LineSplit::new(upstream);
+    let mut translator = AnthropicToOpenAITranslator::new();
+    let mut current_event: String = String::new();
+
+    while let Some(line_res) = line_splitter.next().await {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = body_tx.send(Err(e)).await;
+                return;
+            }
+        };
+
+        // Forward raw upstream line for usage extraction.
+        let _ = lines_tx.try_send(line.clone());
+
+        if !translate {
+            // Anthropic → Anthropic passthrough: forward verbatim.
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // Anthropic → OpenAI: track current event name; feed data lines.
+        if let Some(rest) = line.strip_prefix("event: ") {
+            current_event = rest.to_string();
             continue;
         }
         if line.starts_with("data: ") {
             let data = &line[6..];
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(mid) = v.get("message").and_then(|m| m.get("id")).and_then(|x| x.as_str()) {
-                    id = mid.to_string();
-                }
-                if let Some(m) = v.get("message").and_then(|m| m.get("model")).and_then(|x| x.as_str()) {
-                    model = m.to_string();
-                }
-
-                match v.get("type").and_then(|x| x.as_str()) {
-                    Some("content_block_start") => {
-                        let block = v.get("content_block");
-                        let block_type = block.and_then(|b| b.get("type")).and_then(|x| x.as_str()).unwrap_or("");
-                        if block_type == "tool_use" {
-                            let block_index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
-                            let tool_id = block.and_then(|b| b.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                            let tool_name = block.and_then(|b| b.get("name")).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                            tool_blocks.insert(block_index, (tool_id, tool_name));
-                            if !tool_order.contains(&block_index) {
-                                tool_order.push(block_index);
-                            }
-                            let oa_index = tool_order.iter().position(|i| *i == block_index).unwrap_or(0);
-                            let (tid, tname) = tool_blocks.get(&block_index).cloned().unwrap_or_default();
-                            let chunk = json!({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "created": now(),
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
-                                            "index": oa_index,
-                                            "id": tid,
-                                            "type": "function",
-                                            "function": {"name": tname, "arguments": ""}
-                                        }]
-                                    },
-                                    "finish_reason": null
-                                }]
-                            });
-                            out.push_str(&format!("data: {}\n\n", chunk));
-                        }
+            if let Ok(json) = serde_json::from_str::<Value>(data) {
+                if let Some(extra) = translator.feed_event(&current_event, &json) {
+                    if body_tx.send(Ok(Bytes::from(extra))).await.is_err() {
+                        return;
                     }
-                    Some("content_block_delta") => {
-                        let block_index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
-                        if tool_blocks.contains_key(&block_index) {
-                            // tool_use argument delta
-                            if let Some(partial) = v.get("delta").and_then(|d| d.get("partial_json")).and_then(|x| x.as_str()) {
-                                let oa_index = tool_order.iter().position(|i| *i == block_index).unwrap_or(0);
-                                let chunk = json!({
-                                    "id": id,
-                                    "object": "chat.completion.chunk",
-                                    "created": now(),
-                                    "model": model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {
-                                            "tool_calls": [{
-                                                "index": oa_index,
-                                                "function": {"arguments": partial}
-                                            }]
-                                        },
-                                        "finish_reason": null
-                                    }]
-                                });
-                                out.push_str(&format!("data: {}\n\n", chunk));
-                            }
-                        } else if let Some(text) = v.get("delta").and_then(|d| d.get("text")).and_then(|x| x.as_str()) {
-                            let chunk = json!({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "created": now(),
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": text},
-                                    "finish_reason": null
-                                }]
-                            });
-                            out.push_str(&format!("data: {}\n\n", chunk));
-                        }
-                    }
-                    Some("message_delta") => {
-                        if let Some(sr) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|x| x.as_str()) {
-                            final_stop_reason = Some(sr.to_string());
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
     }
-    Ok(out)
+
+    if translate {
+        if let Some(extra) = translator.finish() {
+            let _ = body_tx.send(Ok(Bytes::from(extra))).await;
+        }
+    }
+}
+
+/// Stream variant: anthropic upstream → anthropic downstream passthrough.
+/// (Used when the client used `/v1/messages` directly.)
+pub async fn proxy_anthropic_to_anthropic_stream(
+    upstream: &UpstreamConfig,
+    target_model: &str,
+    body: &str,
+) -> Result<
+    (
+        Pin<Box<dyn futures::stream::Stream<Item = Result<Bytes, BoxError>> + Send>>,
+        tokio::task::JoinHandle<TokenUsage>,
+    ),
+    String,
+> {
+    let client = build_client()?;
+    let mut req_json: Value = serde_json::from_str(body)
+        .map_err(|e| format!("请求体解析失败: {}", e))?;
+    if let Some(obj) = req_json.as_object_mut() {
+        obj.insert("model".to_string(), json!(target_model));
+    }
+
+    let resp = client
+        .post(format!("{}/messages", upstream.base_url))
+        .header("Content-Type", "application/json")
+        .header("x-api-key", &upstream.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .body(serde_json::to_string(&req_json).map_err(|e| e.to_string())?)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        tracing::error!(
+            target: "upstream",
+            upstream = "anthropic",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "anthropic upstream (stream passthrough) returned non-success"
+        );
+        return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
+    }
+
+    let upstream_stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(reqwest_err_to_box));
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(32);
+    let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    tokio::spawn(drive_anthropic_sse_to_body(
+        upstream_stream,
+        body_tx,
+        lines_tx,
+        false, // passthrough
+    ));
+
+    let usage_handle = spawn_anthropic_usage_tail(lines_rx);
+    let body_stream = mpsc_to_body_stream(body_rx);
+    Ok((body_stream, usage_handle))
+}
+
+/// Stream variant: anthropic upstream → openai downstream (translator).
+pub async fn proxy_openai_to_anthropic_stream(
+    upstream: &UpstreamConfig,
+    target_model: &str,
+    body: &str,
+) -> Result<
+    (
+        Pin<Box<dyn futures::stream::Stream<Item = Result<Bytes, BoxError>> + Send>>,
+        tokio::task::JoinHandle<TokenUsage>,
+    ),
+    String,
+> {
+    let client = build_client()?;
+    let openai_req: ChatCompletionsRequest = serde_json::from_str(body)
+        .map_err(|e| format!("请求体解析失败: {}", e))?;
+    let anthropic_req = openai_to_anthropic_request(&openai_req, target_model)?;
+
+    let resp = client
+        .post(format!("{}/messages", upstream.base_url))
+        .header("Content-Type", "application/json")
+        .header("x-api-key", &upstream.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .body(serde_json::to_string(&anthropic_req).map_err(|e| e.to_string())?)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        tracing::error!(
+            target: "upstream",
+            upstream = "anthropic",
+            target_model,
+            base_url = %upstream.base_url,
+            status = status.as_u16(),
+            body = %truncate(&body_str, 2048),
+            "anthropic upstream (openai->anthropic stream) returned non-success"
+        );
+        return Err(format!("上游返回 {}: {}", status.as_u16(), body_str));
+    }
+
+    let upstream_stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(reqwest_err_to_box));
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(32);
+    let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    tokio::spawn(drive_anthropic_sse_to_body(
+        upstream_stream,
+        body_tx,
+        lines_tx,
+        true, // translate
+    ));
+
+    let usage_handle = spawn_anthropic_usage_tail(lines_rx);
+    let body_stream = mpsc_to_body_stream(body_rx);
+    Ok((body_stream, usage_handle))
 }

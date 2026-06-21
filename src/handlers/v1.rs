@@ -10,6 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
+use futures::stream::StreamExt;
 use std::time::Duration;
 
 /// 鉴权后的 API Key 元数据，注入到请求上下文供 router 使用。
@@ -203,21 +205,23 @@ async fn provider_proxy(
     match result {
         Ok(resp) => {
             let status = resp.status();
-            let body_str = match resp.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": "bad_gateway",
-                            "message": format!("Failed to read response: {}", e)
-                        })),
-                    )
-                        .into_response();
-                }
-            };
 
             if !status.is_success() {
+                // Drain the (likely error) body for logging, then bail. We
+                // have not sent any bytes to the client yet at this point.
+                let body_str = match resp.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": "bad_gateway",
+                                "message": format!("Failed to read response: {}", e)
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
                 tracing::error!(
                     target: "upstream",
                     upstream = "provider_proxy",
@@ -227,18 +231,61 @@ async fn provider_proxy(
                     body = %truncate(&body_str, 2048),
                     "provider_proxy upstream returned non-success"
                 );
+                return (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body_str,
+                )
+                    .into_response();
             }
 
-            let mut response =
-                axum::response::Response::new(axum::body::Body::from(body_str.clone()));
-            response.headers_mut().insert(
-                "Content-Type",
-                if body_str.contains("event:") || body_str.contains("data:") {
-                    "text/event-stream".parse().unwrap()
-                } else {
-                    "application/json".parse().unwrap()
-                },
-            );
+            // Streaming raw passthrough. We need to sniff the first chunk
+            // to decide Content-Type (SSE vs JSON). The sniff is blocking:
+            // we read the first chunk synchronously, then forward it and
+            // all subsequent chunks to the client as a stream. This is
+            // strictly better than buffering the full body (we save
+            // unbounded memory + latency for large SSE responses) at the
+            // cost of waiting for ONE chunk to set the right Content-Type
+            // header. In practice the first upstream chunk arrives in
+            // <100ms; clients see HTTP headers + first event together.
+            let mut upstream_stream = resp.bytes_stream();
+            let first_chunk = match upstream_stream.next().await {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": "bad_gateway",
+                            "message": format!("Failed to read upstream response: {}", e)
+                        })),
+                    )
+                        .into_response();
+                }
+                None => Bytes::new(),
+            };
+
+            // Sniff Content-Type from the first chunk.
+            let prefix = String::from_utf8_lossy(&first_chunk);
+            let is_sse = prefix.contains("event:") || prefix.contains("data:");
+            let content_type: axum::http::HeaderValue = if is_sse {
+                "text/event-stream".parse().unwrap()
+            } else {
+                "application/json".parse().unwrap()
+            };
+
+            // Build a stream that yields the first chunk (already buffered)
+            // followed by the rest of the upstream stream. This is
+            // single-consumer (we own the rest of the stream after reading
+            // the first chunk) so we don't need channels — the stream
+            // just walks the remaining bytes.
+            let body_stream = futures::stream::once(async move { Ok::<_, axum::BoxError>(first_chunk) })
+                .chain(upstream_stream.map(|r| r.map_err(|e| Box::new(e) as axum::BoxError)));
+            let body = axum::body::Body::from_stream(body_stream);
+
+            let mut response = axum::response::Response::new(body);
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_TYPE, content_type);
             response
                 .headers_mut()
                 .insert("Cache-Control", "no-cache".parse().unwrap());
@@ -336,7 +383,7 @@ async fn chat_completions(
     if is_stream {
         let result = tokio::time::timeout(
             HANDLER_TIMEOUT,
-            state.router.route(
+            state.router.route_stream(
                 &model_name,
                 &body_str,
                 format,
@@ -349,17 +396,16 @@ async fn chat_completions(
 
         match result {
             Ok(Ok(stream)) => {
-                let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
+                let body = axum::body::Body::from_stream(stream);
+                let mut resp = axum::response::Response::new(body);
                 resp.headers_mut()
                     .insert("Content-Type", "text/event-stream".parse().unwrap());
                 resp.headers_mut()
                     .insert("Cache-Control", "no-cache".parse().unwrap());
                 resp.headers_mut()
                     .insert("X-Accel-Buffering", "no".parse().unwrap());
-                if state.router.did_failover().await {
-                    resp.headers_mut()
-                        .insert("X-Pstep-Failover", "true".parse().unwrap());
-                }
+                // Streaming requests never failover (see Router::route_stream),
+                // so X-Pstep-Failover is always omitted on this path.
                 resp
             }
             Ok(Err(e)) => (
@@ -378,7 +424,7 @@ async fn chat_completions(
                     model = %model_name,
                     key_id = %auth.key_id,
                     is_stream = true,
-                    "handler exceeded 150s — upstream likely wedged or DNS-broken fallback"
+                    "handler exceeded 150s — upstream likely wedged"
                 );
                 (
                     axum::http::StatusCode::GATEWAY_TIMEOUT,
@@ -466,7 +512,7 @@ async fn chat_completions_anthropic(
     if is_stream {
         let result = tokio::time::timeout(
             HANDLER_TIMEOUT,
-            state.router.route(
+            state.router.route_stream(
                 &model_name,
                 &body_str,
                 OutputFormat::Anthropic,
@@ -479,17 +525,15 @@ async fn chat_completions_anthropic(
 
         match result {
             Ok(Ok(stream)) => {
-                let mut resp = axum::response::Response::new(axum::body::Body::from(stream));
+                let body = axum::body::Body::from_stream(stream);
+                let mut resp = axum::response::Response::new(body);
                 resp.headers_mut()
                     .insert("Content-Type", "text/event-stream".parse().unwrap());
                 resp.headers_mut()
                     .insert("Cache-Control", "no-cache".parse().unwrap());
                 resp.headers_mut()
                     .insert("X-Accel-Buffering", "no".parse().unwrap());
-                if state.router.did_failover().await {
-                    resp.headers_mut()
-                        .insert("X-Pstep-Failover", "true".parse().unwrap());
-                }
+                // Streaming requests never failover (see Router::route_stream).
                 resp
             }
             Ok(Err(e)) => (
@@ -507,7 +551,7 @@ async fn chat_completions_anthropic(
                     model = %model_name,
                     key_id = %auth.key_id,
                     is_stream = true,
-                    "handler exceeded 150s — upstream likely wedged or DNS-broken fallback"
+                    "handler exceeded 150s — upstream likely wedged"
                 );
                 (
                     axum::http::StatusCode::GATEWAY_TIMEOUT,

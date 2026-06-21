@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod openai;
+pub mod streaming;
 
 use crate::types::{TokenUsage, UpstreamConfig, UpstreamType};
 
