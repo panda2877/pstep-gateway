@@ -147,6 +147,9 @@ pub struct AppState {
     pub api_key_quota: Arc<Mutex<ApiKeyQuotaTracker>>,
     /// 在飞请求计数（tower middleware 写入），供 SIGTERM drainer 轮询。
     pub in_flight: InFlight,
+    /// SQLite usage_db（可选）。admin 用量接口直接查 DB 拿任意 period 的数据，
+    /// 不受内存 retention_hours 限制。
+    pub usage_db: Option<Arc<usage_db::UsageDb>>,
 }
 
 #[tokio::main]
@@ -226,6 +229,7 @@ async fn main() {
         thaw_tracker,
         api_key_quota,
         in_flight: in_flight.clone(),
+        usage_db,
     };
 
     let cors = CorsLayer::new()

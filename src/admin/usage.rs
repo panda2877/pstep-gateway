@@ -54,15 +54,15 @@ pub async fn usage_stats(
         .unwrap_or(0);
     let cutoff = now_ms.saturating_sub(hours * 3600 * 1000);
 
-    // Get stats from router's usage tracker
-    let all_recent = state.router.get_usage_tracker().get_recent(10000);
-    let prev_cutoff = cutoff.saturating_sub(hours * 3600 * 1000);
-
-    // Filter by period
-    let filtered: Vec<_> = all_recent
-        .iter()
-        .filter(|r| r.timestamp > cutoff)
-        .collect();
+    // 优先从 SQLite 直接查（不受内存 retention_hours 限制）；无 DB 时回退到内存。
+    let filtered: Vec<crate::types::UsageRecord> = if let Some(db) = &state.usage_db {
+        db.load_recent(cutoff, 100_000).unwrap_or_default()
+    } else {
+        state.router.get_usage_tracker().get_recent(100_000)
+            .into_iter()
+            .filter(|r| r.timestamp > cutoff)
+            .collect()
+    };
 
     let token_input: u64 = filtered.iter().map(|r| r.prompt_tokens as u64).sum();
     let token_output: u64 = filtered.iter().map(|r| r.completion_tokens as u64).sum();
@@ -100,9 +100,23 @@ pub async fn usage_stats(
     }
 
     // Calculate change percent (compare with previous period)
-    let prev_total: u64 = all_recent
+    let prev_cutoff = cutoff.saturating_sub(hours * 3600 * 1000);
+
+    let prev_records: Vec<crate::types::UsageRecord> = if let Some(db) = &state.usage_db {
+        // 从 DB 查前一周期：取 prev_cutoff ~ cutoff 之间的记录
+        db.load_recent(prev_cutoff, 100_000).unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.timestamp <= cutoff)
+            .collect()
+    } else {
+        state.router.get_usage_tracker().get_recent(100_000)
+            .into_iter()
+            .filter(|r| r.timestamp > prev_cutoff && r.timestamp <= cutoff)
+            .collect()
+    };
+
+    let prev_total: u64 = prev_records
         .iter()
-        .filter(|r| r.timestamp > prev_cutoff && r.timestamp <= cutoff)
         .map(|r| (r.prompt_tokens + r.completion_tokens) as u64)
         .sum();
 
@@ -137,11 +151,15 @@ pub async fn usage_distribution(
         .unwrap_or(0);
     let cutoff = now_ms.saturating_sub(hours * 3600 * 1000);
 
-    let recent = state.router.get_usage_tracker().get_recent(10000);
-    let filtered: Vec<_> = recent
-        .iter()
-        .filter(|r| r.timestamp > cutoff)
-        .collect();
+    // 优先从 SQLite 直接查（不受内存 retention_hours 限制）；无 DB 时回退到内存。
+    let filtered: Vec<crate::types::UsageRecord> = if let Some(db) = &state.usage_db {
+        db.load_recent(cutoff, 100_000).unwrap_or_default()
+    } else {
+        state.router.get_usage_tracker().get_recent(100_000)
+            .into_iter()
+            .filter(|r| r.timestamp > cutoff)
+            .collect()
+    };
 
     // Calculate total tokens per model
     let mut by_model: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
