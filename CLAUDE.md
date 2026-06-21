@@ -279,9 +279,9 @@ npm run build      # 产物在 dist/
 
 ### 双路镜像分发
 
-- **scp 直传**（主路径）：runner `docker save` → `scp` 到 server → `podman load`。
-  国内服务器拉 GHCR 慢（实测 ~10KB/s），所以走 scp；服务器侧 `podman load` 而非 `podman pull`。
-- **GHCR 推**（`ghcr.io/panda2877/pstep-gateway`，异地备份）：全量保留，不清理；用于跨服务器容灾分发。
+- **scp 直传**（主路径）：runner `docker save` → 本地文件 → `scp` 到 server → `podman load -i`。
+  文件落盘避免管道丢字节；scp 失败时自动 fallback 到 GHCR pull。
+- **GHCR 推**（`ghcr.io/panda2877/pstep-gateway`，异地备份）：全量保留，不清理；用于跨服务器容灾分发；也是 scp 失败时的 fallback。
 
 ### 触发条件
 
@@ -329,22 +329,25 @@ sudo pstep-deploy-fallback --probe
 
 脚本幂等可重跑，失败会精确报停在哪步（pull / probe / nginx / drain）。
 
-### CI deploy 卡 GHCR pull 时的恢复（CN 服务器已知问题）
+### CI deploy 卡镜像传输时的恢复（CN 服务器已知问题）
 
-**症状**：GHA `Deploy via SSH` 步骤在 `sudo podman pull ghcr.io/.../pstep-gateway:<sha>` 卡在 `Copying blob` 17/20 之后，30+ min 后 SSH session 被打断，`##[error]Process completed with exit code 255`。:latest 标签**不会**被更新——如果 CI fail 后没人救火，新代码永远到不了 3002。
+**症状**：GHA `Deploy via SSH` 步骤超时（exit code 255），:latest 标签**不会**被更新——如果 CI fail 后没人救火，新代码永远到不了 3002。
 
-**根因**：CN 服务器到 ghcr.io 慢/挂（commit `60c0958` 改用 GHCR pull 后的回归，之前是 `docker save | ssh` 管道 silent drop）。runner 侧的 ssh/scp/管道传 14MB 镜像也多次失败，所以这条路不回退。
+**当前方案**（commit `76e0f81`）：CI 主路径用 `docker save → 文件 → scp → podman load`，scp 失败时自动 fallback 到 GHCR pull。不再依赖 GHCR pull 作为主路径（CN 服务器到 ghcr.io 实测 ~10KB/s，blob 17/20 后挂死）。
 
 **恢复**：
 
 ```bash
 ssh root@134.175.163.213
-# 1. 直接在服务器上 podman pull（同样会卡，但脚本 25min 超时，不会让脚本挂死）
-sudo pstep-deploy-fallback <commit-sha>
-# 2. 如果 pull 也挂了，看 [memory/deploy-ghcr-pull-hangs-from-cn-server.md](file_path) 末尾的"长期修法"
+# 用完整 SHA（40 字符）从 GHCR 拉 + 切流
+sudo pstep-deploy-fallback <full-commit-sha>
+# 镜像已在本机、只想切流
+sudo pstep-deploy-fallback --skip-pull <full-commit-sha>
+# 不切流，只看当前 slot / :latest 状态
+sudo pstep-deploy-fallback --probe
 ```
 
-**长期修法**（按 memory 里的判断，不要在没确认前动）：服务器上挂一个反代缓存 / 切到阿里云 ACR 个人版中专（CN 内网拉取，~5MB/s）。这个改动会动 deploy.yml，需要先和你确认。
+脚本幂等可重跑，失败会精确报停在哪步（pull / probe / nginx / drain）。
 
 ### 手动切 active slot（不部署新版本，只换流量）
 
