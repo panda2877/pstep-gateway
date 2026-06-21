@@ -309,15 +309,41 @@ fn prepare_openai_body(body_json: Value, target_model: &str) -> String {
 // openai -> anthropic response conversion (kept for ?format=anthropic on /v1/chat/completions)
 // ============================================================================
 
+/// Tracks the currently-open Anthropic content block (thinking or text) along
+/// with the index that was assigned to it, so every delta and stop emitted
+/// for that block uses the same index that opened it. Tool_use blocks do not
+/// use this slot — they track their own indices via `tool_block_indices`.
+#[derive(Clone, Copy)]
+enum OpenBlock {
+    Thinking { index: usize },
+    Text { index: usize },
+}
+
+impl OpenBlock {
+    fn index(self) -> usize {
+        match self {
+            OpenBlock::Thinking { index } | OpenBlock::Text { index } => index,
+        }
+    }
+}
+
 pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String> {
     let mut output = String::new();
     let mut sent_message_start = false;
-    let mut sent_content_block_start = false;
-    let mut thinking_started = false;
+    // Currently-open thinking/text block, if any. None means no block is
+    // currently open. The index stored here must be used for every
+    // content_block_delta and content_block_stop emitted for that block.
+    let mut open_block: Option<OpenBlock> = None;
     let mut current_prefix = "data:";
-    // Track which tool_use block indices we've emitted content_block_start for.
-    let mut started_tool_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut tool_block_counter: usize = 0;
+    // Index assigned to the next content_block_start (thinking, text, or
+    // tool_use). Monotonically increasing across all block types in the
+    // message — required by the Anthropic SSE spec so downstream clients can
+    // track each open block by index.
+    let mut next_block_index: usize = 0;
+    // openai tool_call index -> our assigned block_index. Tool_use blocks
+    // consume from `next_block_index` when they open, so they continue the
+    // same monotonic sequence as thinking/text blocks.
+    let mut tool_block_indices: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     // Suppress content between <think> and </think> (thinking leaks into text field).
     let mut inside_think: bool = false;
     let mut think_tail: String = String::new();
@@ -342,10 +368,9 @@ pub fn convert_sse_to_anthropic_stream(sse_data: &str) -> Result<String, String>
                 &json,
                 current_prefix,
                 &mut sent_message_start,
-                &mut sent_content_block_start,
-                &mut thinking_started,
-                &mut started_tool_blocks,
-                &mut tool_block_counter,
+                &mut open_block,
+                &mut next_block_index,
+                &mut tool_block_indices,
                 &mut inside_think,
                 &mut think_tail,
                 &mut output,
@@ -359,10 +384,9 @@ fn convert_openai_chunk_to_anthropic(
     chunk: &Value,
     prefix: &str,
     sent_message_start: &mut bool,
-    sent_content_block_start: &mut bool,
-    thinking_started: &mut bool,
-    started_tool_blocks: &mut std::collections::HashSet<usize>,
-    tool_block_counter: &mut usize,
+    open_block: &mut Option<OpenBlock>,
+    next_block_index: &mut usize,
+    tool_block_indices: &mut std::collections::HashMap<usize, usize>,
     inside_think: &mut bool,
     think_tail: &mut String,
     output: &mut String,
@@ -373,6 +397,71 @@ fn convert_openai_chunk_to_anthropic(
     let choice = choices.first()?;
     let delta = choice.get("delta")?;
     let finish_reason = choice.get("finish_reason");
+
+    // ---- helpers that use the shared state ----
+
+    /// Close whichever thinking/text block is currently open, emitting a
+    /// content_block_stop with the index that was assigned when it opened.
+    fn close_open(
+        open_block: &mut Option<OpenBlock>,
+        prefix: &str,
+        output: &mut String,
+    ) {
+        if let Some(block) = open_block.take() {
+            let idx = block.index();
+            let stop_event = json!({"type": "content_block_stop", "index": idx});
+            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
+        }
+    }
+
+    /// Start a new thinking block: close any open block, assign the next
+    /// monotonic index, and emit content_block_start + return the index for
+    /// the caller to use in its delta.
+    fn open_thinking(
+        open_block: &mut Option<OpenBlock>,
+        next_block_index: &mut usize,
+        prefix: &str,
+        output: &mut String,
+    ) -> usize {
+        // Close any currently-open block (thinking, text, or leftover state).
+        close_open(open_block, prefix, output);
+        let idx = *next_block_index;
+        *next_block_index += 1;
+        *open_block = Some(OpenBlock::Thinking { index: idx });
+        let start_event = json!({
+            "type": "content_block_start",
+            "index": idx,
+            "content_block": {"type": "thinking", "thinking": ""}
+        });
+        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+        idx
+    }
+
+    /// Start a new text block: close any open block, assign the next
+    /// monotonic index, and emit content_block_start.  Only called when no
+    /// text block is currently open (caller checks first).
+    fn open_text(
+        open_block: &mut Option<OpenBlock>,
+        next_block_index: &mut usize,
+        prefix: &str,
+        output: &mut String,
+    ) -> usize {
+        // Close any currently-open block first (e.g. a thinking block that
+        // was left open from the previous segment).
+        close_open(open_block, prefix, output);
+        let idx = *next_block_index;
+        *next_block_index += 1;
+        *open_block = Some(OpenBlock::Text { index: idx });
+        let start_event = json!({
+            "type": "content_block_start",
+            "index": idx,
+            "content_block": {"type": "text"}
+        });
+        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
+        idx
+    }
+
+    // ---- body starts here ----
 
     if delta.get("role").is_some() && !*sent_message_start {
         *sent_message_start = true;
@@ -404,24 +493,19 @@ fn convert_openai_chunk_to_anthropic(
             let oa_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
             // Close any open thinking/text block before opening tool_use.
-            if *sent_content_block_start && (*thinking_started || oa_index == 0) {
-                let stop_event = json!({"type": "content_block_stop", "index": 0});
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                *thinking_started = false;
-                *sent_content_block_start = false;
-            }
+            close_open(open_block, prefix, output);
 
-            // Emit content_block_start once per tool_use index.
-            if !started_tool_blocks.contains(&oa_index) {
-                started_tool_blocks.insert(oa_index);
+            if !tool_block_indices.contains_key(&oa_index) {
+                // First chunk for this tool_use: assign a new index and emit start.
+                let block_index = *next_block_index;
+                *next_block_index += 1;
+                tool_block_indices.insert(oa_index, block_index);
                 let tool_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let tool_name = tc.get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let block_index = *tool_block_counter;
-                *tool_block_counter += 1;
                 let start_event = json!({
                     "type": "content_block_start",
                     "index": block_index,
@@ -449,8 +533,7 @@ fn convert_openai_chunk_to_anthropic(
                 // Subsequent chunk for an existing tool block: emit argument delta.
                 if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
                     if !args.is_empty() {
-                        // Map openai index back to our sequential block index.
-                        let block_index = started_tool_blocks.iter().position(|&i| i == oa_index).unwrap_or(oa_index);
+                        let block_index = tool_block_indices.get(&oa_index).copied().unwrap_or(oa_index);
                         let delta_event = json!({
                             "type": "content_block_delta",
                             "index": block_index,
@@ -469,24 +552,13 @@ fn convert_openai_chunk_to_anthropic(
     // and shows the chain-of-thought in its UI; dropping them hides it.
     if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
         if !reasoning.is_empty() {
-            if !*thinking_started {
-                // Close any open text block first.
-                if *sent_content_block_start {
-                    let stop_event = json!({"type": "content_block_stop", "index": 0});
-                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                    *sent_content_block_start = false;
-                }
-                let start_event = json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "thinking", "thinking": ""}
-                });
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                *thinking_started = true;
-            }
+            let idx = match open_block {
+                Some(OpenBlock::Thinking { index }) => *index,
+                _ => open_thinking(open_block, next_block_index, prefix, output),
+            };
             let delta_event = json!({
                 "type": "content_block_delta",
-                "index": 0,
+                "index": idx,
                 "delta": {"type": "thinking_delta", "thinking": reasoning}
             });
             output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
@@ -510,32 +582,19 @@ fn convert_openai_chunk_to_anthropic(
                         // Emit everything up to </think> as thinking_delta.
                         let think_segment = &rest[..end];
                         if !think_segment.is_empty() {
-                            if !*thinking_started {
-                                // Close any open text block first.
-                                if *sent_content_block_start {
-                                    let stop_event = json!({"type": "content_block_stop", "index": 0});
-                                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                                    *sent_content_block_start = false;
-                                }
-                                let start_event = json!({
-                                    "type": "content_block_start",
-                                    "index": 0,
-                                    "content_block": {"type": "thinking", "thinking": ""}
-                                });
-                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                                *thinking_started = true;
-                            }
+                            let idx = match open_block {
+                                Some(OpenBlock::Thinking { index }) => *index,
+                                _ => open_thinking(open_block, next_block_index, prefix, output),
+                            };
                             let delta_event = json!({
                                 "type": "content_block_delta",
-                                "index": 0,
+                                "index": idx,
                                 "delta": {"type": "thinking_delta", "thinking": think_segment}
                             });
                             output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
                         }
                         // Close the thinking block.
-                        let stop_event = json!({"type": "content_block_stop", "index": 0});
-                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                        *thinking_started = false;
+                        close_open(open_block, prefix, output);
                         rest = &rest[end + 8..];
                         *inside_think = false;
                     } else {
@@ -553,23 +612,13 @@ fn convert_openai_chunk_to_anthropic(
                             let think_segment = &rest[..cut];
                             rest = &rest[cut..];
                             if !think_segment.is_empty() {
-                                if !*thinking_started {
-                                    if *sent_content_block_start {
-                                        let stop_event = json!({"type": "content_block_stop", "index": 0});
-                                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                                        *sent_content_block_start = false;
-                                    }
-                                    let start_event = json!({
-                                        "type": "content_block_start",
-                                        "index": 0,
-                                        "content_block": {"type": "thinking", "thinking": ""}
-                                    });
-                                    output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                                    *thinking_started = true;
-                                }
+                                let idx = match open_block {
+                                    Some(OpenBlock::Thinking { index }) => *index,
+                                    _ => open_thinking(open_block, next_block_index, prefix, output),
+                                };
                                 let delta_event = json!({
                                     "type": "content_block_delta",
-                                    "index": 0,
+                                    "index": idx,
                                     "delta": {"type": "thinking_delta", "thinking": think_segment}
                                 });
                                 output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
@@ -582,24 +631,14 @@ fn convert_openai_chunk_to_anthropic(
                     // Emit everything up to <think> as text_delta.
                     let text_segment = &rest[..start];
                     if !text_segment.is_empty() {
-                        // Close any open thinking block first.
-                        if *thinking_started {
-                            let stop_event = json!({"type": "content_block_stop", "index": 0});
-                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                            *thinking_started = false;
-                        }
-                        if !*sent_content_block_start {
-                            let start_event = json!({
-                                "type": "content_block_start",
-                                "index": 0,
-                                "content_block": {"type": "text"}
-                            });
-                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                            *sent_content_block_start = true;
-                        }
+                        // Only open a new text block if one isn't already open.
+                        let idx = match open_block {
+                            Some(OpenBlock::Text { index }) => *index,
+                            _ => open_text(open_block, next_block_index, prefix, output),
+                        };
                         let delta_event = json!({
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": idx,
                             "delta": {"type": "text_delta", "text": text_segment}
                         });
                         output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
@@ -620,23 +659,13 @@ fn convert_openai_chunk_to_anthropic(
                         let text_segment = &rest[..cut];
                         rest = &rest[cut..];
                         if !text_segment.is_empty() {
-                            if *thinking_started {
-                                let stop_event = json!({"type": "content_block_stop", "index": 0});
-                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                                *thinking_started = false;
-                            }
-                            if !*sent_content_block_start {
-                                let start_event = json!({
-                                    "type": "content_block_start",
-                                    "index": 0,
-                                    "content_block": {"type": "text"}
-                                });
-                                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                                *sent_content_block_start = true;
-                            }
+                            let idx = match open_block {
+                                Some(OpenBlock::Text { index }) => *index,
+                                _ => open_text(open_block, next_block_index, prefix, output),
+                            };
                             let delta_event = json!({
                                 "type": "content_block_delta",
-                                "index": 0,
+                                "index": idx,
                                 "delta": {"type": "text_delta", "text": text_segment}
                             });
                             output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
@@ -659,57 +688,33 @@ fn convert_openai_chunk_to_anthropic(
             // was held back as the current block type, then close the block.
             if !think_tail.is_empty() {
                 if *inside_think {
-                    if !*thinking_started {
-                        if *sent_content_block_start {
-                            let stop_event = json!({"type": "content_block_stop", "index": 0});
-                            output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                            *sent_content_block_start = false;
-                        }
-                        let start_event = json!({
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": {"type": "thinking", "thinking": ""}
-                        });
-                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                        *thinking_started = true;
-                    }
+                    let idx = match open_block {
+                        Some(OpenBlock::Thinking { index }) => *index,
+                        _ => open_thinking(open_block, next_block_index, prefix, output),
+                    };
                     let delta_event = json!({
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": idx,
                         "delta": {"type": "thinking_delta", "thinking": think_tail.as_str()}
                     });
                     output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
                 } else {
-                    if *thinking_started {
-                        let stop_event = json!({"type": "content_block_stop", "index": 0});
-                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-                        *thinking_started = false;
-                    }
-                    if !*sent_content_block_start {
-                        let start_event = json!({
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": {"type": "text"}
-                        });
-                        output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&start_event).unwrap_or_default()));
-                        *sent_content_block_start = true;
-                    }
+                    let idx = match open_block {
+                        Some(OpenBlock::Text { index }) => *index,
+                        _ => open_text(open_block, next_block_index, prefix, output),
+                    };
                     let delta_event = json!({
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": idx,
                         "delta": {"type": "text_delta", "text": think_tail.as_str()}
                     });
                     output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&delta_event).unwrap_or_default()));
                 }
                 think_tail.clear();
             }
-            // Close any open thinking block (e.g. upstream ended mid-think
-            // without sending </think>).
-            if *thinking_started {
-                *thinking_started = false;
-                let stop_event = json!({"type": "content_block_stop", "index": 0});
-                output.push_str(&format!("{} {}\n", prefix, serde_json::to_string(&stop_event).unwrap_or_default()));
-            }
+            // Close any open block (e.g. upstream ended mid-think without
+            // sending </think>, or a text block left open at stream end).
+            close_open(open_block, prefix, output);
             let usage = chunk.get("usage");
             let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
             let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1190,5 +1195,208 @@ mod tests {
                     .unwrap_or(false)
         });
         assert!(has_thinking, "expected thinking block from reasoning_content, blocks: {blocks:?}");
+    }
+
+    // ----- monotonic content_block index tests --------------------------------
+    //
+    // Regression coverage for the bug where every thinking and text block was
+    // emitted with `index: 0`, and tool_use blocks had their own independent
+    // counter starting at 0. The Anthropic SSE spec requires content_block
+    // indices to be a monotonically increasing sequence across the entire
+    // message. These tests verify the converter emits correct indices for:
+    //   1. thinking followed by text
+    //   2. thinking → text → tool_use (all three block types in one message)
+
+    /// Index-bookkeeping: walk a parsed Anthropic event stream and assert
+    /// every content_block_start has a unique index, every delta/stop for that
+    /// block carries the same index, and indices are emitted in increasing
+    /// order. Returns the (block_type, index) sequence for ad-hoc assertions.
+    fn assert_block_indices_increasing(events: &[Value]) -> Vec<(String, usize)> {
+        let mut starts: Vec<(usize, String)> = Vec::new(); // (index, block_type)
+        let mut current_index: Option<usize> = None;
+        let mut last_start_index: Option<usize> = None;
+
+        for ev in events {
+            match ev.get("type").and_then(|t| t.as_str()) {
+                Some("content_block_start") => {
+                    let idx = ev.get("index").and_then(|v| v.as_u64()).expect("index") as usize;
+                    let block_type = ev.get("content_block")
+                        .and_then(|cb| cb.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // No duplicate indices across content_block_start events.
+                    assert!(
+                        !starts.iter().any(|(i, _)| *i == idx),
+                        "duplicate content_block_start index {idx} (existing: {starts:?})"
+                    );
+                    // Indices must be emitted in increasing order.
+                    if let Some(prev) = last_start_index {
+                        assert!(
+                            idx > prev,
+                            "content_block_start index {idx} did not increase over previous {prev}"
+                        );
+                    }
+                    starts.push((idx, block_type.clone()));
+                    last_start_index = Some(idx);
+                    current_index = Some(idx);
+                }
+                Some("content_block_delta") | Some("content_block_stop") => {
+                    let idx = ev.get("index").and_then(|v| v.as_u64()).expect("index") as usize;
+                    let expected = current_index.expect("delta/stop before any start");
+                    assert_eq!(
+                        idx, expected,
+                        "delta/stop index {idx} did not match current open block {expected}"
+                    );
+                    if ev.get("type").and_then(|t| t.as_str()) == Some("content_block_stop") {
+                        current_index = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        starts.into_iter().map(|(i, t)| (t, i)).collect()
+    }
+
+    /// thinking → text sequence must produce index 0 (thinking) and
+    /// index 1 (text), with all deltas/stops matching the block they belong to.
+    #[test]
+    fn sse_to_anthropic_thinking_then_text_monotonic_indices() {
+        let mut sse = String::new();
+        // chunk 1: role (triggers message_start, no content yet)
+        sse.push_str(&sse_delta(""));
+        // chunk 2: opens a thinking block via <think> tag
+        sse.push_str(&sse_delta("<think>reasoning text here</think>"));
+        // chunk 3: plain text after the think tag — opens a text block.
+        // Use a short payload (< 6 bytes) so the whole thing becomes think_tail
+        // and only the finish chunk flushes it as text_delta. This way the
+        // text block is opened, not yet closed, until the very end.
+        sse.push_str(&sse_delta("ans"));
+        // chunk 4: finish — flushes the tail and closes the text block.
+        sse.push_str(&format!(
+            "data: {}\n",
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+            })
+        ));
+
+        let out = convert_sse_to_anthropic_stream(&sse).expect("convert ok");
+        let events = parse_anthropic_sse_events(&out);
+        let blocks = assert_block_indices_increasing(&events);
+
+        // Expect exactly thinking(0) and text(1) in that order.
+        assert_eq!(
+            blocks,
+            vec![("thinking".to_string(), 0), ("text".to_string(), 1)],
+            "expected thinking at 0 and text at 1, got: {blocks:?}"
+        );
+
+        // Spot-check content distribution: thinking_delta carries "reasoning
+        // text here", text_delta carries "ans".
+        let mut thinking_text = String::new();
+        let mut text_text = String::new();
+        for ev in &events {
+            if ev.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+                let delta = ev.get("delta").cloned().unwrap_or(json!({}));
+                if delta.get("type").and_then(|t| t.as_str()) == Some("thinking_delta") {
+                    if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                        thinking_text.push_str(t);
+                    }
+                } else if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
+                    if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                        text_text.push_str(t);
+                    }
+                }
+            }
+        }
+        assert!(thinking_text.contains("reasoning text here"), "thinking delta missing content: {thinking_text:?}");
+        assert!(text_text.contains("ans"), "text delta missing content: {text_text:?}");
+    }
+
+    /// thinking → text → tool_use must produce indices 0, 1, 2 — and the
+    /// tool_use's input_json_delta must carry index 2 (continuing the same
+    /// monotonic sequence instead of restarting from a separate counter).
+    #[test]
+    fn sse_to_anthropic_thinking_text_tool_monotonic_indices() {
+        let mut sse = String::new();
+        // chunk 1: role
+        sse.push_str(&sse_delta(""));
+        // chunk 2: opens thinking block, then </think> closes it
+        sse.push_str(&sse_delta("<think>plan</think>"));
+        // chunk 3: opens text block. Payload must exceed the 6-byte think_tail
+        // window so the text block actually opens (otherwise the bytes are
+        // held back as think_tail until finish).
+        sse.push_str(&sse_delta("the answer is 42."));
+        // chunk 4: tool_call arrives. This should close the text block first
+        // (stop index 1) and then open the tool_use block at index 2.
+        let tool_chunk = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "model": "MiniMax-M3",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "toolu_01",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        sse.push_str(&format!("data: {tool_chunk}\n"));
+        // chunk 5: finish — flushes the buffered "ok" tail as text_delta first,
+        // then closes the text block (or — depending on order — closes text
+        // first then flushes tail). Either way the final indices must be 0,1,2.
+        sse.push_str(&format!(
+            "data: {}\n",
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+            })
+        ));
+
+        let out = convert_sse_to_anthropic_stream(&sse).expect("convert ok");
+        let events = parse_anthropic_sse_events(&out);
+        let blocks = assert_block_indices_increasing(&events);
+
+        // Expect thinking(0), text(1), tool_use(2) in arrival order.
+        assert_eq!(
+            blocks,
+            vec![
+                ("thinking".to_string(), 0),
+                ("text".to_string(), 1),
+                ("tool_use".to_string(), 2),
+            ],
+            "expected thinking=0, text=1, tool_use=2, got: {blocks:?}"
+        );
+
+        // Spot-check the tool_use block's input_json_delta carries index 2.
+        let tool_delta = events.iter().find(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
+                && e.get("delta")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str()) == Some("input_json_delta")
+        });
+        let tool_delta = tool_delta.expect("expected an input_json_delta event");
+        let tool_delta_index = tool_delta.get("index").and_then(|v| v.as_u64()).expect("index");
+        assert_eq!(tool_delta_index, 2, "tool_use input_json_delta must carry index 2");
     }
 }
