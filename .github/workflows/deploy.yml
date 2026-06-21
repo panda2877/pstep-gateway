@@ -263,32 +263,63 @@ jobs:
           # 上面的 ssh session 已经做完这件事；保留这段只是占位，不再发 ssh。
           echo "🔧 准备运行时目录（已在上一步完成，跳过）"
 
-          # ---- 3. 远端从 GHCR 拉镜像 ----
-          # 不再用 docker save | gzip | ssh 管道直传 gateway 镜像了。
-          # 这个 GHA runner 类型下的 ssh/scp/管道直传有系统性不可靠（管
-          # 道半路丢字节 / scp CRC 错 / scp 沉默 0 字节）—— 连续 6 次
-          # deploy 都挂在「镜像从 runner 传到远端」这一步。
+          # ---- 3. 镜像从 runner 直传到服务器（docker save → scp → podman load）----
+          # 为什么不走 GHCR pull：国内服务器（134.175.163.213）到 ghcr.io
+          # 实测 ~10KB/s，blob 17/20 后挂死，30min+ 无进度（commit 60c0958
+          # 切到 GHCR pull 后的回归）。
           #
-          # 既然构建步骤已经 `docker push` 到 ghcr.io/panda2877/pstep-gateway
-          # （公开仓库），远端直接 `podman pull` 即可：
-          #   - 走 HTTPS，由 container registry 内置的 layer checksum 校验
-          #   - 失败有明确 HTTP 状态码，不会出现「沉默丢字节」
-          #   - 镜像一次性到位，不需要先 load 再 tag（pull 自动用 :SHA tag）
-          #   - 走完后我们再 tag 成 :latest 覆盖悬空 ID
-          IMAGE="ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}"
-          echo "🐳 远端从 GHCR 拉镜像: $IMAGE..."
-          $SSHD "
-            set -e
-            echo '---- pull 前 registry 已有镜像 ----'
-            sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}' \\
-              | grep 'pstep-gateway' || echo '(none)'
-            sudo podman pull '$IMAGE'
-            sudo podman tag '$IMAGE' pstep-gateway:latest
-            echo '---- pull 后 ----'
-            sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' \\
-              | grep 'pstep-gateway'
-            echo '✅ 镜像已 load + tag 为 latest'
-          "
+          # 为什么不走 docker save | gzip | ssh 管道：GHA runner 类型下
+          # ssh 管道有系统性不可靠（半路丢字节 / scp CRC 错 / 沉默 0 字节），
+          # 连续 6 次 deploy 挂在管道传输。
+          #
+          # 新方案：docker save → 写文件 → scp 传文件 → podman load -i。
+          # 文件落盘避免管道丢字节；scp 自带校验；load 用 -i 从文件读。
+          IMAGE_TAG="${{ github.sha }}"
+          LOCAL_IMAGE="pstep-gateway:${IMAGE_TAG}"
+          SCP_TMP="/tmp/pstep-gateway-image.tar"
+          REMOTE_TMP="/tmp/pstep-gateway-image.tar"
+
+          echo "🐳 导出镜像到本地文件: $LOCAL_IMAGE..."
+          docker save "$LOCAL_IMAGE" -o "$SCP_TMP"
+          LOCAL_SIZE=$(stat -c%s "$SCP_TMP" 2>/dev/null || stat -f%z "$SCP_TMP")
+          echo "📦 镜像大小: $((LOCAL_SIZE / 1048576))MB"
+
+          echo "📤 scp 传镜像到服务器..."
+          if ! scp -o ConnectTimeout=60 -o StrictHostKeyChecking=accept-new \
+            -i ~/.ssh/deploy_key "$SCP_TMP" "${SERVER_USER}@${SERVER_HOST}:"$REMOTE_TMP; then
+            echo "⚠️  scp 失败，尝试 GHCR pull fallback..."
+            $SSHD "
+              set -e
+              IMAGE='ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}'
+              echo \"fallback: podman pull \$IMAGE\"
+              sudo podman pull \"\$IMAGE\"
+              sudo podman tag \"\$IMAGE\" pstep-gateway:latest
+              echo '✅ fallback GHCR pull 成功'
+            "
+            rm -f "$SCP_TMP"
+          else
+            rm -f "$SCP_TMP"
+            echo "🐳 服务器端 podman load + tag..."
+            $SSHD "
+              set -e
+              echo '---- load 前 ----'
+              sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}' \\
+                | grep 'pstep-gateway' || echo '(none)'
+              REMOTE_SIZE=\$(sudo stat -c%s '$REMOTE_TMP' 2>/dev/null || echo 0)
+              echo \"远程文件大小: \$REMOTE_SIZE bytes（本地 $LOCAL_SIZE bytes）\"
+              if [ \"\$REMOTE_SIZE\" -lt 1000000 ]; then
+                echo '❌ 远程镜像文件过小（可能传输不完整），退出'
+                exit 1
+              fi
+              sudo podman load -i '$REMOTE_TMP'
+              sudo podman tag 'pstep-gateway:${{ github.sha }}' pstep-gateway:latest
+              rm -f '$REMOTE_TMP'
+              echo '---- load 后 ----'
+              sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' \\
+                | grep 'pstep-gateway'
+              echo '✅ 镜像已 load + tag 为 latest'
+            "
+          fi
 
           # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
           # 蓝绿流程：
