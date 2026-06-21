@@ -18,8 +18,11 @@ use std::time::Duration;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Regression: assistant message with tool_use-only content (no text)
+    /// must still be emitted so the subsequent role="tool" messages have a
+    /// preceding tool_calls carrier. MiniMax rejects with 400 otherwise.
     #[test]
-    fn debug_anthropic_to_openai() {
+    fn anthropic_to_openai_tool_use_only_assistant_emitted() {
         let body = r#"{
           "model": "minimax",
           "max_tokens": 50,
@@ -30,21 +33,26 @@ mod tests {
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}]}
           ]
         }"#;
-        let result = anthropic_request_to_openai_json(body, "MiniMax-M2.7").unwrap();
-        eprintln!("=== Case A: tool_result-only user ===\n{}\n=== end ===", result);
+        let result = anthropic_request_to_openai_json(body, "MiniMax-M3").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let msgs = parsed["messages"].as_array().unwrap();
 
-        let body2 = r#"{
-          "model": "minimax",
-          "messages": [
-            {"role": "user", "content": [
-              {"type": "text", "text": "Please call"},
-              {"type": "tool_result", "tool_use_id": "toolu_D", "content": "data"}
-            ]}
-          ]
-        }"#;
-        let result2 = anthropic_request_to_openai_json(body2, "MiniMax-M2.7").unwrap();
-        eprintln!("=== Case B: text + tool_result ===\n{}\n=== end ===", result2);
-        panic!("intentional");
+        // Should have: system-derived user, assistant with tool_calls, tool result
+        // Find the assistant message
+        let assistant_msg = msgs.iter().find(|m| m["role"] == "assistant").expect("assistant message must be present");
+        // tool_calls must be present
+        let tc = assistant_msg["tool_calls"].as_array().expect("tool_calls must be an array");
+        assert_eq!(tc.len(), 1, "expected 1 tool_call");
+        assert_eq!(tc[0]["id"], "toolu_D");
+
+        // tool message must come after the assistant message
+        let tool_msg = msgs.iter().find(|m| m["role"] == "tool").expect("tool message must be present");
+        assert_eq!(tool_msg["tool_call_id"], "toolu_D");
+
+        // Verify ordering: assistant index < tool index
+        let assistant_idx = msgs.iter().position(|m| m["role"] == "assistant").unwrap();
+        let tool_idx = msgs.iter().position(|m| m["role"] == "tool").unwrap();
+        assert!(assistant_idx < tool_idx, "assistant must come before tool message");
     }
 
     // ----- streaming-path parity test (Anthropic -> OpenAI) -----------------
@@ -631,7 +639,6 @@ pub fn anthropic_request_to_openai_json(
                             }
                         }
                         "tool_use" => {
-                            has_non_tool_result = true;
                             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let input = v.get("input").cloned().unwrap_or(json!({}));
@@ -643,6 +650,14 @@ pub fn anthropic_request_to_openai_json(
                                     "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
                                 }
                             }));
+                            // tool_use blocks are translated into the
+                            // assistant message's tool_calls field. The
+                            // assistant message MUST be emitted so that
+                            // the subsequent role="tool" messages have a
+                            // preceding tool_calls carrier — otherwise
+                            // strict upstreams (MiniMax) reject with
+                            // "tool call result does not follow tool call".
+                            has_non_tool_result = true;
                         }
                         "tool_result" => {
                             // tool_result blocks are extracted into role="tool"
