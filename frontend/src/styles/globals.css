@@ -190,8 +190,14 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .table-wrap::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .ds-table th { color: var(--fg-2); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
 .ds-table tbody tr:hover { background: var(--surface); }
-.ds-table .num-col { font-family: var(--font-mono); text-align: right; }
-.ds-table .actions { text-align: right; white-space: nowrap; }
+.ds-table .num-col, .ds-table .num-col th,
+.ds-table .actions, .ds-table th.actions { text-align: right; }
+.ds-table .actions {
+  white-space: nowrap;
+  /* 列宽只占按钮需要的宽度；width:1% 是 table-layout:auto 下的标准收缩技巧 */
+  width: 1%;
+}
+.ds-table .actions .btn + .btn { margin-left: 6px; }
 
 .fallback-chain { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .chain-node { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; }
