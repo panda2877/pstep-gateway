@@ -143,8 +143,8 @@ export const ModelsPage: React.FC = () => {
                         ? model.referenced_by_policies.join(', ')
                         : '—'}
                     </td>
-                    <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_input)}</td>
-                    <td className="num-col" style={{ textAlign: 'left' }}>{formatPrice(model.price_per_output)}</td>
+                    <td className="num-col">{formatPrice(model.price_per_input)}</td>
+                    <td className="num-col">{formatPrice(model.price_per_output)}</td>
                     <td className="actions">
                       <Button variant="secondary" size="sm" onClick={() => openEditModal(model)}>
                         编辑

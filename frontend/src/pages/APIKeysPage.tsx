@@ -247,7 +247,7 @@ export const APIKeysPage: React.FC = () => {
                       </Badge>
                     </td>
                     <td className="meta">{key.fallback_policy || '—'}</td>
-                    <td className="num-col" style={{ textAlign: 'left' }}>
+                    <td className="num-col">
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <div
                           style={{
