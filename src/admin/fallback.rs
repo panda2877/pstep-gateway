@@ -1,4 +1,3 @@
-use crate::config::save_config;
 use crate::types::{CreateFallbackPolicyRequest, FallbackPolicy, UpdateFallbackPolicyRequest};
 use crate::AppState;
 use axum::{
@@ -58,15 +57,12 @@ pub async fn create_policy(
     };
     config.fallback_policies.insert(req.id.clone(), policy);
 
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+    // 持久化到数据库
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.upsert_fallback_policy(&req.id, config.fallback_policies.get(&req.id).unwrap()) {
+            eprintln!("⚠️  持久化 fallback_policy 到数据库失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
     }
 
     let resp_policy = {
@@ -160,15 +156,12 @@ pub async fn update_policy(
         policy.chain = chain;
     }
 
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+    // 持久化到数据库
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.upsert_fallback_policy(&id, config.fallback_policies.get(&id).unwrap()) {
+            eprintln!("⚠️  持久化 fallback_policy 到数据库失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
     }
 
     let p = config.fallback_policies.get(&id).cloned().unwrap();
@@ -231,15 +224,12 @@ pub async fn delete_policy(
             .into_response();
     }
 
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+    // 从数据库删除
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.delete_fallback_policy(&id) {
+            eprintln!("⚠️  从数据库删除 fallback_policy 失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
     }
 
     (

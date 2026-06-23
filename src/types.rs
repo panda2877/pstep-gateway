@@ -145,6 +145,16 @@ impl ModelStatus {
     }
 }
 
+/// 模型元数据覆盖（仅热重载字段），用于数据库持久化
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelMetadataOverride {
+    pub name: Option<String>,
+    /// 枚举小写字符串: "active" | "rate_limited" | "disabled"
+    pub status: Option<String>,
+    pub price_per_input: Option<f64>,
+    pub price_per_output: Option<f64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FallbackPolicyConfig {
     #[serde(default)]

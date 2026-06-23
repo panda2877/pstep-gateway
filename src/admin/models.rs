@@ -1,4 +1,3 @@
-use crate::config::save_config;
 use crate::types::{ModelConfig, ModelStatus, UpdateModelConfigRequest, UpstreamType};
 use crate::AppState;
 use axum::{
@@ -272,15 +271,25 @@ pub async fn update_model(
         }
     }
 
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+    // 持久化热重载字段到数据库
+    if let Some(db) = &state.usage_db {
+        let override_config = crate::types::ModelMetadataOverride {
+            name: name.clone(),
+            status: status_str.clone(),
+            price_per_input: price_input,
+            price_per_output: price_output,
+        };
+        if let Err(e) = db.upsert_model_override(&id, &override_config) {
+            eprintln!("⚠️  持久化 model_override 到数据库失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
+    }
+
+    // 如果有需重启字段，添加警告日志
+    if restart_required {
+        eprintln!(
+            "⚠️  api_key/base_url/type/model 变更已写入内存，需修改 YAML 文件并重启服务才能生效"
+        );
     }
 
     // 读回最新值

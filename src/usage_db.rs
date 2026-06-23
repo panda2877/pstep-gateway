@@ -11,7 +11,7 @@
 //! ApiKeyQuotaTracker) logs and continues — a DB hiccup should not fail a
 //! chat request.
 
-use crate::types::UsageRecord;
+use crate::types::{UsageRecord, FallbackPolicyConfig, ClientApiKeyConfig, ModelMetadataOverride};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
@@ -73,6 +73,24 @@ impl UsageDb {
              CREATE TABLE IF NOT EXISTS quota_usage (
                  key_id TEXT PRIMARY KEY,
                  tokens INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             -- 持久化配置表：fallback 策略
+             CREATE TABLE IF NOT EXISTS persisted_fallback_policies (
+                 policy_id TEXT PRIMARY KEY,
+                 config_json TEXT NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             -- 持久化配置表：客户端 API Key
+             CREATE TABLE IF NOT EXISTS persisted_client_api_keys (
+                 key_id TEXT PRIMARY KEY,
+                 config_json TEXT NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             -- 持久化配置表：模型元数据覆盖（仅热重载字段）
+             CREATE TABLE IF NOT EXISTS persisted_model_overrides (
+                 model_id TEXT PRIMARY KEY,
+                 config_json TEXT NOT NULL,
                  updated_at_ms INTEGER NOT NULL
              );",
         )
@@ -174,6 +192,169 @@ impl UsageDb {
         }
         Ok(out)
     }
+
+    // ============= 持久化配置方法 =============
+
+    /// Upsert a single fallback policy.
+    pub fn upsert_fallback_policy(
+        &self,
+        policy_id: &str,
+        config: &FallbackPolicyConfig,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let json = serde_json::to_string(config)
+            .map_err(|e| format!("序列化 fallback_policy 失败: {}", e))?;
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO persisted_fallback_policies (policy_id, config_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(policy_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![policy_id, json, now as i64],
+        )
+        .map_err(|e| format!("写入 fallback_policy 失败: {}", e))?;
+        Ok(())
+    }
+
+    /// Delete a single fallback policy. Returns Ok(false) if not found.
+    pub fn delete_fallback_policy(&self, policy_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let rows = conn
+            .execute(
+                "DELETE FROM persisted_fallback_policies WHERE policy_id = ?1",
+                params![policy_id],
+            )
+            .map_err(|e| format!("删除 fallback_policy 失败: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    /// Load all persisted fallback policies.
+    pub fn load_fallback_policies(&self) -> Result<HashMap<String, FallbackPolicyConfig>, String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT policy_id, config_json FROM persisted_fallback_policies")
+            .map_err(|e| format!("查询 persisted_fallback_policies 失败: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("遍历 persisted_fallback_policies 失败: {}", e))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (id, json) = r.map_err(|e| format!("读取行失败: {}", e))?;
+            let config: FallbackPolicyConfig = serde_json::from_str(&json)
+                .map_err(|e| format!("反序列化 fallback_policy '{}': {}", id, e))?;
+            out.insert(id, config);
+        }
+        Ok(out)
+    }
+
+    /// Upsert a single client API key.
+    pub fn upsert_client_api_key(
+        &self,
+        key_id: &str,
+        config: &ClientApiKeyConfig,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let json = serde_json::to_string(config)
+            .map_err(|e| format!("序列化 client_api_key 失败: {}", e))?;
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO persisted_client_api_keys (key_id, config_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![key_id, json, now as i64],
+        )
+        .map_err(|e| format!("写入 client_api_key 失败: {}", e))?;
+        Ok(())
+    }
+
+    /// Delete a single client API key. Returns Ok(false) if not found.
+    pub fn delete_client_api_key(&self, key_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let rows = conn
+            .execute(
+                "DELETE FROM persisted_client_api_keys WHERE key_id = ?1",
+                params![key_id],
+            )
+            .map_err(|e| format!("删除 client_api_key 失败: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    /// Load all persisted client API keys.
+    pub fn load_client_api_keys(&self) -> Result<HashMap<String, ClientApiKeyConfig>, String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT key_id, config_json FROM persisted_client_api_keys")
+            .map_err(|e| format!("查询 persisted_client_api_keys 失败: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("遍历 persisted_client_api_keys 失败: {}", e))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (id, json) = r.map_err(|e| format!("读取行失败: {}", e))?;
+            let config: ClientApiKeyConfig = serde_json::from_str(&json)
+                .map_err(|e| format!("反序列化 client_api_key '{}': {}", id, e))?;
+            out.insert(id, config);
+        }
+        Ok(out)
+    }
+
+    /// Upsert model metadata overrides (hot-reloadable fields only).
+    pub fn upsert_model_override(
+        &self,
+        model_id: &str,
+        config: &ModelMetadataOverride,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let json = serde_json::to_string(config)
+            .map_err(|e| format!("序列化 model_override 失败: {}", e))?;
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO persisted_model_overrides (model_id, config_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(model_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![model_id, json, now as i64],
+        )
+        .map_err(|e| format!("写入 model_override 失败: {}", e))?;
+        Ok(())
+    }
+
+    /// Load all persisted model metadata overrides.
+    pub fn load_model_overrides(&self) -> Result<HashMap<String, ModelMetadataOverride>, String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT model_id, config_json FROM persisted_model_overrides")
+            .map_err(|e| format!("查询 persisted_model_overrides 失败: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("遍历 persisted_model_overrides 失败: {}", e))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (id, json) = r.map_err(|e| format!("读取行失败: {}", e))?;
+            let config: ModelMetadataOverride = serde_json::from_str(&json)
+                .map_err(|e| format!("反序列化 model_override '{}': {}", id, e))?;
+            out.insert(id, config);
+        }
+        Ok(out)
+    }
+}
+
+/// 获取当前时间戳（毫秒）
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

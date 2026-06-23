@@ -37,29 +37,96 @@ pub fn get_config_path() -> Option<std::path::PathBuf> {
     find_config_path()
 }
 
-pub fn save_config(config: &GatewayConfig) -> Result<(), String> {
-    let config_path = find_config_path()
-        .ok_or_else(|| "无法找到配置文件路径".to_string())?;
+/// 将数据库中的配置覆盖应用到 YAML 加载的基础配置上。
+/// 如果数据库中没有覆盖值，YAML 配置将原样返回。
+pub fn apply_db_overlays(
+    mut config: GatewayConfig,
+    usage_db: &crate::usage_db::UsageDb,
+) -> GatewayConfig {
+    use crate::types::ModelStatus;
 
-    let yaml = serde_yaml::to_string(config)
-        .map_err(|e| format!("序列化配置失败: {}", e))?;
-
-    fs::write(&config_path, yaml)
-        .map_err(|e| format!("写入配置文件失败: {}", e))?;
-
-    // 限制文件权限为 0600
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&config_path)
-            .map_err(|e| format!("stat 配置失败: {}", e))?
-            .permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&config_path, perms)
-            .map_err(|e| format!("chmod 600 失败: {}", e))?;
+    // 1. 从数据库加载 fallback_policies 覆盖
+    match usage_db.load_fallback_policies() {
+        Ok(db_policies) if !db_policies.is_empty() => {
+            println!(
+                "📄 从数据库加载 {} 个 fallback_policies 覆盖",
+                db_policies.len()
+            );
+            config.fallback_policies = db_policies;
+        }
+        Ok(_) => {
+            println!("📄 数据库无 fallback_policies，使用 YAML 配置");
+        }
+        Err(e) => {
+            eprintln!("⚠️  加载数据库 fallback_policies 失败，使用 YAML 配置: {}", e);
+        }
     }
 
-    Ok(())
+    // 2. 从数据库加载 client_api_keys 覆盖
+    match usage_db.load_client_api_keys() {
+        Ok(db_keys) if !db_keys.is_empty() => {
+            println!(
+                "📄 从数据库加载 {} 个 client_api_keys 覆盖",
+                db_keys.len()
+            );
+            config.client_api_keys = db_keys;
+        }
+        Ok(_) => {
+            println!("📄 数据库无 client_api_keys，使用 YAML 配置");
+        }
+        Err(e) => {
+            eprintln!("⚠️  加载数据库 client_api_keys 失败，使用 YAML 配置: {}", e);
+        }
+    }
+
+    // 3. 从数据库加载 model_overrides 覆盖（合并而非替换）
+    match usage_db.load_model_overrides() {
+        Ok(overrides) if !overrides.is_empty() => {
+            println!(
+                "📄 从数据库加载 {} 个 model_overrides 覆盖",
+                overrides.len()
+            );
+            for (model_id, ov) in &overrides {
+                if let Some(route) = config.models.get_mut(model_id) {
+                    // 确保 metadata 存在
+                    if route.metadata.is_none() {
+                        route.metadata = Some(Default::default());
+                    }
+                    let meta = route.metadata.as_mut().unwrap();
+                    if let Some(name) = &ov.name {
+                        meta.name = Some(name.clone());
+                    }
+                    if let Some(status_str) = &ov.status {
+                        meta.status = match status_str.as_str() {
+                            "active" => ModelStatus::Active,
+                            "rate_limited" => ModelStatus::RateLimited,
+                            "disabled" => ModelStatus::Disabled,
+                            _ => meta.status, // 无效值保留原有状态
+                        };
+                    }
+                    if ov.price_per_input.is_some() {
+                        meta.price_per_input = ov.price_per_input;
+                    }
+                    if ov.price_per_output.is_some() {
+                        meta.price_per_output = ov.price_per_output;
+                    }
+                } else {
+                    eprintln!(
+                        "⚠️  数据库中 model_override 引用了不存在的 model '{}'，跳过",
+                        model_id
+                    );
+                }
+            }
+        }
+        Ok(_) => {
+            println!("📄 数据库无 model_overrides，使用 YAML 配置");
+        }
+        Err(e) => {
+            eprintln!("⚠️  加载数据库 model_overrides 失败，使用 YAML 配置: {}", e);
+        }
+    }
+
+    config
 }
 
 fn find_config_path() -> Option<std::path::PathBuf> {

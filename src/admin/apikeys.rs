@@ -1,4 +1,3 @@
-use crate::config::save_config;
 use crate::types::{
     ApiKey, ClientApiKeyConfig, CreateApiKeyRequest, CreateApiKeyResponse, UpdateApiKeyRequest,
 };
@@ -169,15 +168,13 @@ pub async fn create_key(
     };
 
     config.client_api_keys.insert(id.clone(), cfg);
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+
+    // 持久化到数据库
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.upsert_client_api_key(&id, config.client_api_keys.get(&id).unwrap()) {
+            eprintln!("⚠️  持久化 client_api_key 到数据库失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
     }
 
     let resp = build_api_key(&id, config.client_api_keys.get(&id).unwrap(), 0);
@@ -233,15 +230,13 @@ pub async fn update_key(
 
     // 先复制出需要的字段（放下 cfg 借用）
     let saved_cfg = cfg.clone();
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+
+    // 持久化到数据库
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.upsert_client_api_key(&id, &saved_cfg) {
+            eprintln!("⚠️  持久化 client_api_key 到数据库失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
     }
 
     let used = state.api_key_quota.lock().await.get(&id).await;
@@ -272,16 +267,15 @@ pub async fn delete_key(
         )
             .into_response();
     }
-    if let Err(e) = save_config(&config) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "save_failed",
-                "message": e
-            })),
-        )
-            .into_response();
+
+    // 从数据库删除
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.delete_client_api_key(&id) {
+            eprintln!("⚠️  从数据库删除 client_api_key 失败: {}", e);
+            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        }
     }
+
     (
         axum::http::StatusCode::OK,
         Json(serde_json::json!({ "success": true, "message": "Key deleted" })),

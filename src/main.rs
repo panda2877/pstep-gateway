@@ -189,7 +189,7 @@ async fn main() {
     println!("║         Pstep Gateway v{}         ║", env!("CARGO_PKG_VERSION"));
     println!("╚══════════════════════════════════════╝");
 
-    let config = load_config();
+    let mut config = load_config();
 
     // 打开 SQLite usage_db（如果配置了的话）。None = 走纯内存路径（向后兼容）。
     let usage_db: Option<Arc<usage_db::UsageDb>> = config
@@ -204,6 +204,11 @@ async fn main() {
             println!("💾 usage_db 已就绪: {}", p);
             db
         });
+
+    // 从数据库加载配置覆盖（如果 usage_db 可用）
+    if let Some(db) = &usage_db {
+        config = config::apply_db_overlays(config, db);
+    }
 
     let thaw_tracker = if let Some(thaw_config) = &config.thaw {
         Some(Arc::new(thaw::ThawTracker::new(thaw_config.clone())))
