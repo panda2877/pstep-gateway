@@ -215,14 +215,16 @@ h1, h2, h3, h4 { text-wrap: balance; }
 }
 .ds-table .actions .btn + .btn { margin-left: 6px; }
 
-/* Models 表的列宽控制：名字 + 状态贴左，策略占剩余，价格列按内容收缩 */
+/* Models 表的列宽控制：名字 22% / 状态 12% / 策略 30%（占中段固定宽）
+   价格列用 width:1% 配合 text-align:right 收缩到内容宽度，避免右对齐产生大片空白 */
 #section-models .ds-table col.name-col,
 #section-models .ds-table th:nth-child(1),
 #section-models .ds-table td:nth-child(1) { width: 22%; }
 #section-models .ds-table th:nth-child(2),
 #section-models .ds-table td:nth-child(2) { width: 12%; }
 #section-models .ds-table th:nth-child(3),
-#section-models .ds-table td:nth-child(3) { width: auto; }
+#section-models .ds-table td:nth-child(3) { width: 30%; }
+#section-models .ds-table .num-col { width: 1%; }
 
 .fallback-chain { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .chain-node { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; }
