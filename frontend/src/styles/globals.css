@@ -112,12 +112,15 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-secondary { background: var(--surface-2); color: var(--fg); border-color: var(--border); }
 .btn-secondary:hover { border-color: var(--fg-2); }
+.btn-ghost { background: transparent; color: var(--fg-2); border-color: transparent; }
+.btn-ghost:hover { color: var(--fg); background: var(--surface-2); }
 .btn-danger { background: transparent; color: var(--danger); border-color: var(--danger); }
 .btn-danger:hover { background: color-mix(in oklch, var(--danger) 15%, transparent); }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--gap-md); }
 .card-flat { background: transparent; border: 0; padding: 0; }
+.card.tight { padding: 0; }
 
 .stat-card {
   background: var(--surface);
@@ -181,23 +184,45 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .field-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--gap-md); }
 @media (max-width: 640px) { .field-row { grid-template-columns: 1fr; } }
 
-.ds-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.ds-table th, .ds-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.ds-table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: auto; }
+.ds-table th, .ds-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.ds-table tbody tr:last-child td { border-bottom: 0; }
 .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 .table-wrap::-webkit-scrollbar { height: 6px; }
 .table-wrap::-webkit-scrollbar-track { background: transparent; }
 .table-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
 .table-wrap::-webkit-scrollbar-thumb:hover { background: var(--muted); }
-.ds-table th { color: var(--fg-2); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
-.ds-table tbody tr:hover { background: var(--surface); }
+.ds-table th {
+  color: var(--fg-2);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  background: var(--surface-2);
+  border-bottom-color: var(--border);
+}
+.ds-table tbody tr { transition: background 0.1s ease; }
+.ds-table tbody tr:hover { background: color-mix(in oklch, var(--surface-2) 60%, transparent); }
 .ds-table .num-col, .ds-table .num-col th,
 .ds-table .actions, .ds-table th.actions { text-align: right; }
+.ds-table .num-col { font-variant-numeric: tabular-nums; }
 .ds-table .actions {
   white-space: nowrap;
   /* 列宽只占按钮需要的宽度；width:1% 是 table-layout:auto 下的标准收缩技巧 */
   width: 1%;
 }
 .ds-table .actions .btn + .btn { margin-left: 6px; }
+
+/* Models 表的列宽控制：名字 + 状态贴左，策略占剩余，价格列按内容收缩 */
+#section-models .ds-table col.name-col,
+#section-models .ds-table th:nth-child(1),
+#section-models .ds-table td:nth-child(1) { width: 22%; }
+#section-models .ds-table th:nth-child(2),
+#section-models .ds-table td:nth-child(2) { width: 12%; }
+#section-models .ds-table th:nth-child(3),
+#section-models .ds-table td:nth-child(3) { width: auto; }
 
 .fallback-chain { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .chain-node { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; }
@@ -245,7 +270,7 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .modal-footer { display: flex; justify-content: flex-end; gap: var(--gap-sm); margin-top: var(--gap-lg); }
 
 .rule { border: 0; border-top: 1px solid var(--border); margin: 0; }
-.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--gap-md); }
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--gap-sm); }
 .section-title { font-size: 16px; font-weight: 600; }
 .section-desc { font-size: 13px; color: var(--fg-2); margin-top: 2px; }
 

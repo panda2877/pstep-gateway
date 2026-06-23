@@ -92,7 +92,13 @@ export const ModelsPage: React.FC = () => {
     }
   };
 
-  const formatPrice = (price?: number) => (price ? `$${price.toFixed(3)}` : '-');
+  const formatPrice = (price?: number) => {
+    if (!price) return '-';
+    // 智能去尾零：0.1 → $0.1, 0.125 → $0.125, 0.100 → $0.10
+    const fixed = Number(price.toFixed(4));
+    const str = fixed.toString();
+    return `$${str}`;
+  };
 
   return (
     <div className="section" id="section-models">
@@ -103,7 +109,7 @@ export const ModelsPage: React.FC = () => {
         </div>
       </div>
 
-      <Card>
+      <Card className="tight">
         <div className="table-wrap">
           <table className="ds-table">
             <thead>
@@ -141,12 +147,12 @@ export const ModelsPage: React.FC = () => {
                     <td className="meta">
                       {model.referenced_by_policies && model.referenced_by_policies.length > 0
                         ? model.referenced_by_policies.join(', ')
-                        : '—'}
+                        : <span style={{ color: 'var(--muted)' }}>—</span>}
                     </td>
                     <td className="num-col">{formatPrice(model.price_per_input)}</td>
                     <td className="num-col">{formatPrice(model.price_per_output)}</td>
                     <td className="actions">
-                      <Button variant="secondary" size="sm" onClick={() => openEditModal(model)}>
+                      <Button variant="ghost" size="sm" onClick={() => openEditModal(model)}>
                         编辑
                       </Button>
                     </td>
