@@ -9,7 +9,7 @@
 #   - ContainerName: pstep-gateway-b
 #   - PublishPort:  127.0.0.1:13005:3002  (仅本机；避开 :3002/3003
 #                     因为 nginx 占了，避开 13002/13003 因为 frps 占了)
-#   - Volume:       /var/lib/pstep-gateway-b (独立 SQLite)
+#   - Volume:       /var/lib/pstep-gateway-shared (与 slot A 共享，确保配置一致)
 #   - GATEWAY_PORT: 3002  (容器内仍跑 3002；通过 127.0.0.1:13005 暴露)
 #
 # 服务器部署位置: /etc/containers/systemd/pstep/pstep-gateway-b.container
@@ -39,7 +39,9 @@ DropCapability=ALL
 SecurityLabelDisable=true
 
 Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
-Volume=/var/lib/pstep-gateway-b:/var/lib/pstep-gateway:rw
+# 与 slot A 共享 /var/lib/pstep-gateway-shared 目录，确保配置修改
+# 在蓝绿切换后仍然可见。
+Volume=/var/lib/pstep-gateway-shared:/var/lib/pstep-gateway:rw
 
 EnvironmentFile=/etc/pstep-gateway/env
 Environment=RUST_LOG=info

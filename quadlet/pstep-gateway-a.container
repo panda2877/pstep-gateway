@@ -48,8 +48,9 @@ Volume=/etc/pstep-gateway:/etc/pstep-gateway:ro
 
 # Writable scratch for usage_db (SQLite). The gateway creates /var/lib/pstep-gateway
 # at startup; the host dir must be chown 65532:65532 to match the container user.
-# Slot A 用独立目录避免与 slot B 共享 SQLite WAL 文件。
-Volume=/var/lib/pstep-gateway-a:/var/lib/pstep-gateway:rw
+# Slot A 和 Slot B 共享 /var/lib/pstep-gateway-shared 目录，确保配置修改
+# 在蓝绿切换后仍然可见。SQLite WAL 模式有文件锁保护，并发安全。
+Volume=/var/lib/pstep-gateway-shared:/var/lib/pstep-gateway:rw
 
 # Secrets injected via EnvironmentFile (chmod 600, host-managed).
 # Required keys: MIMO_API_KEY (and any other upstream API keys referenced by ${VAR}

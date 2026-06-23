@@ -301,7 +301,7 @@ Containerfile  .containerignore  quadlet/**  nginx/**  .github/workflows/deploy.
 - 加固：`ReadOnly=true` / `NoNewPrivileges=true` / `DropCapability=ALL`
 - 挂载：
   - `/etc/pstep-gateway:/etc/pstep-gateway:ro`（config；需 `chmod 644`，distroless 无 /etc/passwd）
-  - `/var/lib/pstep-gateway-{a,b}:/var/lib/pstep-gateway:rw`（SQLite；需 `chown 65532:65532`）
+  - `/var/lib/pstep-gateway-shared:/var/lib/pstep-gateway:rw`（**共享 SQLite**；需 `chown 65532:65532`；两个 slot 共用同一 DB 文件，确保 admin API 配置修改在蓝绿切换后仍然可见）
 - `Network=bridge` + `PublishPort=127.0.0.1:13004:3002`（A）或 `:13005:3002`（B）
 - `TimeoutStopSec=130`（必须 > 上游 reqwest 120s，否则慢请求会被 SIGKILL）
 - `Restart=always`，5 秒重试
@@ -405,3 +405,9 @@ gh workflow run deploy.yml --ref main
 - **nginx 切流不会丢长连接**：`keepalive 32` + `proxy_buffering off`，
   切流时旧连接走完再被新 worker 接管。已验证：ab -c 500 / 30M reqs 跨整个
   cutover 窗口 0 失败。
+- **共享 SQLite 数据库**：两个 slot 共享 `/var/lib/pstep-gateway-shared/usage.db`，
+  确保通过 admin API 修改的配置（fallback_policies、client_api_keys、model_overrides）
+  在蓝绿切换后仍然可见。SQLite WAL 模式有文件锁保护，并发安全。
+  **历史问题**：之前每个 slot 使用独立数据库（`/var/lib/pstep-gateway-{a,b}/`），
+  导致 admin API 写入的配置只存在于处理请求的 slot 的数据库中，
+  重启后两个 slot 加载的配置不一致（已修复，commit `4f7daa3`）。
