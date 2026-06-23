@@ -263,65 +263,74 @@ jobs:
           # 上面的 ssh session 已经做完这件事；保留这段只是占位，不再发 ssh。
           echo "🔧 准备运行时目录（已在上一步完成，跳过）"
 
-          # ---- 3. 镜像从 runner 直传到服务器（docker save → scp → podman load）----
-          # 为什么不走 GHCR pull：国内服务器（134.175.163.213）到 ghcr.io
-          # 实测 ~10KB/s，blob 17/20 后挂死，30min+ 无进度（commit 60c0958
-          # 切到 GHCR pull 后的回归）。
+          # ---- 3. 服务器端从 GHCR 拉镜像（主路径）----
+          # 2026-06-23 实测：CN 服务器到 ghcr.io 已恢复正常
+          #   TCP 延迟 147ms，32.7MB 镜像拉取 2.5~5.5 分钟
+          #   之前 "10KB/s + blob 17/20 挂死" 的问题已不存在。
           #
-          # 为什么不走 docker save | gzip | ssh 管道：GHA runner 类型下
-          # ssh 管道有系统性不可靠（半路丢字节 / scp CRC 错 / 沉默 0 字节），
-          # 连续 6 次 deploy 挂在管道传输。
+          # scp 方案的问题：
+          #   - docker save 输出未压缩 tar（32.7MB），scp 无 -C 传 25~34 分钟
+          #   - 引号 bug 导致远端路径可能错误，scp 静默失败后 fallback 回 GHCR
+          #   - GHA runner → CN 的 TCP 带宽不稳定
           #
-          # 新方案：docker save → 写文件 → scp 传文件 → podman load -i。
-          # 文件落盘避免管道丢字节；scp 自带校验；load 用 -i 从文件读。
-          IMAGE_TAG="${{ github.sha }}"
-          LOCAL_IMAGE="pstep-gateway:${IMAGE_TAG}"
-          SCP_TMP="/tmp/pstep-gateway-image.tar"
-          REMOTE_TMP="/tmp/pstep-gateway-image.tar"
+          # GHCR pull 方案：podman pull 自带重试、checksum 校验、blob 缓存。
+          IMAGE="ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}"
 
-          echo "🐳 导出镜像到本地文件: $LOCAL_IMAGE..."
-          docker save "$LOCAL_IMAGE" -o "$SCP_TMP"
-          LOCAL_SIZE=$(stat -c%s "$SCP_TMP" 2>/dev/null || stat -f%z "$SCP_TMP")
-          echo "📦 镜像大小: $((LOCAL_SIZE / 1048576))MB"
-
-          echo "📤 scp 传镜像到服务器..."
-          if ! scp -o ConnectTimeout=60 -o StrictHostKeyChecking=accept-new \
-            -i ~/.ssh/deploy_key "$SCP_TMP" "${SERVER_USER}@${SERVER_HOST}:"$REMOTE_TMP; then
-            echo "⚠️  scp 失败，尝试 GHCR pull fallback..."
-            $SSHD "
+          echo "🐳 服务器从 GHCR 拉镜像: $IMAGE..."
+          pull_ok=false
+          for attempt in 1 2 3; do
+            echo "---- attempt $attempt/3 ----"
+            if $SSHD "
               set -e
-              IMAGE='ghcr.io/${{ github.repository_owner }}/pstep-gateway:${{ github.sha }}'
-              echo \"fallback: podman pull \$IMAGE\"
-              sudo podman pull \"\$IMAGE\"
-              sudo podman tag \"\$IMAGE\" pstep-gateway:latest
-              echo '✅ fallback GHCR pull 成功'
-            "
-            rm -f "$SCP_TMP"
-          else
-            rm -f "$SCP_TMP"
-            echo "🐳 服务器端 podman load + tag..."
-            $SSHD "
-              set -e
-              echo '---- load 前 ----'
+              echo 'pull 前 registry 已有镜像:'
               sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}' \\
                 | grep 'pstep-gateway' || echo '(none)'
+              # podman pull 没有内置 timeout；外层用 timeout 命令兜底（300s = 5min）
+              sudo timeout 300 podman pull '$IMAGE'
+              sudo podman tag '$IMAGE' pstep-gateway:latest
+              echo '---- pull 后 ----'
+              sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' \\
+                | grep 'pstep-gateway'
+              echo '✅ GHCR pull 成功'
+            "; then
+              pull_ok=true
+              break
+            fi
+            echo "⚠️  attempt $attempt 失败，等 5s 重试..."
+            sleep 5
+          done
+
+          if [ "$pull_ok" != "true" ]; then
+            echo "❌ GHCR pull 3 次均失败，尝试 scp fallback..."
+            IMAGE_TAG="${{ github.sha }}"
+            LOCAL_IMAGE="pstep-gateway:${IMAGE_TAG}"
+            SCP_TMP="/tmp/pstep-gateway-image.tar"
+            REMOTE_TMP="/tmp/pstep-gateway-image.tar"
+
+            docker save "$LOCAL_IMAGE" -o "$SCP_TMP"
+            LOCAL_SIZE=$(stat -c%s "$SCP_TMP" 2>/dev/null || stat -f%z "$SCP_TMP")
+            echo "📦 镜像大小: $((LOCAL_SIZE / 1048576))MB"
+
+            scp -C -o ConnectTimeout=60 -o StrictHostKeyChecking=accept-new \
+              -i ~/.ssh/deploy_key "$SCP_TMP" "${SERVER_USER}@${SERVER_HOST}:${REMOTE_TMP}"
+            rm -f "$SCP_TMP"
+
+            $SSHD "
+              set -e
               REMOTE_SIZE=\$(sudo stat -c%s '$REMOTE_TMP' 2>/dev/null || echo 0)
-              echo \"远程文件大小: \$REMOTE_SIZE bytes（本地 $LOCAL_SIZE bytes）\"
+              echo \"远程文件大小: \$REMOTE_SIZE bytes\"
               if [ \"\$REMOTE_SIZE\" -lt 1000000 ]; then
-                echo '❌ 远程镜像文件过小（可能传输不完整），退出'
+                echo '❌ 远程镜像文件过小（传输不完整），退出'
                 exit 1
               fi
               sudo podman load -i '$REMOTE_TMP'
               sudo podman tag 'pstep-gateway:${{ github.sha }}' pstep-gateway:latest
               rm -f '$REMOTE_TMP'
-              echo '---- load 后 ----'
-              sudo podman images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' \\
-                | grep 'pstep-gateway'
-              echo '✅ 镜像已 load + tag 为 latest'
+              echo '✅ scp fallback 成功'
             "
           fi
 
-          # ---- 4. 服务器端：load 镜像 + 蓝绿切流 + 健康检查 ----
+          # ---- 4. 服务器端：蓝绿切流 + 健康检查 ----
           # 蓝绿流程：
           #  1. 加载新镜像
           #  2. 找到当前 nginx upstream 指向哪个端口（13004=A / 13005=B）
