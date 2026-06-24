@@ -37,92 +37,102 @@ pub fn get_config_path() -> Option<std::path::PathBuf> {
     find_config_path()
 }
 
-/// 将数据库中的配置覆盖应用到 YAML 加载的基础配置上。
-/// 如果数据库中没有覆盖值，YAML 配置将原样返回。
+/// 从 SQLite 加载所有配置覆盖到 YAML 加载的基础配置上。
+///
+/// 加载优先级：SQLite > YAML。如果 SQLite 某表为空且 YAML 有数据，
+/// 会自动执行首次迁移（把 YAML 数据写入 SQLite）。
 pub fn apply_db_overlays(
     mut config: GatewayConfig,
     usage_db: &crate::usage_db::UsageDb,
 ) -> GatewayConfig {
-    use crate::types::ModelStatus;
+    // 1. 从数据库加载 models（SQLite-first，YAML 作为首次迁移源）
+    match usage_db.load_models() {
+        Ok(db_models) if !db_models.is_empty() => {
+            println!(
+                "📦 从数据库加载 {} 个 models",
+                db_models.len()
+            );
+            config.models = db_models;
+        }
+        Ok(_) if !config.models.is_empty() => {
+            // 首次迁移：把 YAML 的 models 写入 SQLite
+            let count = config.models.len();
+            println!(
+                "📦 首次迁移：从 YAML 导入 {} 个 models 到 SQLite",
+                count
+            );
+            for (id, route) in &config.models {
+                if let Err(e) = usage_db.upsert_model(id, route) {
+                    eprintln!("⚠️  迁移 model '{}' 失败: {}", id, e);
+                }
+            }
+            // 不替换 config.models——YAML 的数据和 SQLite 的一样
+        }
+        Ok(_) => {
+            println!("📦 数据库和 YAML 均无 models");
+        }
+        Err(e) => {
+            eprintln!("⚠️  加载数据库 models 失败，使用 YAML 配置: {}", e);
+        }
+    }
 
-    // 1. 从数据库加载 fallback_policies 覆盖
+    // 2. 从数据库加载 fallback_policies 覆盖
     match usage_db.load_fallback_policies() {
         Ok(db_policies) if !db_policies.is_empty() => {
             println!(
-                "📄 从数据库加载 {} 个 fallback_policies 覆盖",
+                "📄 从数据库加载 {} 个 fallback_policies",
                 db_policies.len()
             );
             config.fallback_policies = db_policies;
         }
+        Ok(_) if !config.fallback_policies.is_empty() => {
+            // 首次迁移：把 YAML 的 fallback_policies 写入 SQLite
+            let count = config.fallback_policies.len();
+            println!(
+                "📄 首次迁移：从 YAML 导入 {} 个 fallback_policies 到 SQLite",
+                count
+            );
+            for (id, policy) in &config.fallback_policies {
+                if let Err(e) = usage_db.upsert_fallback_policy(id, policy) {
+                    eprintln!("⚠️  迁移 fallback_policy '{}' 失败: {}", id, e);
+                }
+            }
+        }
         Ok(_) => {
-            println!("📄 数据库无 fallback_policies，使用 YAML 配置");
+            println!("📄 数据库和 YAML 均无 fallback_policies");
         }
         Err(e) => {
             eprintln!("⚠️  加载数据库 fallback_policies 失败，使用 YAML 配置: {}", e);
         }
     }
 
-    // 2. 从数据库加载 client_api_keys 覆盖
+    // 3. 从数据库加载 client_api_keys 覆盖
     match usage_db.load_client_api_keys() {
         Ok(db_keys) if !db_keys.is_empty() => {
             println!(
-                "📄 从数据库加载 {} 个 client_api_keys 覆盖",
+                "🔑 从数据库加载 {} 个 client_api_keys",
                 db_keys.len()
             );
             config.client_api_keys = db_keys;
         }
-        Ok(_) => {
-            println!("📄 数据库无 client_api_keys，使用 YAML 配置");
-        }
-        Err(e) => {
-            eprintln!("⚠️  加载数据库 client_api_keys 失败，使用 YAML 配置: {}", e);
-        }
-    }
-
-    // 3. 从数据库加载 model_overrides 覆盖（合并而非替换）
-    match usage_db.load_model_overrides() {
-        Ok(overrides) if !overrides.is_empty() => {
+        Ok(_) if !config.client_api_keys.is_empty() => {
+            // 首次迁移：把 YAML 的 client_api_keys 写入 SQLite
+            let count = config.client_api_keys.len();
             println!(
-                "📄 从数据库加载 {} 个 model_overrides 覆盖",
-                overrides.len()
+                "🔑 首次迁移：从 YAML 导入 {} 个 client_api_keys 到 SQLite",
+                count
             );
-            for (model_id, ov) in &overrides {
-                if let Some(route) = config.models.get_mut(model_id) {
-                    // 确保 metadata 存在
-                    if route.metadata.is_none() {
-                        route.metadata = Some(Default::default());
-                    }
-                    let meta = route.metadata.as_mut().unwrap();
-                    if let Some(name) = &ov.name {
-                        meta.name = Some(name.clone());
-                    }
-                    if let Some(status_str) = &ov.status {
-                        meta.status = match status_str.as_str() {
-                            "active" => ModelStatus::Active,
-                            "rate_limited" => ModelStatus::RateLimited,
-                            "disabled" => ModelStatus::Disabled,
-                            _ => meta.status, // 无效值保留原有状态
-                        };
-                    }
-                    if ov.price_per_input.is_some() {
-                        meta.price_per_input = ov.price_per_input;
-                    }
-                    if ov.price_per_output.is_some() {
-                        meta.price_per_output = ov.price_per_output;
-                    }
-                } else {
-                    eprintln!(
-                        "⚠️  数据库中 model_override 引用了不存在的 model '{}'，跳过",
-                        model_id
-                    );
+            for (id, key) in &config.client_api_keys {
+                if let Err(e) = usage_db.upsert_client_api_key(id, key) {
+                    eprintln!("⚠️  迁移 client_api_key '{}' 失败: {}", id, e);
                 }
             }
         }
         Ok(_) => {
-            println!("📄 数据库无 model_overrides，使用 YAML 配置");
+            println!("🔑 数据库和 YAML 均无 client_api_keys");
         }
         Err(e) => {
-            eprintln!("⚠️  加载数据库 model_overrides 失败，使用 YAML 配置: {}", e);
+            eprintln!("⚠️  加载数据库 client_api_keys 失败，使用 YAML 配置: {}", e);
         }
     }
 

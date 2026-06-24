@@ -38,7 +38,7 @@ pub struct GatewayConfig {
 ///
 /// 决策（v0.3）：model 不再持有 `fallback_policy`。fallback 关系由 policy 的
 /// `chain[*].model` 反向表达：同一个 model 可以被多个 policy 复用。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelRoute {
     /// `type` / `base_url` / `api_key` / `model` 决定上游签名
     #[serde(rename = "type")]
@@ -143,16 +143,6 @@ impl ModelStatus {
             Self::Disabled => "disabled",
         }
     }
-}
-
-/// 模型元数据覆盖（仅热重载字段），用于数据库持久化
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModelMetadataOverride {
-    pub name: Option<String>,
-    /// 枚举小写字符串: "active" | "rate_limited" | "disabled"
-    pub status: Option<String>,
-    pub price_per_input: Option<f64>,
-    pub price_per_output: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -680,6 +670,25 @@ pub struct UpdateModelConfigRequest {
     /// - 其他值 = 覆盖
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// POST /api/admin/models 的请求体
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateModelRequest {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub upstream_type: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub price_per_input: Option<f64>,
+    #[serde(default)]
+    pub price_per_output: Option<f64>,
 }
 
 /// API Key 列表项（响应给前端）

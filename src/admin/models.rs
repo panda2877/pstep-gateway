@@ -1,4 +1,7 @@
-use crate::types::{ModelConfig, ModelStatus, UpdateModelConfigRequest, UpstreamType};
+use crate::types::{
+    CreateModelRequest, ModelConfig, ModelMetadata, ModelRoute, ModelStatus,
+    UpdateModelConfigRequest, UpstreamType,
+};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -30,7 +33,7 @@ fn mask_api_key(key: &str) -> String {
 /// 把 ModelRoute 转换为响应给前端的 ModelConfig。
 fn build_model_config(
     id: &str,
-    route: &crate::types::ModelRoute,
+    route: &ModelRoute,
     referenced_by_policies: Vec<String>,
 ) -> ModelConfig {
     let metadata = route.metadata.as_ref();
@@ -114,29 +117,100 @@ pub async fn get_model(
     }
 }
 
+/// POST /api/admin/models
+pub async fn create_model(
+    State(state): State<AppState>,
+    Json(req): Json<CreateModelRequest>,
+) -> Response {
+    let mut config = state.config.write().await;
+
+    if config.models.contains_key(&req.id) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_exists",
+                "message": format!("Model '{}' already exists", req.id)
+            })),
+        )
+            .into_response();
+    }
+
+    let upstream_type = match req.upstream_type.as_str() {
+        "openai" => UpstreamType::Openai,
+        "anthropic" => UpstreamType::Anthropic,
+        other => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_type",
+                    "message": format!("upstream_type 必须是 openai / anthropic，收到: {}", other)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = match req.status.as_deref() {
+        Some("active") | None => ModelStatus::Active,
+        Some("rate_limited") => ModelStatus::RateLimited,
+        Some("disabled") => ModelStatus::Disabled,
+        Some(other) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_status",
+                    "message": format!("status 必须是 active / rate_limited / disabled，收到: {}", other)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let route = ModelRoute {
+        upstream_type,
+        base_url: req.base_url,
+        api_key: req.api_key,
+        model: req.model,
+        metadata: Some(ModelMetadata {
+            name: req.name,
+            status,
+            price_per_input: req.price_per_input,
+            price_per_output: req.price_per_output,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // 持久化到 SQLite
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.upsert_model(&req.id, &route) {
+            eprintln!("⚠️  持久化 model 到数据库失败: {}", e);
+        }
+    }
+
+    config.models.insert(req.id.clone(), route.clone());
+
+    let resp = build_model_config(&req.id, &route, vec![]);
+    (
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!({
+            "success": true,
+            "model": resp
+        })),
+    )
+        .into_response()
+}
+
 /// PUT /api/admin/models/:id
 ///
-/// 字段分组（v0.3）：
-/// - 热更新：name, status, price_per_input, price_per_output
-/// - 需重启：type (upstream_type), base_url, api_key, model
-/// - 移除：fallback_policy（关系由 policy.chain[*].model 反向表达）
+/// 所有字段（包括上游连接字段）都热生效，持久化到 SQLite。
 pub async fn update_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateModelConfigRequest>,
 ) -> Response {
-    // 提前克隆出所有需要持有的值，缩短锁区
-    let name = req.name.clone();
-    let status_str = req.status.clone();
-    let price_input = req.price_per_input;
-    let price_output = req.price_per_output;
-    let upstream_type_str = req.upstream_type.clone();
-    let base_url = req.base_url.clone();
-    let model = req.model.clone();
-    let api_key = req.api_key.clone();
-
     // 解析 status
-    let new_status = match status_str.as_deref() {
+    let new_status = match req.status.as_deref() {
         Some(s) => match s {
             "active" => Some(ModelStatus::Active),
             "rate_limited" => Some(ModelStatus::RateLimited),
@@ -159,7 +233,7 @@ pub async fn update_model(
     };
 
     // 解析 upstream_type
-    let new_upstream_type = match upstream_type_str.as_deref() {
+    let new_upstream_type = match req.upstream_type.as_deref() {
         Some(s) => match s {
             "openai" => Some(UpstreamType::Openai),
             "anthropic" => Some(UpstreamType::Anthropic),
@@ -193,22 +267,34 @@ pub async fn update_model(
             .into_response();
     }
 
-    // 检测是否触发了「需重启」字段
-    let restart_required = new_upstream_type.is_some()
-        || base_url.is_some()
-        || api_key
-            .as_ref()
-            .map(|v| !v.is_empty() && v != "********")
-            .unwrap_or(false)
-        || model.is_some();
-
     if let Some(route) = config.models.get_mut(&id) {
-        // --- 热更新字段 ---
-        if let Some(n) = name.clone() {
+        // --- 上游连接字段 ---
+        if let Some(ut) = new_upstream_type {
+            route.upstream_type = ut;
+        }
+        if let Some(ref b) = req.base_url {
+            let trimmed = b.trim();
+            if !trimmed.is_empty() {
+                route.base_url = trimmed.to_string();
+            }
+        }
+        if let Some(ref m) = req.model {
+            if !m.is_empty() {
+                route.model = m.clone();
+            }
+        }
+        if let Some(ref k) = req.api_key {
+            if !k.is_empty() && k != "********" {
+                route.api_key = k.clone();
+            }
+        }
+
+        // --- 元数据字段 ---
+        if let Some(n) = req.name.clone() {
             match &mut route.metadata {
                 Some(m) => m.name = Some(n),
                 None => {
-                    route.metadata = Some(crate::types::ModelMetadata {
+                    route.metadata = Some(ModelMetadata {
                         name: Some(n),
                         ..Default::default()
                     });
@@ -219,113 +305,103 @@ pub async fn update_model(
             match &mut route.metadata {
                 Some(m) => m.status = s,
                 None => {
-                    route.metadata = Some(crate::types::ModelMetadata {
+                    route.metadata = Some(ModelMetadata {
                         status: s,
                         ..Default::default()
                     });
                 }
             }
         }
-        if let Some(p) = price_input {
+        if let Some(p) = req.price_per_input {
             match &mut route.metadata {
                 Some(m) => m.price_per_input = Some(p),
                 None => {
-                    route.metadata = Some(crate::types::ModelMetadata {
+                    route.metadata = Some(ModelMetadata {
                         price_per_input: Some(p),
                         ..Default::default()
                     });
                 }
             }
         }
-        if let Some(p) = price_output {
+        if let Some(p) = req.price_per_output {
             match &mut route.metadata {
                 Some(m) => m.price_per_output = Some(p),
                 None => {
-                    route.metadata = Some(crate::types::ModelMetadata {
+                    route.metadata = Some(ModelMetadata {
                         price_per_output: Some(p),
                         ..Default::default()
                     });
                 }
             }
         }
-
-        // --- 需重启字段 ---
-        if let Some(ut) = new_upstream_type {
-            route.upstream_type = ut;
-        }
-        if let Some(ref b) = base_url {
-            let trimmed = b.trim();
-            if !trimmed.is_empty() {
-                route.base_url = trimmed.to_string();
-            }
-        }
-        if let Some(ref m) = model {
-            if !m.is_empty() {
-                route.model = m.clone();
-            }
-        }
-        if let Some(ref k) = api_key {
-            if !k.is_empty() && k != "********" {
-                route.api_key = k.clone();
-            }
-        }
     }
 
-    // 持久化热重载字段到数据库
+    // 持久化完整 model 到 SQLite
+    let saved_route = config.models.get(&id).cloned().unwrap();
     if let Some(db) = &state.usage_db {
-        let override_config = crate::types::ModelMetadataOverride {
-            name: name.clone(),
-            status: status_str.clone(),
-            price_per_input: price_input,
-            price_per_output: price_output,
-        };
-        if let Err(e) = db.upsert_model_override(&id, &override_config) {
-            eprintln!("⚠️  持久化 model_override 到数据库失败: {}", e);
-            // 内存配置已更新，热重载仍有效；重启后此修改会丢失
+        if let Err(e) = db.upsert_model(&id, &saved_route) {
+            eprintln!("⚠️  持久化 model 到数据库失败: {}", e);
         }
     }
 
-    // 如果有需重启字段，添加警告日志
-    if restart_required {
-        eprintln!(
-            "⚠️  api_key/base_url/type/model 变更已写入内存，需修改 YAML 文件并重启服务才能生效"
-        );
-    }
-
-    // 读回最新值
     let refs = policies_referencing_model(&config, &id);
-    let updated = config
-        .models
-        .get(&id)
-        .map(|route| build_model_config(&id, route, refs));
-
-    let api_key_changed = api_key
-        .as_ref()
-        .map(|v| !v.is_empty() && v != "********")
-        .unwrap_or(false);
+    let updated = build_model_config(&id, &saved_route, refs);
 
     Json(serde_json::json!({
         "success": true,
-        "message": if restart_required {
-            "已保存。api_key/base_url/type/model 变更需重启服务生效"
-        } else {
-            "已保存"
-        },
+        "message": "已保存",
         "model_id": id,
-        "restart_required": restart_required,
-        "changes": {
-            "name": name,
-            "status": status_str,
-            "price_per_input": price_input,
-            "price_per_output": price_output,
-            "upstream_type": upstream_type_str,
-            "base_url": base_url,
-            "model": model,
-            "api_key_changed": api_key_changed
-        },
         "model": updated
     }))
     .into_response()
+}
+
+/// DELETE /api/admin/models/:id
+pub async fn delete_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut config = state.config.write().await;
+
+    // 检查是否被 fallback_policy 引用
+    let referenced_by = policies_referencing_model(&config, &id);
+    if !referenced_by.is_empty() {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "in_use",
+                "message": format!(
+                    "Model '{}' 仍被 fallback 策略引用: {:?}",
+                    id, referenced_by
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    if config.models.remove(&id).is_none() {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "message": format!("Model '{}' not found", id)
+            })),
+        )
+            .into_response();
+    }
+
+    // 从 SQLite 删除
+    if let Some(db) = &state.usage_db {
+        if let Err(e) = db.delete_model(&id) {
+            eprintln!("⚠️  从数据库删除 model 失败: {}", e);
+        }
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "success": true, "message": "Model deleted" })),
+    )
+        .into_response()
 }
 
 /// GET /api/admin/fallback/policies-mini（前端 model 编辑 modal 用）

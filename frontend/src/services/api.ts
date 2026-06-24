@@ -4,6 +4,7 @@ import type {
   UsageDistribution,
   ModelConfig,
   ModelConfigUpdate,
+  ModelCreate,
   ApiKey,
   ApiKeyCreate,
   ApiKeyUpdate,
@@ -65,6 +66,20 @@ export const updateModel = async (
 ): Promise<UpdateModelResponse> => {
   const response = await api.put<UpdateModelResponse>(`/api/admin/models/${id}`, data);
   return response.data;
+};
+
+export const createModel = async (
+  data: ModelCreate,
+): Promise<{ success: boolean; model: ModelConfig }> => {
+  const response = await api.post<{ success: boolean; model: ModelConfig }>(
+    '/api/admin/models',
+    data,
+  );
+  return response.data;
+};
+
+export const deleteModel = async (id: string): Promise<void> => {
+  await api.delete(`/api/admin/models/${id}`);
 };
 
 export const getFallbackPoliciesMini = async (): Promise<FallbackPolicyMini[]> => {

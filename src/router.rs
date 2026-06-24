@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub struct Router {
-    config: GatewayConfig,
+    /// 共享 config 引用：admin API 修改后 Router 立即可见。
+    config: Arc<RwLock<GatewayConfig>>,
     usage_tracker: Arc<UsageTracker>,
     thaw_tracker: Option<Arc<ThawTracker>>,
     last_failover: Arc<RwLock<bool>>,
@@ -15,11 +16,16 @@ pub struct Router {
 
 impl Router {
     pub fn new(
-        config: GatewayConfig,
+        config: Arc<RwLock<GatewayConfig>>,
         thaw_tracker: Option<Arc<ThawTracker>>,
         usage_db: Option<Arc<UsageDb>>,
     ) -> Self {
-        let usage_tracking = config.usage_tracking.clone();
+        // 注意：usage_tracking 配置在启动后不会变，从 config 快照读一次即可。
+        // 这里需要 block_on 拿读锁，因为 new() 不是 async。
+        let usage_tracking = {
+            let cfg = config.blocking_read();
+            cfg.usage_tracking.clone()
+        };
         let usage_tracker = match usage_db {
             Some(db) => Arc::new(UsageTracker::with_db(
                 usage_tracking.enabled,
@@ -57,15 +63,15 @@ impl Router {
     /// `key_fallback_policy` 决定：API Key 可指定一个策略覆盖默认（无 key
     /// 时无 fallback）。
     fn build_chain(
-        &self,
+        config: &GatewayConfig,
         model_name: &str,
         key_fallback_policy: Option<&str>,
     ) -> Result<Vec<String>, String> {
-        if !self.config.models.contains_key(model_name) {
+        if !config.models.contains_key(model_name) {
             return Err(format!(
                 "未知模型: {}。可用模型: {}",
                 model_name,
-                self.config.models
+                config.models
                     .keys()
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>()
@@ -77,13 +83,13 @@ impl Router {
         let mut chain: Vec<String> = vec![model_name.to_string()];
 
         if let Some(pid) = key_fallback_policy {
-            if let Some(policy) = self.config.fallback_policies.get(pid) {
+            if let Some(policy) = config.fallback_policies.get(pid) {
                 if policy.enabled {
                     for node in &policy.chain {
                         if node.model == model_name {
                             continue;
                         }
-                        if !self.config.models.contains_key(&node.model) {
+                        if !config.models.contains_key(&node.model) {
                             tracing::warn!(
                                 target: "router",
                                 policy = %pid,
@@ -111,16 +117,16 @@ impl Router {
         key_id: Option<&str>,
         quota_tracker: &Arc<tokio::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
     ) -> Result<String, String> {
-        let chain = self.build_chain(model_name, key_fallback_policy)?;
-        let route = self.config.models.get(model_name).unwrap();
+        let config = self.config.read().await;
+        let chain = Self::build_chain(&config, model_name, key_fallback_policy)?;
+        let route = config.models.get(model_name).unwrap();
         let primary_upstream = route.upstream_type.as_str().to_string();
 
         let start = std::time::Instant::now();
         let mut last_error = String::new();
 
         for (i, target_model_id) in chain.iter().enumerate() {
-            let target_route = self
-                .config
+            let target_route = config
                 .models
                 .get(target_model_id)
                 .ok_or_else(|| format!("fallback 模型 {} 不存在", target_model_id))?;
@@ -259,15 +265,15 @@ impl Router {
         >,
         String,
     > {
-        let chain = self.build_chain(model_name, key_fallback_policy)?;
-        let route = self.config.models.get(model_name).unwrap();
+        let config = self.config.read().await;
+        let chain = Self::build_chain(&config, model_name, key_fallback_policy)?;
+        let route = config.models.get(model_name).unwrap();
         let primary_upstream = route.upstream_type.as_str().to_string();
         let start = std::time::Instant::now();
         let mut last_error = String::new();
 
         for (i, target_model_id) in chain.iter().enumerate() {
-            let target_route = self
-                .config
+            let target_route = config
                 .models
                 .get(target_model_id)
                 .ok_or_else(|| format!("fallback 模型 {} 不存在", target_model_id))?;
@@ -433,16 +439,16 @@ impl Router {
         key_id: Option<&str>,
         quota_tracker: &Arc<tokio::sync::Mutex<crate::admin::apikeys::ApiKeyQuotaTracker>>,
     ) -> Result<String, String> {
-        let chain = self.build_chain(model_name, key_fallback_policy)?;
-        let route = self.config.models.get(model_name).unwrap();
+        let config = self.config.read().await;
+        let chain = Self::build_chain(&config, model_name, key_fallback_policy)?;
+        let route = config.models.get(model_name).unwrap();
         let primary_upstream = route.upstream_type.as_str().to_string();
 
         let start = std::time::Instant::now();
         let mut last_error = String::new();
 
         for (i, target_model_id) in chain.iter().enumerate() {
-            let target_route = self
-                .config
+            let target_route = config
                 .models
                 .get(target_model_id)
                 .ok_or_else(|| format!("fallback 模型 {} 不存在", target_model_id))?;

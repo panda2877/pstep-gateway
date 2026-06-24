@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
+import { Plus } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
-import { getModels, updateModel } from '../services/api';
+import { getModels, updateModel, createModel, deleteModel } from '../services/api';
 import type { ModelConfig } from '../types';
 
 const KEEP_PLACEHOLDER = '********';
@@ -35,6 +36,30 @@ const buildFormState = (m: ModelConfig): FormState => ({
   api_key: KEEP_PLACEHOLDER,
 });
 
+interface CreateFormState {
+  id: string;
+  type: 'openai' | 'anthropic';
+  name: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+  status: 'active' | 'rate_limited' | 'disabled';
+  price_per_input: number;
+  price_per_output: number;
+}
+
+const EMPTY_CREATE: CreateFormState = {
+  id: '',
+  type: 'openai',
+  name: '',
+  base_url: '',
+  model: '',
+  api_key: '',
+  status: 'active',
+  price_per_input: 0,
+  price_per_output: 0,
+};
+
 export const ModelsPage: React.FC = () => {
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [loading, setLoading] = useState(true);
@@ -42,6 +67,11 @@ export const ModelsPage: React.FC = () => {
   const [formData, setFormData] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
+
+  // Create modal state
+  const [createModal, setCreateModal] = useState(false);
+  const [createForm, setCreateForm] = useState<CreateFormState>(EMPTY_CREATE);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const fetchModels = async () => {
     setLoading(true);
@@ -92,9 +122,49 @@ export const ModelsPage: React.FC = () => {
     }
   };
 
+  const handleCreate = async () => {
+    if (!createForm.id.trim() || !createForm.base_url.trim() || !createForm.model.trim()) {
+      setCreateError('id、base_url、model 不能为空');
+      return;
+    }
+    setSaving(true);
+    setCreateError(null);
+    try {
+      await createModel({
+        id: createForm.id,
+        type: createForm.type,
+        base_url: createForm.base_url,
+        api_key: createForm.api_key,
+        model: createForm.model,
+        name: createForm.name || undefined,
+        status: createForm.status,
+        price_per_input: createForm.price_per_input || undefined,
+        price_per_output: createForm.price_per_output || undefined,
+      });
+      setCreateModal(false);
+      setCreateForm(EMPTY_CREATE);
+      fetchModels();
+    } catch (err: any) {
+      const msg = err?.response?.data?.message || '创建失败';
+      setCreateError(msg);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm(`确定要删除模型 "${id}" 吗？`)) return;
+    try {
+      await deleteModel(id);
+      fetchModels();
+    } catch (err: any) {
+      const msg = err?.response?.data?.message || '删除失败';
+      alert(msg);
+    }
+  };
+
   const formatPrice = (price?: number) => {
     if (!price) return '-';
-    // 智能去尾零：0.1 → $0.1, 0.125 → $0.125, 0.100 → $0.10
     const fixed = Number(price.toFixed(4));
     const str = fixed.toString();
     return `$${str}`;
@@ -105,8 +175,12 @@ export const ModelsPage: React.FC = () => {
       <div className="section-header">
         <div>
           <h2 className="section-title">模型配置</h2>
-          <p className="section-desc">管理模型参数与上游连接</p>
+          <p className="section-desc">管理模型参数与上游连接（持久化到 SQLite）</p>
         </div>
+        <Button variant="secondary" size="sm" onClick={() => { setCreateForm(EMPTY_CREATE); setCreateError(null); setCreateModal(true); }}>
+          <Plus size={14} />
+          新增模型
+        </Button>
       </div>
 
       <Card className="tight">
@@ -152,9 +226,14 @@ export const ModelsPage: React.FC = () => {
                     <td className="num-col">{formatPrice(model.price_per_input)}</td>
                     <td className="num-col">{formatPrice(model.price_per_output)}</td>
                     <td className="actions">
-                      <Button variant="ghost" size="sm" onClick={() => openEditModal(model)}>
-                        编辑
-                      </Button>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <Button variant="ghost" size="sm" onClick={() => openEditModal(model)}>
+                          编辑
+                        </Button>
+                        <Button variant="danger" size="sm" onClick={() => handleDelete(model.id)}>
+                          删除
+                        </Button>
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -164,6 +243,7 @@ export const ModelsPage: React.FC = () => {
         </div>
       </Card>
 
+      {/* Edit Modal */}
       <Modal
         isOpen={!!editModal}
         onClose={() => setEditModal(null)}
@@ -217,7 +297,7 @@ export const ModelsPage: React.FC = () => {
               />
             </div>
 
-            <div className="section-divider"><span>上游配置（变更需重启服务）</span></div>
+            <div className="section-divider"><span>上游配置</span></div>
 
             <Input
               label="上游模型 id"
@@ -255,6 +335,97 @@ export const ModelsPage: React.FC = () => {
             )}
           </>
         )}
+      </Modal>
+
+      {/* Create Modal */}
+      <Modal
+        isOpen={createModal}
+        onClose={() => setCreateModal(false)}
+        title="新增模型"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setCreateModal(false)}>取消</Button>
+            <Button
+              onClick={handleCreate}
+              disabled={saving || !createForm.id.trim() || !createForm.base_url.trim() || !createForm.model.trim()}
+            >
+              {saving ? '创建中...' : '创建'}
+            </Button>
+          </>
+        }
+      >
+        <Input
+          label="模型 id（英文/数字/下划线/短横线）"
+          placeholder="例如：mimo-v2.5"
+          value={createForm.id}
+          onChange={(e) => setCreateForm({ ...createForm, id: e.target.value })}
+        />
+        <div className="field">
+          <label>上游类型</label>
+          <select
+            className="select"
+            value={createForm.type}
+            onChange={(e) => setCreateForm({ ...createForm, type: e.target.value as 'openai' | 'anthropic' })}
+          >
+            <option value="openai">OpenAI 兼容</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </div>
+        <Input
+          label="模型名称（显示用）"
+          placeholder="例如：Mimo"
+          value={createForm.name}
+          onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
+        />
+        <Input
+          label="上游模型 id"
+          placeholder="例如：mimo-v2.5"
+          value={createForm.model}
+          onChange={(e) => setCreateForm({ ...createForm, model: e.target.value })}
+        />
+        <Input
+          label="Base URL"
+          placeholder="https://api.openai.com/v1"
+          value={createForm.base_url}
+          onChange={(e) => setCreateForm({ ...createForm, base_url: e.target.value })}
+        />
+        <Input
+          label="API Key"
+          type="password"
+          mono
+          value={createForm.api_key}
+          placeholder="sk-..."
+          onChange={(e) => setCreateForm({ ...createForm, api_key: e.target.value })}
+        />
+        <div className="field">
+          <label>状态</label>
+          <select
+            className="select"
+            value={createForm.status}
+            onChange={(e) => setCreateForm({ ...createForm, status: e.target.value as 'active' | 'rate_limited' | 'disabled' })}
+          >
+            <option value="active">活跃</option>
+            <option value="rate_limited">限流中</option>
+            <option value="disabled">已禁用</option>
+          </select>
+        </div>
+        <div className="field-row">
+          <Input
+            label="输入单价 ($/1M tokens)"
+            type="number"
+            step="0.001"
+            value={createForm.price_per_input}
+            onChange={(e) => setCreateForm({ ...createForm, price_per_input: Number(e.target.value) })}
+          />
+          <Input
+            label="输出单价 ($/1M tokens)"
+            type="number"
+            step="0.001"
+            value={createForm.price_per_output}
+            onChange={(e) => setCreateForm({ ...createForm, price_per_output: Number(e.target.value) })}
+          />
+        </div>
+        {createError && <div className="field-hint" style={{ color: '#c00', marginTop: 8 }}>{createError}</div>}
       </Modal>
     </div>
   );

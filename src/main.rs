@@ -216,7 +216,9 @@ async fn main() {
         None
     };
 
-    let gateway_router = GatewayRouter::new(config.clone(), thaw_tracker.clone(), usage_db.clone());
+    // 共享 config：Router 和 admin handlers 读同一份，admin 写入后两者都可见。
+    let shared_config = Arc::new(RwLock::new(config));
+    let gateway_router = GatewayRouter::new(shared_config.clone(), thaw_tracker.clone(), usage_db.clone());
 
     // ApiKeyQuotaTracker：若 DB 可用，挂上 DB 并从 DB 还原历史 quota
     let mut quota_tracker = ApiKeyQuotaTracker::default();
@@ -229,7 +231,7 @@ async fn main() {
     let in_flight = InFlight::new();
 
     let state = AppState {
-        config: Arc::new(RwLock::new(config.clone())),
+        config: shared_config.clone(),
         router: Arc::new(gateway_router),
         thaw_tracker,
         api_key_quota,
@@ -258,7 +260,8 @@ async fn main() {
         )
         .route(
             "/api/admin/models",
-            axum::routing::get(admin::models::list_models),
+            axum::routing::get(admin::models::list_models)
+                .post(admin::models::create_model),
         )
         .route(
             "/api/admin/models/fallback-policies",
@@ -266,11 +269,9 @@ async fn main() {
         )
         .route(
             "/api/admin/models/{id}",
-            axum::routing::get(admin::models::get_model),
-        )
-        .route(
-            "/api/admin/models/{id}",
-            axum::routing::put(admin::models::update_model),
+            axum::routing::get(admin::models::get_model)
+                .put(admin::models::update_model)
+                .delete(admin::models::delete_model),
         )
         .route(
             "/api/admin/keys",
@@ -321,21 +322,27 @@ async fn main() {
     let port: u16 = std::env::var("GATEWAY_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(config.port);
+        .unwrap_or({
+            let cfg = shared_config.blocking_read();
+            cfg.port
+        });
     let addr = format!("0.0.0.0:{}", port);
 
     println!("✅ 网关已启动: http://{}:{}", "0.0.0.0", port);
-    let models: Vec<_> = config.models.keys().map(|s| s.as_str()).collect();
-    println!("📋 已配置模型: {}", models.join(", "));
-    println!("🔒 API Key 校验: 已启用（基于 config.client_api_keys）");
-    println!(
-        "📊 用量统计: {}",
-        if config.usage_tracking.enabled {
-            "已启用"
-        } else {
-            "已禁用"
-        }
-    );
+    {
+        let cfg = shared_config.blocking_read();
+        let models: Vec<_> = cfg.models.keys().map(|s| s.as_str()).collect();
+        println!("📋 已配置模型: {}", models.join(", "));
+        println!("🔒 API Key 校验: 已启用（基于 config.client_api_keys）");
+        println!(
+            "📊 用量统计: {}",
+            if cfg.usage_tracking.enabled {
+                "已启用"
+            } else {
+                "已禁用"
+            }
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 

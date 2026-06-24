@@ -165,7 +165,7 @@ export const FallbackPage: React.FC = () => {
       <div className="section-header">
         <div>
           <h2 className="section-title">Fallback 策略</h2>
-          <p className="section-desc">设置模型故障时的自动切换链（与 config.yaml 持久化）</p>
+          <p className="section-desc">设置模型故障时的自动切换链（持久化到 SQLite）</p>
         </div>
         <Button variant="secondary" size="sm" onClick={openCreateModal}>
           <Plus size={14} />

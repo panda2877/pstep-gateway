@@ -182,7 +182,7 @@ export const APIKeysPage: React.FC = () => {
       <div className="section-header">
         <div>
           <h2 className="section-title">API 密钥</h2>
-          <p className="section-desc">创建与管理访问密钥（持久化到 config.yaml）</p>
+          <p className="section-desc">创建与管理访问密钥（持久化到 SQLite）</p>
         </div>
         <Button
           variant="secondary"

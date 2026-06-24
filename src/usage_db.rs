@@ -11,7 +11,7 @@
 //! ApiKeyQuotaTracker) logs and continues — a DB hiccup should not fail a
 //! chat request.
 
-use crate::types::{UsageRecord, FallbackPolicyConfig, ClientApiKeyConfig, ModelMetadataOverride};
+use crate::types::{UsageRecord, FallbackPolicyConfig, ClientApiKeyConfig};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
@@ -87,14 +87,16 @@ impl UsageDb {
                  config_json TEXT NOT NULL,
                  updated_at_ms INTEGER NOT NULL
              );
-             -- 持久化配置表：模型元数据覆盖（仅热重载字段）
-             CREATE TABLE IF NOT EXISTS persisted_model_overrides (
+             -- 持久化配置表：完整模型定义（替代旧 persisted_model_overrides）
+             CREATE TABLE IF NOT EXISTS persisted_models (
                  model_id TEXT PRIMARY KEY,
                  config_json TEXT NOT NULL,
                  updated_at_ms INTEGER NOT NULL
              );",
         )
         .map_err(|e| format!("初始化 usage_db schema 失败: {}", e))?;
+        // 清理旧表（v0.3 → v0.4 迁移）
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS persisted_model_overrides;");
         Ok(())
     }
 
@@ -305,44 +307,56 @@ impl UsageDb {
         Ok(out)
     }
 
-    /// Upsert model metadata overrides (hot-reloadable fields only).
-    pub fn upsert_model_override(
+    /// Upsert a full model definition.
+    pub fn upsert_model(
         &self,
         model_id: &str,
-        config: &ModelMetadataOverride,
+        config: &crate::types::ModelRoute,
     ) -> Result<(), String> {
         let conn = self.conn.lock().expect("usage_db mutex poisoned");
         let json = serde_json::to_string(config)
-            .map_err(|e| format!("序列化 model_override 失败: {}", e))?;
+            .map_err(|e| format!("序列化 model 失败: {}", e))?;
         let now = now_ms();
         conn.execute(
-            "INSERT INTO persisted_model_overrides (model_id, config_json, updated_at_ms)
+            "INSERT INTO persisted_models (model_id, config_json, updated_at_ms)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(model_id) DO UPDATE SET
                 config_json = excluded.config_json,
                 updated_at_ms = excluded.updated_at_ms",
             params![model_id, json, now as i64],
         )
-        .map_err(|e| format!("写入 model_override 失败: {}", e))?;
+        .map_err(|e| format!("写入 model 失败: {}", e))?;
         Ok(())
     }
 
-    /// Load all persisted model metadata overrides.
-    pub fn load_model_overrides(&self) -> Result<HashMap<String, ModelMetadataOverride>, String> {
+    /// Delete a single model. Returns Ok(false) if not found.
+    pub fn delete_model(&self, model_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().expect("usage_db mutex poisoned");
+        let rows = conn
+            .execute(
+                "DELETE FROM persisted_models WHERE model_id = ?1",
+                params![model_id],
+            )
+            .map_err(|e| format!("删除 model 失败: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    /// Load all persisted models.
+    pub fn load_models(&self) -> Result<HashMap<String, crate::types::ModelRoute>, String> {
         let conn = self.conn.lock().expect("usage_db mutex poisoned");
         let mut stmt = conn
-            .prepare("SELECT model_id, config_json FROM persisted_model_overrides")
-            .map_err(|e| format!("查询 persisted_model_overrides 失败: {}", e))?;
+            .prepare("SELECT model_id, config_json FROM persisted_models")
+            .map_err(|e| format!("查询 persisted_models 失败: {}", e))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| format!("遍历 persisted_model_overrides 失败: {}", e))?;
+            .map_err(|e| format!("遍历 persisted_models 失败: {}", e))?;
         let mut out = HashMap::new();
         for r in rows {
             let (id, json) = r.map_err(|e| format!("读取行失败: {}", e))?;
-            let config: ModelMetadataOverride = serde_json::from_str(&json)
-                .map_err(|e| format!("反序列化 model_override '{}': {}", id, e))?;
+            let config: crate::types::ModelRoute = serde_json::from_str(&json)
+                .map_err(|e| format!("反序列化 model '{}': {}", id, e))?;
             out.insert(id, config);
         }
         Ok(out)

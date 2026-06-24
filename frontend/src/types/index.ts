@@ -61,6 +61,19 @@ export interface ModelsResponse {
   models: ModelConfig[];
 }
 
+/** POST /api/admin/models 的请求体 */
+export interface ModelCreate {
+  id: string;
+  type: 'openai' | 'anthropic';
+  base_url: string;
+  api_key: string;
+  model: string;
+  name?: string;
+  status?: 'active' | 'rate_limited' | 'disabled';
+  price_per_input?: number;
+  price_per_output?: number;
+}
+
 export interface FallbackPolicyMini {
   id: string;
 }
