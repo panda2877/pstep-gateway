@@ -217,7 +217,11 @@ async fn main() {
     };
 
     // 共享 config：Router 和 admin handlers 读同一份，admin 写入后两者都可见。
+    // 提取启动日志需要的字段（blocking_read 不能在 tokio runtime 内调用）
     let usage_tracking = config.usage_tracking.clone();
+    let startup_port = config.port;
+    let startup_models: Vec<String> = config.models.keys().cloned().collect();
+    let startup_usage_enabled = config.usage_tracking.enabled;
     let shared_config = Arc::new(RwLock::new(config));
     let gateway_router = GatewayRouter::new(shared_config.clone(), usage_tracking, thaw_tracker.clone(), usage_db.clone());
 
@@ -323,27 +327,16 @@ async fn main() {
     let port: u16 = std::env::var("GATEWAY_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or({
-            let cfg = shared_config.blocking_read();
-            cfg.port
-        });
+        .unwrap_or(startup_port);
     let addr = format!("0.0.0.0:{}", port);
 
     println!("✅ 网关已启动: http://{}:{}", "0.0.0.0", port);
-    {
-        let cfg = shared_config.blocking_read();
-        let models: Vec<_> = cfg.models.keys().map(|s| s.as_str()).collect();
-        println!("📋 已配置模型: {}", models.join(", "));
-        println!("🔒 API Key 校验: 已启用（基于 config.client_api_keys）");
-        println!(
-            "📊 用量统计: {}",
-            if cfg.usage_tracking.enabled {
-                "已启用"
-            } else {
-                "已禁用"
-            }
-        );
-    }
+    println!("📋 已配置模型: {}", startup_models.join(", "));
+    println!("🔒 API Key 校验: 已启用（基于 config.client_api_keys）");
+    println!(
+        "📊 用量统计: {}",
+        if startup_usage_enabled { "已启用" } else { "已禁用" }
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
