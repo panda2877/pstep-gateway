@@ -36,8 +36,13 @@ pub struct GatewayConfig {
 
 /// 一个对外暴露的 model id，4 字段（type / base_url / api_key / model）扁平在自身。
 ///
-/// 决策（v0.3）：model 不再持有 `fallback_policy`。fallback 关系由 policy 的
-/// `chain[*].model` 反向表达：同一个 model 可以被多个 policy 复用。
+/// **v0.4 路由语义**:
+/// - 客户端请求 `model` 字段**优先**被解释为 fallback policy id（见 `fallback_policies`）。
+/// - 命中 policy → 用该 chain 完整路由。
+/// - 未命中 policy 但命中 model id → 当作单节点 chain（向后兼容）。
+/// - 都不命中 → 400 错误。
+///
+/// 旧的"client_api_key.fallback_policy = 主失败后追加备选"语义保留。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelRoute {
     /// `type` / `base_url` / `api_key` / `model` 决定上游签名

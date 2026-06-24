@@ -351,7 +351,8 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "object": "list",
-        "data": models
+        "data": models,
+        "available_policies": state.config.read().await.fallback_policies.keys().collect::<Vec<_>>()
     }))
 }
 

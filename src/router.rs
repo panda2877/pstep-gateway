@@ -62,15 +62,32 @@ impl Router {
         model_name: &str,
         key_fallback_policy: Option<&str>,
     ) -> Result<Vec<String>, String> {
+        // 路径 A：model_name 是 fallback policy id → 直接用该 chain
+        if let Some(policy) = config.fallback_policies.get(model_name) {
+            if !policy.enabled {
+                return Err(format!("policy '{}' is disabled", model_name));
+            }
+            let chain: Vec<String> = policy
+                .chain
+                .iter()
+                .filter(|node| config.models.contains_key(&node.model))
+                .map(|node| node.model.clone())
+                .collect();
+            if chain.is_empty() {
+                return Err(format!(
+                    "policy '{}' chain is empty or references unknown models",
+                    model_name
+                ));
+            }
+            return Ok(chain);
+        }
+
+        // 路径 B：model_name 是 model id → 旧逻辑（向后兼容）
         if !config.models.contains_key(model_name) {
+            let available_policies: Vec<&String> = config.fallback_policies.keys().collect();
             return Err(format!(
-                "未知模型: {}。可用模型: {}",
-                model_name,
-                config.models
-                    .keys()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "未知模型 '{}'。可用 policy 名: {:?}",
+                model_name, available_policies
             ));
         }
 
@@ -114,7 +131,9 @@ impl Router {
     ) -> Result<String, String> {
         let config = self.config.read().await;
         let chain = Self::build_chain(&config, model_name, key_fallback_policy)?;
-        let route = config.models.get(model_name).unwrap();
+        let primary_id = chain.first().ok_or("chain is empty")?;
+        let route = config.models.get(primary_id.as_str())
+            .ok_or_else(|| format!("primary model '{}' not found", primary_id))?;
         let primary_upstream = route.upstream_type.as_str().to_string();
 
         let start = std::time::Instant::now();
@@ -262,7 +281,9 @@ impl Router {
     > {
         let config = self.config.read().await;
         let chain = Self::build_chain(&config, model_name, key_fallback_policy)?;
-        let route = config.models.get(model_name).unwrap();
+        let primary_id = chain.first().ok_or("chain is empty")?;
+        let route = config.models.get(primary_id.as_str())
+            .ok_or_else(|| format!("primary model '{}' not found", primary_id))?;
         let primary_upstream = route.upstream_type.as_str().to_string();
         let start = std::time::Instant::now();
         let mut last_error = String::new();
@@ -436,7 +457,9 @@ impl Router {
     ) -> Result<String, String> {
         let config = self.config.read().await;
         let chain = Self::build_chain(&config, model_name, key_fallback_policy)?;
-        let route = config.models.get(model_name).unwrap();
+        let primary_id = chain.first().ok_or("chain is empty")?;
+        let route = config.models.get(primary_id.as_str())
+            .ok_or_else(|| format!("primary model '{}' not found", primary_id))?;
         let primary_upstream = route.upstream_type.as_str().to_string();
 
         let start = std::time::Instant::now();

@@ -430,4 +430,19 @@ fn validate_config(config: &GatewayConfig) {
             }
         }
     }
+
+    // 警告：未被任何 fallback_policy chain 引用的 model id
+    let referenced: std::collections::HashSet<&str> = config
+        .fallback_policies
+        .values()
+        .flat_map(|p| p.chain.iter().map(|n| n.model.as_str()))
+        .collect();
+    for model_id in config.models.keys() {
+        if !referenced.contains(model_id.as_str()) {
+            eprintln!(
+                "⚠️  model '{}' 未被任何 fallback_policy 引用；客户端需直接使用 model id",
+                model_id
+            );
+        }
+    }
 }
