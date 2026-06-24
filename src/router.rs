@@ -17,15 +17,10 @@ pub struct Router {
 impl Router {
     pub fn new(
         config: Arc<RwLock<GatewayConfig>>,
+        usage_tracking: crate::types::UsageConfig,
         thaw_tracker: Option<Arc<ThawTracker>>,
         usage_db: Option<Arc<UsageDb>>,
     ) -> Self {
-        // 注意：usage_tracking 配置在启动后不会变，从 config 快照读一次即可。
-        // 这里需要 block_on 拿读锁，因为 new() 不是 async。
-        let usage_tracking = {
-            let cfg = config.blocking_read();
-            cfg.usage_tracking.clone()
-        };
         let usage_tracker = match usage_db {
             Some(db) => Arc::new(UsageTracker::with_db(
                 usage_tracking.enabled,

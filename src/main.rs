@@ -217,8 +217,9 @@ async fn main() {
     };
 
     // 共享 config：Router 和 admin handlers 读同一份，admin 写入后两者都可见。
+    let usage_tracking = config.usage_tracking.clone();
     let shared_config = Arc::new(RwLock::new(config));
-    let gateway_router = GatewayRouter::new(shared_config.clone(), thaw_tracker.clone(), usage_db.clone());
+    let gateway_router = GatewayRouter::new(shared_config.clone(), usage_tracking, thaw_tracker.clone(), usage_db.clone());
 
     // ApiKeyQuotaTracker：若 DB 可用，挂上 DB 并从 DB 还原历史 quota
     let mut quota_tracker = ApiKeyQuotaTracker::default();
